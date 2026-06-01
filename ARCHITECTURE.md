@@ -401,5 +401,18 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
    it explicitly); `fn` is removed. Runtime-extent layouts use `row_major(n)`
    with a plain `Int` (not `Idx(n)`). `open()` takes `"r"`/`"w"`, not `"rb"`;
    `FileHandle.read_bytes()` returns the raw bytes regardless. List values must
-   be transferred out of functions with `^`. These are captured by the installed
-   `mojo-syntax` / `mojo-gpu-fundamentals` skills (`.claude/skills/`).
+   be transferred out of functions with `^`. A `TileTensor` over a borrowed
+   `DeviceBuffer` is read-only (`mut=False`) and won't bind to a kernel param
+   typed `MutAnyOrigin` — pass buffers a helper writes through as `mut`. These
+   are captured by the installed `mojo-syntax` / `mojo-gpu-fundamentals` skills.
+
+### Phase-2 progress
+
+4. **Building-block kernels match the reference (Phase 2, partial).** Mojo Metal
+   `matmul (+bias)`, `RMSNorm`, and the composed `SwiGLU MLP` (matmul → silu·mul
+   → matmul) agree with the NumPy references — **matmul bit-exact (0.0)**, RMSNorm
+   ≤ 1.8e-6, SwiGLU ≤ 4.5e-6 — on synthetic dims *and* real Qwen2 layer-0 weights
+   + activations. References cross-checked against HF to ≤ 2.4e-7. With Phase-1
+   attention, every compute kernel the forward pass needs is now verified on
+   Metal. `pixi run kernels-capture` then `pixi run kernels-spike`.
+   *(Remaining Phase-2: safetensors loader, BPE tokenizer.)*

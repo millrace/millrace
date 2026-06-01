@@ -45,7 +45,14 @@ build-gpu-hello = "mkdir -p build && mojo build src/gpu_hello.mojo -o build/gpu_
 # regenerates fixtures + the NumPy reference from HF (oracle env).
 attn-kernel = "mojo run src/attention_spike.mojo"
 
+# Phase 2 building-block kernels (ARCHITECTURE.md §3, §6): matmul+bias, RMSNorm,
+# SwiGLU MLP. `kernels-spike` verifies the Mojo Metal kernels against fixtures.
+kernels-spike = "mojo run src/kernels_spike.mojo"
+
 [feature.oracle.tasks]
 # Generates tests/fixtures/attention/{synthetic,real_L0,real_L23}/ : q/k/v.bin,
 # expected.bin (NumPy ref), meta.txt. Also asserts NumPy ref ≈ HF context.
 attn-capture = "python tests/manual/attention_spike/capture.py"
+# Generates tests/fixtures/kernels/{syn,real}_{rmsnorm,matmul,swiglu}/ and
+# cross-checks each NumPy reference against HF on real layer-0 activations.
+kernels-capture = "python tests/manual/kernels_spike/capture.py"

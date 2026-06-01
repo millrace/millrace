@@ -8,3 +8,7 @@ build/
 # Python caches (oracle / test scripts)
 __pycache__/
 *.pyc
+
+# Real-weight kernel fixtures are large (full Qwen2 dims) — regenerate with
+# `pixi run kernels-capture`. The small synthetic ones (syn_*) stay committed.
+tests/fixtures/kernels/real_*
