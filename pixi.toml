@@ -53,6 +53,10 @@ kernels-spike = "mojo run src/kernels_spike.mojo"
 # verify against real checkpoint values (needs `loader-capture` first).
 loader-spike = "mojo run src/loader_spike.mojo"
 
+# Phase 2 byte-level BPE tokenizer (ARCHITECTURE.md §5.2): encode/decode in pure
+# Mojo, verified byte-identical to transformers (needs `tok-capture` first).
+tok-spike = "mojo run src/tokenizer_spike.mojo"
+
 [feature.oracle.tasks]
 # Generates tests/fixtures/attention/{synthetic,real_L0,real_L23}/ : q/k/v.bin,
 # expected.bin (NumPy ref), meta.txt. Also asserts NumPy ref ≈ HF context.
@@ -62,3 +66,5 @@ attn-capture = "python tests/manual/attention_spike/capture.py"
 kernels-capture = "python tests/manual/kernels_spike/capture.py"
 # Dumps the real checkpoint path + expected first-8 values per tensor.
 loader-capture = "python tests/manual/loader_spike/capture.py"
+# Dumps vocab/merges resolved to ids + expected encodings for the prompt corpus.
+tok-capture = "python tests/manual/tokenizer_spike/capture.py"

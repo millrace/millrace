@@ -265,7 +265,7 @@ positions), so it is verifiable in isolation with no other component built.
 |---|---|
 | **0 — Scaffold** *(✅ done)* | pixi env (Mojo + GPU/Metal, nightly), repo layout, this doc. **A Mojo GPU hello kernel runs on the M4** — re-confirms max-backend rung 1 (hand-written Mojo Metal kernels execute *and* compute correctly) on a clean env, before betting the project on it. `pixi run gpu-hello` ✅. |
 | **1 — Attention + RoPE spike (the go/no-go gate)** *(✅ done — passed)* | The risky kernel, first and alone. A Mojo Metal kernel for RoPE (split-half, θ=1e6) + causal GQA attention at the real Qwen2 dims (head_dim 64, 14:2 heads), **diffed against a from-scratch NumPy reference** on both synthetic inputs and **captured-real layer Q/K/V fixtures from the model run** (so it is tested on realistic magnitudes, not just random). **Result: GPU output matches the reference to ≤ 8.4e-6 abs on synthetic + real layer-0 + real layer-23 — the kernel MAX got wrong on Metal, we got right.** See §11. |
-| **2 — Remaining kernels + loader + tokenizer** | The known-reachable work (max-backend rungs 1–5 already proved matmul/norm/SiLU/MLP correct on Metal): matmul, RMSNorm, SwiGLU MLP GPU kernels; safetensors loader (bf16→f32, device upload); byte-level BPE encode/decode verified against `transformers` ids. Each kernel diffed against MAX-CPU/f32. |
+| **2 — Remaining kernels + loader + tokenizer** *(✅ done)* | matmul/RMSNorm/SwiGLU GPU kernels (matmul bit-exact, others ≤ 4.5e-6 vs NumPy on real layer-0); safetensors loader (bf16→f32, bit-exact vs torch on 6 real tensors); byte-level BPE encode/decode **byte-identical to transformers** on the English corpus (ASCII-correct pretokenizer; non-ASCII `\p{L}`/`\p{N}` deferred). See §11 #4–6. |
 | **3 — Forward pass** | Assemble embed → 24 layers → final norm → tied head on GPU/f32. **Logits match MAX-CPU/f32** at the last prompt position (greedy argmax agrees). Layer-bisection (force 1/2/24 layers) localizes any divergence — the exact technique max-backend used (its §8 #2 rung 6). |
 | **4 — Decode loop + KV cache** | Prefill + incremental greedy decode on-device, EOS handling, `--max-tokens`. **Token-for-token greedy parity** with MAX-CPU on the conformance prompts (§7). |
 | **5 — Sampling** | temperature/top-k/top-p/repetition-penalty per `generation_config.json` (§5.6). |
@@ -292,6 +292,7 @@ checked against a trusted oracle.
   Metal kernels, not a dtype or a wrong reference.
 - **Signals, in order of strictness:**
   1. **Tokenizer:** our `encode(prompt)` == reference token ids; `decode` round-trips.
+     **Done — byte-identical on the English corpus (§11 #6).**
   2. **Per-kernel:** each GPU op (matmul, norm, SiLU, MLP, RoPE, attention) diffed
      against the reference for the same inputs — the rung-by-rung ladder
      max-backend built (its §8 #2 rungs 1–6), now applied to *our* kernels.
@@ -421,4 +422,13 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
    on 6 real Qwen2 tensors (embeddings, norms, q-proj weight+bias, deep-layer
    MLP) — dtype `BF16`, shapes, and first elements all match.
    `pixi run loader-capture` then `pixi run loader-spike`.
-   *(Remaining Phase-2: BPE tokenizer.)*
+6. **Byte-level BPE tokenizer is byte-identical to transformers (Phase 2,
+   complete).** Encode *and* decode match on an 8-prompt English corpus (the full
+   chat template with special tokens + newlines, multi-space, digits+punctuation,
+   newline runs). Trick: the byte↔unicode map is a bijection and every BPE symbol
+   is a vocab token, so the whole tokenizer runs in **integer id-space** — no
+   unicode in Mojo. The pretokenizer implements the Qwen regex ASCII-correct;
+   **non-ASCII `\p{L}`/`\p{N}` is deferred** (a UTF-8 letter run would mis-split)
+   — fine for the English corpus, to revisit before multilingual input.
+   `pixi run tok-capture` then `pixi run tok-spike`. **Phase 2 is complete; every
+   piece the forward pass needs is verified.**
