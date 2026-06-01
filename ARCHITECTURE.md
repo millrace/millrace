@@ -68,10 +68,10 @@ forward pass on Metal is expected to be coherent where driving MAX's was not.
 
 ### Non-goals (v1)
 
-- Streaming SSE, Anthropic `/v1/messages`, multi-request concurrency. *(A
-  minimal non-streaming OpenAI `/v1/chat/completions` + `/v1/models` server did
-  land in Phase 6 — via libc sockets, since flare needs an incompatible Mojo;
-  §11 #11. The richer surface remains future work.)*
+- Anthropic `/v1/messages`, multi-request concurrency. *(An OpenAI
+  `/v1/chat/completions` + `/v1/models` server landed in Phase 6 — via libc
+  sockets, since flare needs an incompatible Mojo (§11 #11) — with request params
+  and SSE streaming. It stays single-threaded; the richer surface is future work.)*
 - Multiple model architectures / config-driven generality.
 - A production **CPU** compute path. CPU is the conformance oracle only; the
   engine runs on the GPU.
@@ -520,11 +520,16 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
     assembled at the **byte level** so multibyte UTF-8 survives (e.g. "Café
     Rétro", "Pâte feuille") — building strings with `chr(byte)` per byte
     mojibakes non-ASCII; `chat.json_escape_str` + `bytes_to_string` fix it.
-    **The whole path — socket → tokenizer → GPU model → tokenizer → JSON — is
-    pure Mojo with no Python and no MAX at runtime: the stance max-backend set
-    out with and had to defer is met end to end.** Still minimal: no SSE
-    streaming, no concurrency. `pixi run serve`. Re-port to flare if/when it
-    supports a Mojo that also runs the GPU engine.
+    **SSE streaming** (`stream:true`) emits one `chat.completion.chunk` per token
+    (role chunk → content deltas → `finish_reason` → `[DONE]`), with UTF-8-complete
+    delta boundaries so a multibyte char is never split mid-chunk
+    (`complete_utf8_len`). The decode loop is factored into a `Session` (KV caches
+    + position) in model.mojo — `sess_prefill`/`sess_step` — shared by greedy,
+    sampled, and streaming generation (greedy parity gate still passes). **The
+    whole path — socket → tokenizer → GPU model → tokenizer → JSON — is pure Mojo
+    with no Python and no MAX at runtime.** Still single-threaded (no concurrency).
+    `pixi run serve`. Re-port to flare if/when it supports a Mojo that also runs
+    the GPU engine.
 
 ## 12. Code layout
 

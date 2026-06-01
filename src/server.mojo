@@ -18,7 +18,10 @@ non-streaming ChatCompletion. Enough to point a client at and get real text.
 from std.ffi import external_call, c_int
 from std.gpu.host import DeviceContext
 
-from model import Weights, load_weights, generate, generate_sample, EOS1, EOS2
+from model import (
+    Weights, load_weights, generate, generate_sample, EOS1, EOS2,
+    Session, new_session, sess_prefill, sess_step, argmax_f, process_logits, sample,
+)
 from tokenizer import Tokenizer, load_tokenizer
 from chat import load_chat_template, render_value, json_escape_str
 from value import Value
@@ -72,6 +75,42 @@ def get_float(req: Value, key: String, default: Float64) -> Float64:
             return Float64(v.i)
     return default
 
+def get_bool(req: Value, key: String, default: Bool) -> Bool:
+    var o = req.map_get(key)
+    if o and o.value().tag == VBOOL:
+        return o.value().b
+    return default
+
+
+def complete_utf8_len(b: List[UInt8]) -> Int:
+    """Length of the longest prefix of `b` that ends on a UTF-8 char boundary —
+    so a multibyte char split across tokens isn't emitted half-formed."""
+    var n = len(b)
+    if n == 0:
+        return 0
+    var i = n - 1
+    while i >= 0 and (Int(b[i]) & 0xC0) == 0x80:  # skip continuation bytes
+        i -= 1
+    if i < 0:
+        return n
+    var lead = Int(b[i])
+    var need = 1
+    if (lead & 0x80) == 0:
+        need = 1
+    elif (lead & 0xE0) == 0xC0:
+        need = 2
+    elif (lead & 0xF0) == 0xE0:
+        need = 3
+    elif (lead & 0xF8) == 0xF0:
+        need = 4
+    return n if i + need <= n else i
+
+def slice_bytes(b: List[UInt8], start: Int, stop: Int) -> List[UInt8]:
+    var out = List[UInt8]()
+    for i in range(start, stop):
+        out.append(b[i])
+    return out^
+
 
 def http_body(req: String) -> String:
     """The bytes after the blank line separating HTTP headers from the body."""
@@ -93,6 +132,51 @@ def http_response(conn: c_int, body: String):
     var resp = String("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n")
     resp += "Content-Length: " + String(len(body.as_bytes())) + "\r\nConnection: close\r\n\r\n" + body
     send_str(conn, resp)
+
+
+comptime CHUNK_HEAD = '{"id":"chatcmpl-millrace","object":"chat.completion.chunk","choices":[{"index":0,"delta":'
+
+def sse(conn: c_int, data: String):
+    send_str(conn, String("data: ") + data + "\n\n")
+
+def handle_stream(conn: c_int, ctx: DeviceContext, mut w: Weights, tok: Tokenizer,
+                  ids: List[Int], max_new: Int, temp: Float32, top_k: Int, top_p: Float32) raises:
+    """SSE streaming: emit one chat.completion.chunk per UTF-8-complete delta."""
+    send_str(conn, String("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"))
+    send_str(conn, String("Cache-Control: no-cache\r\nConnection: close\r\n\r\n"))
+    sse(conn, CHUNK_HEAD + '{"role":"assistant"},"finish_reason":null}]}')
+
+    var s = new_session(ctx, len(ids) + max_new + 2)
+    var logits = sess_prefill(ctx, w, s, ids)
+    var context = ids.copy()
+    var rng = UInt64(0x9E3779B97F4A7C15)
+    var gen = List[Int]()
+    var sent = 0
+    var stopped = False
+    while len(gen) < max_new:
+        var nxt = (
+            sample(process_logits(logits, context, temp, top_k, top_p, DEF_REP), rng)
+            if temp > 0.0 else argmax_f(logits)
+        )
+        if nxt == EOS1 or nxt == EOS2:
+            stopped = True
+            break
+        gen.append(nxt)
+        context.append(nxt)
+        var full = tok.decode(gen)
+        var clen = complete_utf8_len(full)
+        if clen > sent:
+            var delta = json_escape_str(slice_bytes(full, sent, clen))
+            sse(conn, CHUNK_HEAD + '{"content":"' + delta + '"},"finish_reason":null}]}')
+            sent = clen
+        if len(gen) >= max_new:
+            break
+        logits = sess_step(ctx, w, s, nxt)
+
+    var fin = String("stop") if stopped else String("length")
+    sse(conn, CHUNK_HEAD + '{},"finish_reason":"' + fin + '"}]}')
+    send_str(conn, String("data: [DONE]\n\n"))
+    print("  streamed ", len(gen), " tokens [", fin, "]", sep="")
 
 
 def main() raises:
@@ -139,10 +223,16 @@ def main() raises:
                 # OpenAI request knobs: greedy unless temperature > 0.
                 var max_new = get_int(body_v, "max_tokens", DEF_MAXNEW)
                 var temp = Float32(get_float(body_v, "temperature", 0.0))
+                var top_p = Float32(get_float(body_v, "top_p", Float64(DEF_TOPP)))
+                var top_k = get_int(body_v, "top_k", DEF_TOPK)
+
+                if get_bool(body_v, "stream", False):
+                    handle_stream(conn, ctx, w, tok, ids, max_new, temp, top_k, top_p)
+                    _ = external_call["close", c_int](conn)
+                    continue
+
                 var gen: List[Int]
                 if temp > 0.0:
-                    var top_p = Float32(get_float(body_v, "top_p", Float64(DEF_TOPP)))
-                    var top_k = get_int(body_v, "top_k", DEF_TOPK)
                     gen = generate_sample(ctx, w, ids, max_new, temp, top_k, top_p, DEF_REP, UInt64(0))
                 else:
                     gen = generate(ctx, w, ids, max_new)

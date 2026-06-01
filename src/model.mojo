@@ -526,72 +526,85 @@ def upload_ids(ctx: DeviceContext, vals: List[Int]) raises -> DeviceBuffer[DType
             mt[i] = rebind[mt.ElementType](Int32(vals[i]))
     return d^
 
-def generate(ctx: DeviceContext, mut w: Weights, prompt: List[Int], max_new: Int) raises -> List[Int]:
-    """Greedy decode: prefill the prompt then emit tokens until EOS or max_new."""
-    var P = len(prompt)
-    var max_seq = P + max_new + 2
+def argmax_f(logits: List[Float32]) -> Int:
+    var best = -1
+    var best_v = Float32(-1.0e30)
+    for i in range(len(logits)):
+        if logits[i] > best_v:
+            best_v = logits[i]
+            best = i
+    return best
+
+
+# ── decode session: KV caches + position, the per-step primitive ──────────────
+
+@fieldwise_init
+struct Session(Movable):
+    """Holds the per-layer KV caches and the current position. `prefill` runs the
+    prompt and returns the last-position logits; `step` advances one token. Shared
+    by greedy/sampled generate and the server's streaming loop."""
+    var kcs: List[DevBuf]
+    var vcs: List[DevBuf]
+    var dummy: DevBuf
+    var cache_len: Int
+    var pos: Int
+
+
+def new_session(ctx: DeviceContext, max_seq: Int) raises -> Session:
     var cache_len = max_seq * NKV
     var kcs = List[DevBuf]()
     var vcs = List[DevBuf]()
     for _ in range(NLAYERS):
         kcs.append(ctx.enqueue_create_buffer[DType.float32](cache_len))
         vcs.append(ctx.enqueue_create_buffer[DType.float32](cache_len))
-    var dummy = ctx.enqueue_create_buffer[DType.float32](1)
+    return Session(kcs^, vcs^, ctx.enqueue_create_buffer[DType.float32](1), cache_len, 0)
 
+
+def sess_prefill(ctx: DeviceContext, mut w: Weights, mut s: Session, prompt: List[Int]) raises -> List[Float32]:
+    var P = len(prompt)
     var ids_dev = upload_ids(ctx, prompt)
     var h = embed_tokens(ctx, ids_dev, w.embed, P)
     for l in range(NLAYERS):
-        h = layer_cached(ctx, w, l, h, kcs[l], vcs[l], P, 0, cache_len, dummy)
-    var nxt = argmax_last(ctx, w, h, P, dummy)
+        h = layer_cached(ctx, w, l, h, s.kcs[l], s.vcs[l], P, 0, s.cache_len, s.dummy)
+    s.pos = P
+    return logits_last(ctx, w, h, P, s.dummy)
 
+
+def sess_step(ctx: DeviceContext, mut w: Weights, mut s: Session, token: Int) raises -> List[Float32]:
+    var one = upload_ids(ctx, [token])
+    var h = embed_tokens(ctx, one, w.embed, 1)
+    for l in range(NLAYERS):
+        h = layer_cached(ctx, w, l, h, s.kcs[l], s.vcs[l], 1, s.pos, s.cache_len, s.dummy)
+    s.pos += 1
+    return logits_last(ctx, w, h, 1, s.dummy)
+
+
+def generate(ctx: DeviceContext, mut w: Weights, prompt: List[Int], max_new: Int) raises -> List[Int]:
+    """Greedy decode: prefill the prompt then emit tokens until EOS or max_new."""
+    var s = new_session(ctx, len(prompt) + max_new + 2)
+    var nxt = argmax_f(sess_prefill(ctx, w, s, prompt))
     var gen = List[Int]()
     gen.append(nxt)
-    var pos = P
     while len(gen) < max_new and nxt != EOS1 and nxt != EOS2:
-        var one = upload_ids(ctx, [nxt])
-        var h1 = embed_tokens(ctx, one, w.embed, 1)
-        for l in range(NLAYERS):
-            h1 = layer_cached(ctx, w, l, h1, kcs[l], vcs[l], 1, pos, cache_len, dummy)
-        nxt = argmax_last(ctx, w, h1, 1, dummy)
-        pos += 1
+        nxt = argmax_f(sess_step(ctx, w, s, nxt))
         gen.append(nxt)
     return gen^
+
 
 def generate_sample(ctx: DeviceContext, mut w: Weights, prompt: List[Int], max_new: Int,
                     temp: Float32, top_k: Int, top_p: Float32, rep_pen: Float32,
                     seed: UInt64) raises -> List[Int]:
     """Greedy-structure decode but draw each token from the processed distribution."""
-    var P = len(prompt)
-    var max_seq = P + max_new + 2
-    var cache_len = max_seq * NKV
-    var kcs = List[DevBuf]()
-    var vcs = List[DevBuf]()
-    for _ in range(NLAYERS):
-        kcs.append(ctx.enqueue_create_buffer[DType.float32](cache_len))
-        vcs.append(ctx.enqueue_create_buffer[DType.float32](cache_len))
-    var dummy = ctx.enqueue_create_buffer[DType.float32](1)
+    var s = new_session(ctx, len(prompt) + max_new + 2)
     var rng = seed if seed != 0 else UInt64(0x9E3779B97F4A7C15)
-
     var context = prompt.copy()
-    var ids_dev = upload_ids(ctx, prompt)
-    var h = embed_tokens(ctx, ids_dev, w.embed, P)
-    for l in range(NLAYERS):
-        h = layer_cached(ctx, w, l, h, kcs[l], vcs[l], P, 0, cache_len, dummy)
-    var dist = process_logits(logits_last(ctx, w, h, P, dummy), context, temp, top_k, top_p, rep_pen)
-    var nxt = sample(dist, rng)
-
+    var nxt = sample(process_logits(sess_prefill(ctx, w, s, prompt), context, temp, top_k, top_p, rep_pen), rng)
     var gen = List[Int]()
     gen.append(nxt)
     context.append(nxt)
-    var pos = P
     while len(gen) < max_new and nxt != EOS1 and nxt != EOS2:
-        var one = upload_ids(ctx, [nxt])
-        var h1 = embed_tokens(ctx, one, w.embed, 1)
-        for l in range(NLAYERS):
-            h1 = layer_cached(ctx, w, l, h1, kcs[l], vcs[l], 1, pos, cache_len, dummy)
-        dist = process_logits(logits_last(ctx, w, h1, 1, dummy), context, temp, top_k, top_p, rep_pen)
+        var dist = process_logits(sess_step(ctx, w, s, nxt), context, temp, top_k, top_p, rep_pen)
         nxt = sample(dist, rng)
         context.append(nxt)
         gen.append(nxt)
-        pos += 1
     return gen^
