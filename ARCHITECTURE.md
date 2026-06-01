@@ -474,6 +474,15 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
    wires it into the decode loop. `pixi run sample-capture` then `pixi run
    test-sample`.
 
+10. **End-to-end pure-Mojo chat CLI works (Phase 6a, ✅).** `src/main.mojo` ties
+    the library into a `prompt → text` program with **no Python on the path**:
+    hardcoded Qwen no-tools chat-template render → `tokenizer.encode` → GPU
+    weight load → greedy `generate` → `tokenizer.decode`. `pixi run chat --
+    "What is the capital of France?"` → `The capital of France is Paris.`; a haiku
+    prompt yields a coherent haiku. The first fully self-contained run of the
+    engine as an application. (Full Jinja templating via ../minja2 and the HTTP
+    server remain — §5.3, Phase 6b.)
+
 ## 12. Code layout
 
 The inference engine is a small Mojo library under `src/`; the `test_*.mojo`

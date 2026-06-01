@@ -68,6 +68,11 @@ test-generate = { cmd = "mkdir -p build && mojo build src/test_generate.mojo -o 
 # distribution vs HF's logits processors. Needs sample-capture.
 test-sample = "mojo run src/test_sample.mojo"
 
+# Phase 6a end-to-end chat CLI (ARCHITECTURE.md §6): prompt -> text, pure Mojo on
+# the GPU. Usage: pixi run chat -- "Your question". Needs tok-capture (tokenizer
+# tables) + a checkpoint path ($QWEN_SAFETENSORS or forward-capture's meta).
+chat = { cmd = "mkdir -p build && mojo build src/main.mojo -o build/chat && ./build/chat" }
+
 [feature.oracle.tasks]
 # Generates tests/fixtures/attention/{synthetic,real_L0,real_L23}/ : q/k/v.bin,
 # expected.bin (NumPy ref), meta.txt. Also asserts NumPy ref ≈ HF context.
