@@ -39,32 +39,30 @@ oracle = ["oracle"]
 gpu-hello = "mojo run src/gpu_hello.mojo"
 build-gpu-hello = "mkdir -p build && mojo build src/gpu_hello.mojo -o build/gpu_hello"
 
-# Phase 1 go/no-go (ARCHITECTURE.md §6): the attention+RoPE spike — the kernel
-# MAX got wrong on Metal. `attn-kernel` runs our hand-written Mojo Metal kernel
-# against fixtures and exits non-zero on mismatch (default env). `attn-capture`
-# regenerates fixtures + the NumPy reference from HF (oracle env).
-attn-kernel = "mojo run src/attention_spike.mojo"
+# Verification gates. Each test_*.mojo drives the src/ library (kernels.mojo,
+# model.mojo, tokenizer.mojo) against fixtures and exits non-zero on mismatch;
+# the matching *-capture task (oracle env) regenerates the fixtures from HF/torch.
 
-# Phase 2 building-block kernels (ARCHITECTURE.md §3, §6): matmul+bias, RMSNorm,
-# SwiGLU MLP. `kernels-spike` verifies the Mojo Metal kernels against fixtures.
-kernels-spike = "mojo run src/kernels_spike.mojo"
+# Phase 1 (ARCHITECTURE.md §6, §11 #1): RoPE + causal GQA attention — the kernel
+# MAX got wrong on Metal — vs the NumPy reference.
+test-attention = "mojo run src/test_attention.mojo"
 
-# Phase 2 safetensors loader (ARCHITECTURE.md §5.1): parse header, bf16→f32,
-# verify against real checkpoint values (needs `loader-capture` first).
-loader-spike = "mojo run src/loader_spike.mojo"
+# Phase 2 (§3, §11 #4): matmul+bias, RMSNorm, SwiGLU vs NumPy.
+test-kernels = "mojo run src/test_kernels.mojo"
 
-# Phase 2 byte-level BPE tokenizer (ARCHITECTURE.md §5.2): encode/decode in pure
-# Mojo, verified byte-identical to transformers (needs `tok-capture` first).
-tok-spike = "mojo run src/tokenizer_spike.mojo"
+# Phase 2 (§5.1, §11 #5): safetensors parse + bf16→f32 vs torch. Needs loader-capture.
+test-loader = "mojo run src/test_loader.mojo"
 
-# Phase 3 full forward pass (ARCHITECTURE.md §6): embed -> 24 layers -> norm ->
-# tied head on the GPU, verified vs HF per-layer + final logits (argmax).
-# Built (not `run`) for compiled-speed weight loading. Needs `forward-capture`.
-forward-spike = { cmd = "mkdir -p build && mojo build src/forward_spike.mojo -o build/forward_spike && ./build/forward_spike" }
+# Phase 2 (§5.2, §11 #6): byte-level BPE encode/decode vs transformers. Needs tok-capture.
+test-tokenizer = "mojo run src/test_tokenizer.mojo"
 
-# Phase 4 greedy decode + KV cache (ARCHITECTURE.md §5.4–5.5): prefill then
-# incremental decode; checked token-for-token vs HF. Needs `generate-capture`.
-generate-spike = { cmd = "mkdir -p build && mojo build src/generate_spike.mojo -o build/generate_spike && ./build/generate_spike" }
+# Phase 3 (§6, §11 #7): full forward pass vs HF per-layer + argmax. Built (not
+# `run`) for compiled-speed weight loading. Needs forward-capture.
+test-forward = { cmd = "mkdir -p build && mojo build src/test_forward.mojo -o build/test_forward && ./build/test_forward" }
+
+# Phase 4 (§5.4–5.5, §11 #8): greedy decode + KV cache, token-for-token vs HF.
+# Needs generate-capture.
+test-generate = { cmd = "mkdir -p build && mojo build src/test_generate.mojo -o build/test_generate && ./build/test_generate" }
 
 [feature.oracle.tasks]
 # Generates tests/fixtures/attention/{synthetic,real_L0,real_L23}/ : q/k/v.bin,

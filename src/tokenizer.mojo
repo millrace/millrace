@@ -1,27 +1,17 @@
-"""Phase-2 byte-level BPE tokenizer + verification gate (ARCHITECTURE.md §5.2).
+"""Byte-level BPE tokenizer for Qwen2 (ARCHITECTURE.md §5.2), pure Mojo.
 
-Encode/decode for Qwen2Tokenizer, in pure Mojo, verified byte-identical to
-transformers on an English corpus. Works entirely in integer token-id space:
-the GPT-2 byte<->unicode map is a bijection and every BPE symbol (incl. all 256
-single bytes) is a vocab token, so `tok-capture` resolves vocab/merges to ids
-and Mojo never touches unicode.
+Encode/decode in integer token-id space (the byte↔unicode map is a bijection and
+every BPE symbol is a vocab token, so no unicode is needed in Mojo). Special-token
+splitting + ASCII-correct Qwen pretokenization + rank-greedy BPE. Loads the tables
+`tok-capture` dumps (vocab/merges resolved to ids). Verified by test_tokenizer.mojo.
 
-Pipeline: split special tokens (matched verbatim) -> ASCII pretokenization
-(the Qwen regex, ASCII-correct) -> bytes -> initial ids -> rank-greedy BPE.
-
-Scope (per decision): ASCII-correct. Non-ASCII \\p{L}/\\p{N} pretokenization is
-deferred — a UTF-8 letter run would be mis-split. The conformance corpus is
-English (incl. the chat template), where this is byte-identical.
-
-Needs `pixi run tok-capture` first (tests/fixtures/tokenizer/, gitignored).
+Scope: ASCII-correct; non-ASCII \\p{L}/\\p{N} pretokenization is deferred.
 """
 
 comptime MUL = 200000          # pair key = left*MUL + right (ids < 151936)
 comptime APOS = 39
 comptime SPACE = 32
 
-
-# ── character classes (ASCII) ─────────────────────────────────────────────────
 
 def is_letter(b: Int) -> Bool:
     return (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
@@ -38,8 +28,6 @@ def is_nl(b: Int) -> Bool:
 def lower(b: Int) -> Int:
     return b + 32 if (b >= 65 and b <= 90) else b
 
-
-# ── tokenizer ─────────────────────────────────────────────────────────────────
 
 @fieldwise_init
 struct SpMatch(Copyable, Movable):
@@ -104,7 +92,7 @@ struct Tokenizer(Movable):
                     q += 1
                 return q
 
-        # rule 3: \p{N}  (single digit)
+        # rule 3: \p{N} (single digit)
         if is_digit(c):
             return pos + 1
 
@@ -136,15 +124,14 @@ struct Tokenizer(Movable):
                     lastnl = i
             if lastnl >= 0:
                 return lastnl + 1
-
             # rule 6/7: \s+(?!\S) then \s+
             if w == end:
-                return w               # trailing run
+                return w
             if w - 1 > pos:
-                return w - 1           # leave one space for the next word
-            return w                   # single space before non-space
+                return w - 1
+            return w
 
-        return pos + 1                 # non-ASCII / unhandled byte: emit one
+        return pos + 1  # non-ASCII / unhandled byte
 
     def encode_normal(self, buf: List[UInt8], start: Int, stop: Int, mut out: List[Int]) raises:
         var p = start
@@ -202,7 +189,6 @@ struct Tokenizer(Movable):
                 for b in self.id_to_bytes[id]:
                     out.append(b)
             else:
-                # special token: emit its text
                 for s in range(len(self.sp_id)):
                     if self.sp_id[s] == id:
                         for b in self.sp_text[s]:
@@ -211,12 +197,10 @@ struct Tokenizer(Movable):
         return out^
 
 
-# ── loading ───────────────────────────────────────────────────────────────────
-
 def hex_val(c: Int) -> Int:
     if c >= 48 and c <= 57:
         return c - 48
-    return c - 97 + 10   # a-f (Python .hex() is lowercase)
+    return c - 97 + 10  # a-f (Python .hex() is lowercase)
 
 def hex_to_bytes(s: String) -> List[UInt8]:
     var sb = s.as_bytes()
@@ -227,17 +211,9 @@ def hex_to_bytes(s: String) -> List[UInt8]:
         i += 2
     return out^
 
-def read_text(path: String) raises -> String:
+def _read(path: String) raises -> String:
     with open(path, "r") as f:
         return f.read()
-
-def read_bytes_file(path: String) raises -> List[UInt8]:
-    var out = List[UInt8]()
-    with open(path, "r") as f:
-        var raw = f.read_bytes()
-        for i in range(len(raw)):
-            out.append(raw[i])
-    return out^
 
 def load_tokenizer(dir: String) raises -> Tokenizer:
     var byte_id = List[Int]()
@@ -245,8 +221,7 @@ def load_tokenizer(dir: String) raises -> Tokenizer:
         byte_id.append(-1)
     var id_to_bytes = Dict[Int, List[UInt8]]()
 
-    var vtext = read_text(dir + "vocab.tsv")
-    for line in vtext.split("\n"):
+    for line in _read(dir + "vocab.tsv").split("\n"):
         var ls = String(line)
         if ls.byte_length() == 0:
             continue
@@ -264,27 +239,22 @@ def load_tokenizer(dir: String) raises -> Tokenizer:
 
     var merge_rank = Dict[Int, Int]()
     var merge_id = Dict[Int, Int]()
-    var mtext = read_text(dir + "merges.tsv")
     var rank = 0
-    for line in mtext.split("\n"):
+    for line in _read(dir + "merges.tsv").split("\n"):
         var ls = String(line)
         if ls.byte_length() == 0:
             continue
         var parts = ls.split(" ")
         if len(parts) < 3:
             continue
-        var l = Int(atol(String(parts[0]).strip()))
-        var r = Int(atol(String(parts[1]).strip()))
-        var mid = Int(atol(String(parts[2]).strip()))
-        var key = l * MUL + r
+        var key = Int(atol(String(parts[0]).strip())) * MUL + Int(atol(String(parts[1]).strip()))
         merge_rank[key] = rank
-        merge_id[key] = mid
+        merge_id[key] = Int(atol(String(parts[2]).strip()))
         rank += 1
 
     var sp_text = List[List[UInt8]]()
     var sp_id = List[Int]()
-    var stext = read_text(dir + "specials.tsv")
-    for line in stext.split("\n"):
+    for line in _read(dir + "specials.tsv").split("\n"):
         var ls = String(line)
         if ls.byte_length() == 0:
             continue
@@ -299,66 +269,3 @@ def load_tokenizer(dir: String) raises -> Tokenizer:
         sp_text.append(tb^)
 
     return Tokenizer(byte_id^, merge_rank^, merge_id^, id_to_bytes^, sp_text^, sp_id^)
-
-
-def ids_equal(a: List[Int], b: List[Int]) -> Bool:
-    if len(a) != len(b):
-        return False
-    for i in range(len(a)):
-        if a[i] != b[i]:
-            return False
-    return True
-
-def bytes_equal(a: List[UInt8], b: List[UInt8]) -> Bool:
-    if len(a) != len(b):
-        return False
-    for i in range(len(a)):
-        if a[i] != b[i]:
-            return False
-    return True
-
-def ids_str(a: List[Int]) -> String:
-    var s = String("")
-    for i in range(len(a)):
-        if i > 0:
-            s += " "
-        s += String(a[i])
-    return s^
-
-
-def main() raises:
-    var dir = "tests/fixtures/tokenizer/"
-    var tok = load_tokenizer(dir)
-    print("loaded tokenizer; running corpus")
-
-    var exp = read_text(dir + "expected.tsv")
-    var lines = exp.split("\n")
-    var count = Int(atol(String(lines[0]).strip()))
-
-    var all_ok = True
-    for i in range(count):
-        # parse "i\tid id id"
-        var parts = String(lines[1 + i]).split("\t")
-        var expected = List[Int]()
-        if len(parts) >= 2:
-            for t in String(parts[1]).split(" "):
-                var ts = String(t).strip()
-                if ts.byte_length() > 0:
-                    expected.append(Int(atol(ts)))
-
-        var buf = read_bytes_file(dir + "prompts/p" + String(i) + ".txt")
-        var got = tok.encode(buf)
-        var enc_ok = ids_equal(got, expected)
-        var dec = tok.decode(expected)
-        var dec_ok = bytes_equal(dec, buf)
-
-        var tag = "OK" if (enc_ok and dec_ok) else "FAIL"
-        print("  p", i, ": encode=", enc_ok, " decode=", dec_ok, " (", len(expected), " toks) [", tag, "]", sep="")
-        if not enc_ok:
-            print("     expected:", ids_str(expected))
-            print("     got:     ", ids_str(got))
-        all_ok = all_ok and enc_ok and dec_ok
-
-    if not all_ok:
-        raise Error("tokenizer does NOT match transformers — spike FAILED")
-    print("OK — Mojo byte-level BPE matches transformers (encode + decode) on the corpus")

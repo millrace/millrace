@@ -380,14 +380,14 @@ only as the CPU oracle that tells us our GPU kernels are right.
 Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
 
 1. **Hand-written Mojo Metal RoPE + causal GQA attention is correct — the
-   go/no-go gate passed.** The spike kernel (`src/attention_spike.mojo`: one GPU
+   go/no-go gate passed.** The attention kernel (`src/kernels.mojo`: one GPU
    thread per (query position, query head), split-half RoPE at θ=1e6, online
    softmax, GQA 14:2) matches a from-scratch NumPy reference to **≤ 8.4e-6
    absolute** on three fixtures: synthetic random Q/K/V, and **real** Q/K/V
    captured from Qwen2.5-0.5B layer 0 and layer 23. This is the exact kernel
    class MAX's Metal backend got *wrong* (max-backend §8 #2 rung 6), so the
    load-bearing risk (§9 #3) is retired: writing our own attention/RoPE on Metal
-   is coherent. Reproduce: `pixi run attn-capture` then `pixi run attn-kernel`.
+   is coherent. Reproduce: `pixi run attn-capture` then `pixi run test-attention`.
 2. **The oracle is HF transformers (CPU/f32), not MAX — a deliberate, equivalent
    substitution for *this* spike.** ARCHITECTURE called for MAX-CPU (§7), but for
    a single-kernel check HF eager attention is the better oracle: it exposes the
@@ -417,13 +417,13 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
    ≤ 1.8e-6, SwiGLU ≤ 4.5e-6 — on synthetic dims *and* real Qwen2 layer-0 weights
    + activations. References cross-checked against HF to ≤ 2.4e-7. With Phase-1
    attention, every compute kernel the forward pass needs is now verified on
-   Metal. `pixi run kernels-capture` then `pixi run kernels-spike`.
+   Metal. `pixi run kernels-capture` then `pixi run test-kernels`.
 5. **Safetensors loader reads the real checkpoint (Phase 2).** A hand-written
    Mojo header parser (8-byte LE length + JSON) locates tensors and decodes bf16
    → f32 (`f32_bits = u16 << 16`, exact). Verified **bit-exact (0.0)** vs torch
    on 6 real Qwen2 tensors (embeddings, norms, q-proj weight+bias, deep-layer
    MLP) — dtype `BF16`, shapes, and first elements all match.
-   `pixi run loader-capture` then `pixi run loader-spike`.
+   `pixi run loader-capture` then `pixi run test-loader`.
 6. **Byte-level BPE tokenizer is byte-identical to transformers (Phase 2,
    complete).** Encode *and* decode match on an 8-prompt English corpus (the full
    chat template with special tokens + newlines, multi-space, digits+punctuation,
@@ -432,7 +432,7 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
    unicode in Mojo. The pretokenizer implements the Qwen regex ASCII-correct;
    **non-ASCII `\p{L}`/`\p{N}` is deferred** (a UTF-8 letter run would mis-split)
    — fine for the English corpus, to revisit before multilingual input.
-   `pixi run tok-capture` then `pixi run tok-spike`. **Phase 2 is complete; every
+   `pixi run tok-capture` then `pixi run test-tokenizer`. **Phase 2 is complete; every
    piece the forward pass needs is verified.**
 
 ### Phase-3 result
@@ -446,7 +446,7 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
    accumulation, monotone and tiny — no bisection failure), final-norm 1.4e-3,
    and the **greedy next-token argmax agrees exactly** (785 → `'The'`). Kernels
    live in the reusable `src/kernels.mojo`. `pixi run forward-capture` then
-   `pixi run forward-spike`. **The GPU-only native-Mojo Qwen2 is real; only the
+   `pixi run test-forward`. **The GPU-only native-Mojo Qwen2 is real; only the
    decode loop (Phase 4) stands between this and generated text.**
 
 ### Phase-4 result
@@ -458,7 +458,33 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
    on the GPU. For "What is the capital of France?" it produces
    `The capital of France is Paris.` + `<|im_end|>` — **all 8 token ids identical
    to HF greedy generation** (`[785, 6722, 315, 9625, 374, 12095, 13, 151645]`).
-   `pixi run generate-capture` then `pixi run generate-spike`. **End to end, the
+   `pixi run generate-capture` then `pixi run test-generate`. **End to end, the
    pure-Mojo GPU engine reproduces the reference — matching logits became matching
    text.** Remaining: per-request sampling (Phase 5) and the flare HTTP server
    (Phase 6); the inference core is done.
+
+## 12. Code layout
+
+The inference engine is a small Mojo library under `src/`; the `test_*.mojo`
+files are thin verification gates that drive it against the `*-capture` fixtures.
+
+**Library (no `main`, importable):**
+- `src/kernels.mojo` — GPU Metal kernels: `cvt` (bf16→f32), `embed`, `add`,
+  `rmsnorm`, `matmul`, `silu_mul`, `attn_cached` (RoPE + causal GQA over a KV
+  cache; prefill is just `q_offset=0`), `copy`.
+- `src/model.mojo` — the model: safetensors header parser + bf16→f32 weight
+  loader, the op launchers over the kernels, `Weights`, `layer_cached` (prefill
+  and decode), `argmax_last`, and greedy `generate`. Hardcoded to Qwen2.5-0.5B.
+- `src/tokenizer.mojo` — byte-level BPE `Tokenizer` + `load_tokenizer`.
+- `src/testio.mojo` — fixture readers + device-buffer comparison helpers (gates only).
+
+**Gates (`main`, import the library) and their oracle captures:**
+- `test_attention` ← `attn-capture` · `test_kernels` ← `kernels-capture`
+- `test_loader` ← `loader-capture` · `test_tokenizer` ← `tok-capture`
+- `test_forward` ← `forward-capture` · `test_generate` ← `generate-capture`
+- `gpu_hello` — the Phase-0 standalone Metal smoke check.
+
+A `pixi run test-<x>` runs a gate (default env, GPU); `pixi run <x>-capture`
+regenerates its fixtures from HF/torch (oracle env). The capture scripts live in
+`tests/manual/<x>_spike/`. Not yet built: the chat-template path via minja2
+(§5.3) and the HTTP server (§6 Phase 6).

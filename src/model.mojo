@@ -1,26 +1,23 @@
-"""Phase-3 full Qwen2.5-0.5B forward pass on the GPU + verification gate.
+"""Native-Mojo Qwen2.5-0.5B-Instruct inference library (ARCHITECTURE.md §3, §5).
 
-Assembles the verified kernels (src/kernels.mojo) into the whole model — embed →
-24 decoder layers (RMSNorm → QKV → RoPE+attention → o_proj → residual; RMSNorm →
-SwiGLU → residual) → final RMSNorm → tied LM head — running entirely on the M4
-GPU in float32, with weights loaded from the real safetensors checkpoint.
+Everything needed to run the model on the GPU, independent of any test harness:
+  - safetensors header parsing + bf16→f32 weight loading to device buffers
+  - the op launchers (matmul+bias, RMSNorm, residual add, SwiGLU's silu·mul,
+    embedding gather, KV-cached attention) over src/kernels.mojo
+  - one decoder layer (`layer_cached`, used for both prefill at q_offset=0 and
+    single-token decode), `argmax_last`, and greedy `generate`
 
-Verifies against HF (CPU/f32, via `forward-capture`): the residual-stream hidden
-state after the embedding and after every layer (per-layer comparison =
-layer-bisection, max-backend §8 #2 rung 6), the final-norm output, and the
-last-position logits — requiring **greedy-argmax agreement** (the next-token
-decision matches). Build + run via `pixi run forward-spike`.
+Hardcoded to Qwen2.5-0.5B (ARCHITECTURE.md §2). Verified by the test_*.mojo gates.
 """
 
 from std.math import ceildiv
-from std.sys import has_accelerator
 from std.gpu.host import DeviceContext, DeviceBuffer
 from std.memory import memcpy
 from layout import TileTensor, row_major
 
 from kernels import (
     cvt_kernel, embed_kernel, add_kernel, rmsnorm_kernel, matmul_kernel,
-    silu_mul_kernel, attn_kernel,
+    silu_mul_kernel, attn_cached_kernel, copy_kernel,
 )
 
 comptime H = 896
@@ -29,11 +26,13 @@ comptime INTER = 4864
 comptime VOCAB = 151936
 comptime NLAYERS = 24
 comptime BLOCK = 256
+comptime EOS1 = 151645
+comptime EOS2 = 151643
 
 comptime DevBuf = DeviceBuffer[DType.float32]
 
 
-# ── safetensors header parsing (JSON subset) ──────────────────────────────────
+# ── safetensors header (JSON subset) ──────────────────────────────────────────
 
 comptime QUOTE = 34
 comptime LBRACE = 123
@@ -195,29 +194,8 @@ def parse_header(buf: List[UInt8]) raises -> List[TensorEntry]:
         break
     return entries^
 
-
-# ── weights ────────────────────────────────────────────────────────────────────
-
-@fieldwise_init
-struct Weights(Movable):
-    var embed: DevBuf
-    var final_norm: DevBuf
-    var ln1: List[DevBuf]
-    var qw: List[DevBuf]
-    var qb: List[DevBuf]
-    var kw: List[DevBuf]
-    var kb: List[DevBuf]
-    var vw: List[DevBuf]
-    var vb: List[DevBuf]
-    var ow: List[DevBuf]
-    var ln2: List[DevBuf]
-    var gate: List[DevBuf]
-    var up: List[DevBuf]
-    var down: List[DevBuf]
-
-
 def read_header(path: String) raises -> List[TensorEntry]:
-    """Parse the header; returns entries with begin/end as ABSOLUTE file offsets."""
+    """Parse the header; entries' begin/end are ABSOLUTE file offsets."""
     with open(path, "r") as f:
         var lenb = f.read_bytes(8)
         var hlen: UInt64 = 0
@@ -231,6 +209,8 @@ def read_header(path: String) raises -> List[TensorEntry]:
             entries[i].end += ds
         return entries^
 
+
+# ── weight loading (bf16 → f32 on device) ─────────────────────────────────────
 
 def load_one(ctx: DeviceContext, path: String, begin: Int, end: Int) raises -> DevBuf:
     var nbytes = end - begin
@@ -253,11 +233,28 @@ def load_one(ctx: DeviceContext, path: String, begin: Int, end: Int) raises -> D
         ctx.synchronize()
     return dev_f32^
 
-
-def load_named(ctx: DeviceContext, path: String,
-               entries: List[TensorEntry], name2idx: Dict[String, Int], name: String) raises -> DevBuf:
+def load_named(ctx: DeviceContext, path: String, entries: List[TensorEntry],
+               name2idx: Dict[String, Int], name: String) raises -> DevBuf:
     var idx = name2idx[name]
     return load_one(ctx, path, entries[idx].begin, entries[idx].end)
+
+
+@fieldwise_init
+struct Weights(Movable):
+    var embed: DevBuf
+    var final_norm: DevBuf
+    var ln1: List[DevBuf]
+    var qw: List[DevBuf]
+    var qb: List[DevBuf]
+    var kw: List[DevBuf]
+    var kb: List[DevBuf]
+    var vw: List[DevBuf]
+    var vb: List[DevBuf]
+    var ow: List[DevBuf]
+    var ln2: List[DevBuf]
+    var gate: List[DevBuf]
+    var up: List[DevBuf]
+    var down: List[DevBuf]
 
 
 def load_weights(ctx: DeviceContext, path: String) raises -> Weights:
@@ -294,13 +291,10 @@ def load_weights(ctx: DeviceContext, path: String) raises -> Weights:
         gate.append(load_named(ctx, path, entries, name2idx, p + "mlp.gate_proj.weight"))
         up.append(load_named(ctx, path, entries, name2idx, p + "mlp.up_proj.weight"))
         down.append(load_named(ctx, path, entries, name2idx, p + "mlp.down_proj.weight"))
-    return Weights(
-        embed^, final_norm^, ln1^, qw^, qb^, kw^, kb^, vw^, vb^, ow^, ln2^,
-        gate^, up^, down^,
-    )
+    return Weights(embed^, final_norm^, ln1^, qw^, qb^, kw^, kb^, vw^, vb^, ow^, ln2^, gate^, up^, down^)
 
 
-# ── op helpers (each launches one kernel, returns a new device buffer) ─────────
+# ── op launchers (each runs one kernel, returns a new device buffer) ───────────
 
 def mm(ctx: DeviceContext, mut x: DevBuf, mut w: DevBuf, mut b: DevBuf,
        M: Int, K: Int, N: Int, use_bias: Int) raises -> DevBuf:
@@ -315,12 +309,12 @@ def mm(ctx: DeviceContext, mut x: DevBuf, mut w: DevBuf, mut b: DevBuf,
     )
     return y^
 
-def rms(ctx: DeviceContext, mut x: DevBuf, mut w: DevBuf, T: Int) raises -> DevBuf:
-    var y = ctx.enqueue_create_buffer[DType.float32](T * H)
-    var lay = row_major(T * H)
+def rmsnorm(ctx: DeviceContext, mut x: DevBuf, mut w: DevBuf, T: Int, dim: Int) raises -> DevBuf:
+    var y = ctx.enqueue_create_buffer[DType.float32](T * dim)
+    var lay = row_major(T * dim)
     comptime k = rmsnorm_kernel[type_of(lay)]
     ctx.enqueue_function[k](
-        TileTensor(x, lay), TileTensor(w, row_major(H)), TileTensor(y, lay), T, H,
+        TileTensor(x, lay), TileTensor(w, row_major(dim)), TileTensor(y, lay), T, dim,
         grid_dim=ceildiv(T, 64), block_dim=64,
     )
     return y^
@@ -335,7 +329,7 @@ def add(ctx: DeviceContext, mut a: DevBuf, mut b: DevBuf, n: Int) raises -> DevB
     )
     return y^
 
-def silumul(ctx: DeviceContext, mut a: DevBuf, mut b: DevBuf, n: Int) raises -> DevBuf:
+def silu_mul(ctx: DeviceContext, mut a: DevBuf, mut b: DevBuf, n: Int) raises -> DevBuf:
     var y = ctx.enqueue_create_buffer[DType.float32](n)
     var lay = row_major(n)
     comptime k = silu_mul_kernel[type_of(lay)]
@@ -345,74 +339,69 @@ def silumul(ctx: DeviceContext, mut a: DevBuf, mut b: DevBuf, n: Int) raises -> 
     )
     return y^
 
-def attention(ctx: DeviceContext, mut q: DevBuf, mut k: DevBuf, mut v: DevBuf, T: Int) raises -> DevBuf:
-    var o = ctx.enqueue_create_buffer[DType.float32](T * H)
+def embed_tokens(ctx: DeviceContext, mut ids: DeviceBuffer[DType.int32], mut emb: DevBuf, T: Int) raises -> DevBuf:
+    var h = ctx.enqueue_create_buffer[DType.float32](T * H)
     var lay = row_major(T * H)
-    comptime kk = attn_kernel[type_of(lay)]
-    ctx.enqueue_function[kk](
-        TileTensor(q, row_major(T * H)), TileTensor(k, row_major(T * NKV)),
-        TileTensor(v, row_major(T * NKV)), TileTensor(o, lay), T,
-        grid_dim=ceildiv(T * 14, 14), block_dim=14,
+    comptime k = embed_kernel[type_of(lay)]
+    ctx.enqueue_function[k](
+        TileTensor(ids, row_major(T)), TileTensor(emb, row_major(VOCAB * H)),
+        TileTensor(h, lay), T, H,
+        grid_dim=ceildiv(T * H, BLOCK), block_dim=BLOCK,
+    )
+    return h^
+
+def copy_into(ctx: DeviceContext, mut src: DevBuf, mut dst: DevBuf, dst_offset: Int, n: Int, dst_len: Int) raises:
+    var lay = row_major(n)
+    comptime k = copy_kernel[type_of(lay)]
+    ctx.enqueue_function[k](
+        TileTensor(src, lay), TileTensor(dst, row_major(dst_len)), dst_offset, n,
+        grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK,
+    )
+
+def attn_cached(ctx: DeviceContext, mut q: DevBuf, mut kc: DevBuf, mut vc: DevBuf,
+                Tq: Int, q_offset: Int, cache_len: Int) raises -> DevBuf:
+    var o = ctx.enqueue_create_buffer[DType.float32](Tq * H)
+    var lay = row_major(Tq * H)
+    comptime k = attn_cached_kernel[type_of(lay)]
+    ctx.enqueue_function[k](
+        TileTensor(q, row_major(Tq * H)), TileTensor(kc, row_major(cache_len)),
+        TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset,
+        grid_dim=ceildiv(Tq * 14, 14), block_dim=14,
     )
     return o^
 
-def layer(ctx: DeviceContext, mut w: Weights, l: Int, mut h: DevBuf, mut dummy: DevBuf, T: Int) raises -> DevBuf:
-    var ln1 = rms(ctx, h, w.ln1[l], T)
-    var q = mm(ctx, ln1, w.qw[l], w.qb[l], T, H, H, 1)
-    var k = mm(ctx, ln1, w.kw[l], w.kb[l], T, H, NKV, 1)
-    var v = mm(ctx, ln1, w.vw[l], w.vb[l], T, H, NKV, 1)
-    var a = attention(ctx, q, k, v, T)
-    var o = mm(ctx, a, w.ow[l], dummy, T, H, H, 0)
-    var h2 = add(ctx, h, o, T * H)
-    var ln2 = rms(ctx, h2, w.ln2[l], T)
-    var g = mm(ctx, ln2, w.gate[l], dummy, T, H, INTER, 0)
-    var u = mm(ctx, ln2, w.up[l], dummy, T, H, INTER, 0)
-    var gu = silumul(ctx, g, u, T * INTER)
-    var dn = mm(ctx, gu, w.down[l], dummy, T, INTER, H, 0)
-    var h3 = add(ctx, h2, dn, T * H)
-    return h3^
 
+# ── model assembly ─────────────────────────────────────────────────────────────
 
-# ── fixtures + comparison ──────────────────────────────────────────────────────
+def layer_cached(ctx: DeviceContext, mut w: Weights, l: Int, mut h: DevBuf,
+                 mut kc: DevBuf, mut vc: DevBuf, Tq: Int, q_offset: Int,
+                 cache_len: Int, mut dummy: DevBuf) raises -> DevBuf:
+    """One decoder layer. Prefill = (Tq=P, q_offset=0); decode = (Tq=1, q_offset=pos)."""
+    var ln1 = rmsnorm(ctx, h, w.ln1[l], Tq, H)
+    var q = mm(ctx, ln1, w.qw[l], w.qb[l], Tq, H, H, 1)
+    var kk = mm(ctx, ln1, w.kw[l], w.kb[l], Tq, H, NKV, 1)
+    var vv = mm(ctx, ln1, w.vw[l], w.vb[l], Tq, H, NKV, 1)
+    copy_into(ctx, kk, kc, q_offset * NKV, Tq * NKV, cache_len)
+    copy_into(ctx, vv, vc, q_offset * NKV, Tq * NKV, cache_len)
+    var o = attn_cached(ctx, q, kc, vc, Tq, q_offset, cache_len)
+    var o2 = mm(ctx, o, w.ow[l], dummy, Tq, H, H, 0)
+    var h2 = add(ctx, h, o2, Tq * H)
+    var ln2 = rmsnorm(ctx, h2, w.ln2[l], Tq, H)
+    var g = mm(ctx, ln2, w.gate[l], dummy, Tq, H, INTER, 0)
+    var u = mm(ctx, ln2, w.up[l], dummy, Tq, H, INTER, 0)
+    var gu = silu_mul(ctx, g, u, Tq * INTER)
+    var dn = mm(ctx, gu, w.down[l], dummy, Tq, INTER, H, 0)
+    return add(ctx, h2, dn, Tq * H)
 
-def read_text(path: String) raises -> String:
-    with open(path, "r") as f:
-        return f.read()
-
-def read_f32(path: String) raises -> List[Float32]:
-    var out = List[Float32]()
-    with open(path, "r") as f:
-        var raw = f.read_bytes()
-        var p = raw.unsafe_ptr().bitcast[Float32]()
-        for i in range(len(raw) // 4):
-            out.append(p[i])
-    return out^
-
-def read_i32(path: String) raises -> List[Int32]:
-    var out = List[Int32]()
-    with open(path, "r") as f:
-        var raw = f.read_bytes()
-        var p = raw.unsafe_ptr().bitcast[Int32]()
-        for i in range(len(raw) // 4):
-            out.append(p[i])
-    return out^
-
-def max_abs(mut dev: DevBuf, expected: List[Float32]) raises -> Float32:
-    var n = len(expected)
-    var worst = Float32(0.0)
-    with dev.map_to_host() as m:
-        var mt = TileTensor(m, row_major(len(expected)))
-        for i in range(n):
-            var d = abs(rebind[Scalar[DType.float32]](mt[i]) - expected[i])
-            if d > worst:
-                worst = d
-    return worst
-
-def argmax_dev_lastrow(mut dev: DevBuf, T: Int) raises -> Int:
+def argmax_last(ctx: DeviceContext, mut w: Weights, mut h: DevBuf, T: Int, mut dummy: DevBuf) raises -> Int:
+    """Final RMSNorm + tied LM head; argmax over the last position's logits."""
+    var hn = rmsnorm(ctx, h, w.final_norm, T, H)
+    var logits = mm(ctx, hn, w.embed, dummy, T, H, VOCAB, 0)
+    ctx.synchronize()
+    var base = (T - 1) * VOCAB
     var best = -1
     var best_v = Float32(-1.0e30)
-    var base = (T - 1) * VOCAB
-    with dev.map_to_host() as m:
+    with logits.map_to_host() as m:
         var mt = TileTensor(m, row_major(T * VOCAB))
         for i in range(VOCAB):
             var v = rebind[Scalar[DType.float32]](mt[base + i])
@@ -421,80 +410,42 @@ def argmax_dev_lastrow(mut dev: DevBuf, T: Int) raises -> Int:
                 best = i
     return best
 
-def argmax_list(a: List[Float32]) -> Int:
-    var best = -1
-    var best_v = Float32(-1.0e30)
-    for i in range(len(a)):
-        if a[i] > best_v:
-            best_v = a[i]
-            best = i
-    return best
+def upload_ids(ctx: DeviceContext, vals: List[Int]) raises -> DeviceBuffer[DType.int32]:
+    var n = len(vals)
+    var d = ctx.enqueue_create_buffer[DType.int32](n)
+    with d.map_to_host() as m:
+        var mt = TileTensor(m, row_major(n))
+        for i in range(n):
+            mt[i] = rebind[mt.ElementType](Int32(vals[i]))
+    return d^
 
-
-def main() raises:
-    comptime if not has_accelerator():
-        raise Error("no GPU accelerator detected — this is a GPU-only build")
-
-    var dir = "tests/fixtures/forward/"
-    var meta = read_text(dir + "meta.txt").split("\n")
-    var T = Int(atol(String(meta[0]).strip()))
-    var ckpt = String(String(meta[1]).strip())
-    print("forward spike — T=", T, " loading weights…", sep="")
-
-    var ctx = DeviceContext()
-    var w = load_weights(ctx, ckpt)
+def generate(ctx: DeviceContext, mut w: Weights, prompt: List[Int], max_new: Int) raises -> List[Int]:
+    """Greedy decode: prefill the prompt then emit tokens until EOS or max_new."""
+    var P = len(prompt)
+    var max_seq = P + max_new + 2
+    var cache_len = max_seq * NKV
+    var kcs = List[DevBuf]()
+    var vcs = List[DevBuf]()
+    for _ in range(NLAYERS):
+        kcs.append(ctx.enqueue_create_buffer[DType.float32](cache_len))
+        vcs.append(ctx.enqueue_create_buffer[DType.float32](cache_len))
     var dummy = ctx.enqueue_create_buffer[DType.float32](1)
 
-    # ids -> device int32
-    var ids_host = read_i32(dir + "ids.bin")
-    var ids_dev = ctx.enqueue_create_buffer[DType.int32](T)
-    with ids_dev.map_to_host() as m:
-        var mt = TileTensor(m, row_major(T))
-        for i in range(T):
-            mt[i] = rebind[mt.ElementType](ids_host[i])
-
-    # embed
-    var h = ctx.enqueue_create_buffer[DType.float32](T * H)
-    var elay = row_major(T * H)
-    comptime ek = embed_kernel[type_of(elay)]
-    ctx.enqueue_function[ek](
-        TileTensor(ids_dev, row_major(T)), TileTensor(w.embed, row_major(VOCAB * H)),
-        TileTensor(h, elay), T, H,
-        grid_dim=ceildiv(T * H, BLOCK), block_dim=BLOCK,
-    )
-    ctx.synchronize()
-
-    var all_ok = True
-    var worst_layer = max_abs(h, read_f32(dir + "embed.bin"))
-    print("  embed        max_abs=", worst_layer)
-
+    var ids_dev = upload_ids(ctx, prompt)
+    var h = embed_tokens(ctx, ids_dev, w.embed, P)
     for l in range(NLAYERS):
-        h = layer(ctx, w, l, h, dummy, T)
-        ctx.synchronize()
-        var ma = max_abs(h, read_f32(dir + "layer_" + String(l) + ".bin"))
-        if ma > worst_layer:
-            worst_layer = ma
-        if ma > 5.0e-2:
-            print("  layer ", l, "   max_abs=", ma, "  <-- large", sep="")
-            all_ok = False
+        h = layer_cached(ctx, w, l, h, kcs[l], vcs[l], P, 0, cache_len, dummy)
+    var nxt = argmax_last(ctx, w, h, P, dummy)
 
-    var hn = rms(ctx, h, w.final_norm, T)
-    ctx.synchronize()
-    var ma_norm = max_abs(hn, read_f32(dir + "final_norm.bin"))
-    print("  final_norm   max_abs=", ma_norm)
-
-    var logits = mm(ctx, hn, w.embed, dummy, T, H, VOCAB, 0)
-    ctx.synchronize()
-    var ref_last = read_f32(dir + "logits_last.bin")
-    var gpu_am = argmax_dev_lastrow(logits, T)
-    var ref_am = argmax_list(ref_last)
-
-    print("  worst per-layer hidden max_abs=", worst_layer)
-    print("  argmax  gpu=", gpu_am, "  ref=", ref_am, sep="")
-    var argmax_ok = gpu_am == ref_am
-    if not argmax_ok:
-        all_ok = False
-
-    if not all_ok:
-        raise Error("forward pass mismatch — Phase 3 FAILED")
-    print("OK — GPU forward matches HF/CPU per layer; greedy next-token argmax agrees (", gpu_am, ")", sep="")
+    var gen = List[Int]()
+    gen.append(nxt)
+    var pos = P
+    while len(gen) < max_new and nxt != EOS1 and nxt != EOS2:
+        var one = upload_ids(ctx, [nxt])
+        var h1 = embed_tokens(ctx, one, w.embed, 1)
+        for l in range(NLAYERS):
+            h1 = layer_cached(ctx, w, l, h1, kcs[l], vcs[l], 1, pos, cache_len, dummy)
+        nxt = argmax_last(ctx, w, h1, 1, dummy)
+        pos += 1
+        gen.append(nxt)
+    return gen^
