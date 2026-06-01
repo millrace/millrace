@@ -268,7 +268,7 @@ positions), so it is verifiable in isolation with no other component built.
 | **2 — Remaining kernels + loader + tokenizer** *(✅ done)* | matmul/RMSNorm/SwiGLU GPU kernels (matmul bit-exact, others ≤ 4.5e-6 vs NumPy on real layer-0); safetensors loader (bf16→f32, bit-exact vs torch on 6 real tensors); byte-level BPE encode/decode **byte-identical to transformers** on the English corpus (ASCII-correct pretokenizer; non-ASCII `\p{L}`/`\p{N}` deferred). See §11 #4–6. |
 | **3 — Forward pass** *(✅ done)* | embed → 24 layers → final norm → tied head on GPU/f32, real weights loaded from safetensors. **Greedy next-token argmax agrees with HF/CPU** (785, `'The'`); per-layer hidden drift ≤ 2.5e-3 over 24 layers (pure f32 accumulation). Per-layer comparison gives the layer-bisection (max-backend §8 #2 rung 6). See §11 #7. |
 | **4 — Decode loop + KV cache** *(✅ done)* | Prefill + incremental greedy decode on-device (per-layer KV cache, RoPE-by-cache-row so a step is O(positions)), EOS handling. **Token-for-token greedy parity with HF**: "What is the capital of France?" → `The capital of France is Paris.` + EOS, all 8 ids identical. See §11 #8. |
-| **5 — Sampling** | temperature/top-k/top-p/repetition-penalty per `generation_config.json` (§5.6). |
+| **5 — Sampling** *(✅ done)* | repetition-penalty → temperature → top-k → top-p → softmax per `generation_config.json`, then seeded multinomial draw (§5.6). Distribution verified vs HF's logits processors (max prob diff ≤ 6e-8). See §11 #9. |
 | **6 — Serve** | Port max-backend's flare HTTP layer (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`) onto this engine — now a *pure-Mojo, GPU* request path end to end, **no Python/MAX at runtime**. |
 | **Later — bf16 GPU** | bf16-native device compute (§4) once it matches the f32 reference. |
 | **Later — Generalize** | Replace the hardcoded constants with a parsed `config.json` + a weight-name scheme; add a second architecture. The hardcoding in §2 is the seam this phase widens. |
@@ -462,6 +462,17 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
    pure-Mojo GPU engine reproduces the reference — matching logits became matching
    text.** Remaining: per-request sampling (Phase 5) and the flare HTTP server
    (Phase 6); the inference core is done.
+
+9. **Sampling matches HF's logits processors (Phase 5, ✅).** `process_logits`
+   applies repetition-penalty (1.1) → temperature (0.7) → top-k (20) → top-p
+   (0.8) → softmax exactly in HF's order, then `sample` draws from the result
+   with a seeded xorshift RNG. Token-for-token parity is impossible (RNG differs),
+   so the gate verifies the **distribution**: on a real logits vector the kept
+   token ids and probabilities match HF's `LogitsProcessorList` — **max prob diff
+   ≤ 6e-8** on both the real config (1 kept token) and a high-entropy case (3
+   kept, exercising top-k/top-p ordering + renormalization). `model.generate_sample`
+   wires it into the decode loop. `pixi run sample-capture` then `pixi run
+   test-sample`.
 
 ## 12. Code layout
 

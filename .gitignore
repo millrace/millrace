@@ -28,3 +28,6 @@ tests/fixtures/forward/
 # Generation fixtures reference a machine-specific checkpoint path; regenerate
 # with `pixi run generate-capture`.
 tests/fixtures/generate/
+
+# Sampling fixtures; regenerate with `pixi run sample-capture`.
+tests/fixtures/sample/

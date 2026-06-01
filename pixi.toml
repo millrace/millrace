@@ -64,6 +64,10 @@ test-forward = { cmd = "mkdir -p build && mojo build src/test_forward.mojo -o bu
 # Needs generate-capture.
 test-generate = { cmd = "mkdir -p build && mojo build src/test_generate.mojo -o build/test_generate && ./build/test_generate" }
 
+# Phase 5 (§5.6, §11 #9): sampling pipeline (rep-penalty/temp/top-k/top-p)
+# distribution vs HF's logits processors. Needs sample-capture.
+test-sample = "mojo run src/test_sample.mojo"
+
 [feature.oracle.tasks]
 # Generates tests/fixtures/attention/{synthetic,real_L0,real_L23}/ : q/k/v.bin,
 # expected.bin (NumPy ref), meta.txt. Also asserts NumPy ref ≈ HF context.
@@ -79,3 +83,5 @@ tok-capture = "python tests/manual/tokenizer_spike/capture.py"
 forward-capture = "python tests/manual/forward_spike/capture.py"
 # Dumps prompt ids + HF greedy continuation token ids.
 generate-capture = "python tests/manual/generate_spike/capture.py"
+# Dumps raw logits + context + HF's processed (id,prob) distribution.
+sample-capture = "python tests/manual/sample_spike/capture.py"

@@ -10,7 +10,7 @@ Everything needed to run the model on the GPU, independent of any test harness:
 Hardcoded to Qwen2.5-0.5B (ARCHITECTURE.md §2). Verified by the test_*.mojo gates.
 """
 
-from std.math import ceildiv
+from std.math import ceildiv, exp
 from std.gpu.host import DeviceContext, DeviceBuffer
 from std.memory import memcpy
 from layout import TileTensor, row_major
@@ -410,6 +410,113 @@ def argmax_last(ctx: DeviceContext, mut w: Weights, mut h: DevBuf, T: Int, mut d
                 best = i
     return best
 
+def logits_last(ctx: DeviceContext, mut w: Weights, mut h: DevBuf, T: Int, mut dummy: DevBuf) raises -> List[Float32]:
+    """Final RMSNorm + tied LM head; returns the last position's logits on host."""
+    var hn = rmsnorm(ctx, h, w.final_norm, T, H)
+    var logits = mm(ctx, hn, w.embed, dummy, T, H, VOCAB, 0)
+    ctx.synchronize()
+    var out = List[Float32]()
+    var base = (T - 1) * VOCAB
+    with logits.map_to_host() as m:
+        var mt = TileTensor(m, row_major(T * VOCAB))
+        for i in range(VOCAB):
+            out.append(rebind[Scalar[DType.float32]](mt[base + i]))
+    return out^
+
+
+# ── sampling (ARCHITECTURE.md §5.6; generation_config.json defaults) ───────────
+
+@fieldwise_init
+struct Dist(Movable):
+    var ids: List[Int]
+    var probs: List[Float32]
+
+
+def process_logits(logits: List[Float32], context: List[Int], temp: Float32,
+                   top_k: Int, top_p: Float32, rep_pen: Float32) raises -> Dist:
+    """HF order: repetition_penalty → temperature → top_k → top_p → softmax.
+    Returns the kept token ids and their (renormalized) probabilities."""
+    var v = logits.copy()
+
+    # repetition penalty over the unique tokens seen so far
+    var seen = List[Bool]()
+    for _ in range(len(v)):
+        seen.append(False)
+    for c in context:
+        var id = Int(c)
+        if 0 <= id and id < len(v) and not seen[id]:
+            seen[id] = True
+            v[id] = v[id] / rep_pen if v[id] > 0 else v[id] * rep_pen
+
+    # temperature
+    for i in range(len(v)):
+        v[i] = v[i] / temp
+
+    # top-k: pull the k largest (k is small; selection beats a full sort)
+    var k = top_k if top_k < len(v) else len(v)
+    var used = List[Bool]()
+    for _ in range(len(v)):
+        used.append(False)
+    var ids = List[Int]()
+    var logs = List[Float32]()
+    for _ in range(k):
+        var bi = -1
+        var bv = Float32(-1.0e30)
+        for i in range(len(v)):
+            if not used[i] and v[i] > bv:
+                bv = v[i]
+                bi = i
+        used[bi] = True
+        ids.append(bi)
+        logs.append(v[bi])
+
+    # softmax over the top-k (descending order already)
+    var maxl = logs[0]
+    var ps = List[Float32]()
+    var z = Float32(0.0)
+    for i in range(len(logs)):
+        var e = exp(logs[i] - maxl)
+        ps.append(e)
+        z += e
+    for i in range(len(ps)):
+        ps[i] = ps[i] / z
+
+    # top-p: keep the smallest prefix with cumulative prob >= top_p
+    var keep = 0
+    var cum = Float32(0.0)
+    for i in range(len(ps)):
+        keep = i + 1
+        cum += ps[i]
+        if cum >= top_p:
+            break
+
+    var out_ids = List[Int]()
+    var out_probs = List[Float32]()
+    var s = Float32(0.0)
+    for i in range(keep):
+        s += ps[i]
+    for i in range(keep):
+        out_ids.append(ids[i])
+        out_probs.append(ps[i] / s)
+    return Dist(out_ids^, out_probs^)
+
+
+def next_rand(mut state: UInt64) -> UInt64:
+    state ^= state << UInt64(13)
+    state ^= state >> UInt64(7)
+    state ^= state << UInt64(17)
+    return state
+
+def sample(dist: Dist, mut rng: UInt64) -> Int:
+    var r = Float32(Int(next_rand(rng) >> UInt64(40))) / Float32(1 << 24)  # [0,1)
+    var cum = Float32(0.0)
+    for i in range(len(dist.ids)):
+        cum += dist.probs[i]
+        if r < cum:
+            return dist.ids[i]
+    return dist.ids[len(dist.ids) - 1]
+
+
 def upload_ids(ctx: DeviceContext, vals: List[Int]) raises -> DeviceBuffer[DType.int32]:
     var n = len(vals)
     var d = ctx.enqueue_create_buffer[DType.int32](n)
@@ -448,4 +555,43 @@ def generate(ctx: DeviceContext, mut w: Weights, prompt: List[Int], max_new: Int
         nxt = argmax_last(ctx, w, h1, 1, dummy)
         pos += 1
         gen.append(nxt)
+    return gen^
+
+def generate_sample(ctx: DeviceContext, mut w: Weights, prompt: List[Int], max_new: Int,
+                    temp: Float32, top_k: Int, top_p: Float32, rep_pen: Float32,
+                    seed: UInt64) raises -> List[Int]:
+    """Greedy-structure decode but draw each token from the processed distribution."""
+    var P = len(prompt)
+    var max_seq = P + max_new + 2
+    var cache_len = max_seq * NKV
+    var kcs = List[DevBuf]()
+    var vcs = List[DevBuf]()
+    for _ in range(NLAYERS):
+        kcs.append(ctx.enqueue_create_buffer[DType.float32](cache_len))
+        vcs.append(ctx.enqueue_create_buffer[DType.float32](cache_len))
+    var dummy = ctx.enqueue_create_buffer[DType.float32](1)
+    var rng = seed if seed != 0 else UInt64(0x9E3779B97F4A7C15)
+
+    var context = prompt.copy()
+    var ids_dev = upload_ids(ctx, prompt)
+    var h = embed_tokens(ctx, ids_dev, w.embed, P)
+    for l in range(NLAYERS):
+        h = layer_cached(ctx, w, l, h, kcs[l], vcs[l], P, 0, cache_len, dummy)
+    var dist = process_logits(logits_last(ctx, w, h, P, dummy), context, temp, top_k, top_p, rep_pen)
+    var nxt = sample(dist, rng)
+
+    var gen = List[Int]()
+    gen.append(nxt)
+    context.append(nxt)
+    var pos = P
+    while len(gen) < max_new and nxt != EOS1 and nxt != EOS2:
+        var one = upload_ids(ctx, [nxt])
+        var h1 = embed_tokens(ctx, one, w.embed, 1)
+        for l in range(NLAYERS):
+            h1 = layer_cached(ctx, w, l, h1, kcs[l], vcs[l], 1, pos, cache_len, dummy)
+        dist = process_logits(logits_last(ctx, w, h1, 1, dummy), context, temp, top_k, top_p, rep_pen)
+        nxt = sample(dist, rng)
+        context.append(nxt)
+        gen.append(nxt)
+        pos += 1
     return gen^
