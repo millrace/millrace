@@ -597,8 +597,27 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
     pre-rotated, so the score loop is a plain rotated_q · rotated_k dot. V is
     unchanged; Q is still rotated once per query. Numerically identical (gates
     pass: attention, forward, greedy parity); **server 128-tok decode 13.6 → 19.5
-    tok/s.** The remaining decode cost is still the per-layer matmul chain (levers
-    (1)/(2) above).
+    tok/s.**
+
+    **Per-op profiling corrected the target — it was *thread-starved* kernels,
+    not the matmuls.** Timing each op (`.scratch/bench_ops.mojo`) showed RMSNorm
+    at 0.185 ms (as costly as a 4864-wide matmul) and attention at 0.64 ms @128 /
+    1.22 ms @256 — both far above the matmuls (qkv/o ~0.06, gate/up/down ~0.19).
+    The cause: RMSNorm launched **one thread per row** (1 thread for decode's T=1,
+    doing the whole 896-element reduction serially) and attention **one thread
+    per (query, head)** (14 threads total, each looping every key). Both now use
+    a **warp** as the unit of work — RMSNorm warp-per-row (0.185→0.056 ms);
+    attention warp-per-(query,head) with each lane running flash softmax over its
+    key slice and a cross-lane `warp_max`/`warp_sum` merge, Q pre-rotated by
+    `rope_q_kernel` so the kernel is transcendental-free (0.64→0.10 ms @128, and
+    now **flat in context**: 0.098 ms @256). Gates still pass.
+    **Net: server decode ~11 → ~22.6 tok/s @128, 23.9 @256; long context no
+    longer degrades.** The dominant remaining decode cost is now the per-layer
+    MLP matmuls (gate/up/down at INTER=4864, ~0.19 ms each, ~90 GB/s) plus the
+    lm-head — so lever (1) above (vectorized loads / **bf16-resident weights** to
+    halve the ~90 GB/s traffic, numerically identical since weights are bf16-
+    origin) is the next concrete step; the per-layer megakernel (2) remains the
+    bigger structural effort.
 
 ## 12. Code layout
 
