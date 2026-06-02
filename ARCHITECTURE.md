@@ -587,9 +587,18 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
     the ~10-deep dependent-dispatch chain (rmsnorm→qkv→attn→o→add→rmsnorm→mlp→add)
     into one launch, attacking the per-dispatch latency floor directly. Both are
     substantial, independent efforts; (1) is the more tractable next step and
-    helps the single biggest op (logits). The attention kernel also recomputes
-    RoPE `exp/log/cos/sin` per key per step — precomputing/caching rotated K is a
-    further win as context grows (it explains the ~24→~14 tok/s short-vs-long gap).
+    helps the single biggest op (logits).
+
+    **RoPE-on-write (done, ~1.4x long-context).** Attention used to recompute K's
+    RoPE (`exp/log/cos/sin`) for every past key on every step, redundantly across
+    all 14 query-head threads — which is why throughput fell from ~24 tok/s at
+    short context to ~13.6 at 128 tokens. K is now rotated *once on write* into
+    the cache (`rope_k_kernel`, keyed by cache row = absolute position) and read
+    pre-rotated, so the score loop is a plain rotated_q · rotated_k dot. V is
+    unchanged; Q is still rotated once per query. Numerically identical (gates
+    pass: attention, forward, greedy parity); **server 128-tok decode 13.6 → 19.5
+    tok/s.** The remaining decode cost is still the per-layer matmul chain (levers
+    (1)/(2) above).
 
 ## 12. Code layout
 
