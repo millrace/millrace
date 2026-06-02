@@ -33,6 +33,7 @@ comptime EOS1 = 151645
 comptime EOS2 = 151643
 
 comptime DevBuf = DeviceBuffer[DType.float32]
+comptime WBuf = DeviceBuffer[DType.uint16]   # bf16 weights kept on-device as raw u16
 
 
 # ── safetensors header (JSON subset) ──────────────────────────────────────────
@@ -242,22 +243,45 @@ def load_named(ctx: DeviceContext, path: String, entries: List[TensorEntry],
     return load_one(ctx, path, entries[idx].begin, entries[idx].end)
 
 
+def load_one_bf16(ctx: DeviceContext, path: String, begin: Int, end: Int) raises -> WBuf:
+    """Load a bf16 tensor to device *without* widening to f32 — the matmul/embed
+    kernels widen per element (bf16_widen), halving weight read traffic (§11 #12).
+    The raw safetensors bytes are already bf16, so this is a plain upload."""
+    var nbytes = end - begin
+    var count = nbytes // 2
+    var dev_u16 = ctx.enqueue_create_buffer[DType.uint16](count)
+    with open(path, "r") as f:
+        _ = f.seek(UInt64(begin))
+        var raw = f.read_bytes(nbytes)
+        var host = ctx.enqueue_create_host_buffer[DType.uint16](count)
+        ctx.synchronize()
+        memcpy(dest=host.unsafe_ptr().bitcast[UInt8](), src=raw.unsafe_ptr(), count=nbytes)
+        ctx.enqueue_copy(dev_u16, host)
+        ctx.synchronize()
+    return dev_u16^
+
+def load_named_bf16(ctx: DeviceContext, path: String, entries: List[TensorEntry],
+                    name2idx: Dict[String, Int], name: String) raises -> WBuf:
+    var idx = name2idx[name]
+    return load_one_bf16(ctx, path, entries[idx].begin, entries[idx].end)
+
+
 @fieldwise_init
 struct Weights(Movable):
-    var embed: DevBuf
+    var embed: WBuf            # bf16 — used as both embedding table and (tied) lm-head
     var final_norm: DevBuf
     var ln1: List[DevBuf]
-    var qw: List[DevBuf]
+    var qw: List[WBuf]
     var qb: List[DevBuf]
-    var kw: List[DevBuf]
+    var kw: List[WBuf]
     var kb: List[DevBuf]
-    var vw: List[DevBuf]
+    var vw: List[WBuf]
     var vb: List[DevBuf]
-    var ow: List[DevBuf]
+    var ow: List[WBuf]
     var ln2: List[DevBuf]
-    var gate: List[DevBuf]
-    var up: List[DevBuf]
-    var down: List[DevBuf]
+    var gate: List[WBuf]
+    var up: List[WBuf]
+    var down: List[WBuf]
 
 
 def load_weights(ctx: DeviceContext, path: String) raises -> Weights:
@@ -266,40 +290,40 @@ def load_weights(ctx: DeviceContext, path: String) raises -> Weights:
     for e in range(len(entries)):
         name2idx[entries[e].name] = e
 
-    var embed = load_named(ctx, path, entries, name2idx, "model.embed_tokens.weight")
+    var embed = load_named_bf16(ctx, path, entries, name2idx, "model.embed_tokens.weight")
     var final_norm = load_named(ctx, path, entries, name2idx, "model.norm.weight")
     var ln1 = List[DevBuf]()
-    var qw = List[DevBuf]()
+    var qw = List[WBuf]()
     var qb = List[DevBuf]()
-    var kw = List[DevBuf]()
+    var kw = List[WBuf]()
     var kb = List[DevBuf]()
-    var vw = List[DevBuf]()
+    var vw = List[WBuf]()
     var vb = List[DevBuf]()
-    var ow = List[DevBuf]()
+    var ow = List[WBuf]()
     var ln2 = List[DevBuf]()
-    var gate = List[DevBuf]()
-    var up = List[DevBuf]()
-    var down = List[DevBuf]()
+    var gate = List[WBuf]()
+    var up = List[WBuf]()
+    var down = List[WBuf]()
     for l in range(NLAYERS):
         var p = "model.layers." + String(l) + "."
         ln1.append(load_named(ctx, path, entries, name2idx, p + "input_layernorm.weight"))
-        qw.append(load_named(ctx, path, entries, name2idx, p + "self_attn.q_proj.weight"))
+        qw.append(load_named_bf16(ctx, path, entries, name2idx, p + "self_attn.q_proj.weight"))
         qb.append(load_named(ctx, path, entries, name2idx, p + "self_attn.q_proj.bias"))
-        kw.append(load_named(ctx, path, entries, name2idx, p + "self_attn.k_proj.weight"))
+        kw.append(load_named_bf16(ctx, path, entries, name2idx, p + "self_attn.k_proj.weight"))
         kb.append(load_named(ctx, path, entries, name2idx, p + "self_attn.k_proj.bias"))
-        vw.append(load_named(ctx, path, entries, name2idx, p + "self_attn.v_proj.weight"))
+        vw.append(load_named_bf16(ctx, path, entries, name2idx, p + "self_attn.v_proj.weight"))
         vb.append(load_named(ctx, path, entries, name2idx, p + "self_attn.v_proj.bias"))
-        ow.append(load_named(ctx, path, entries, name2idx, p + "self_attn.o_proj.weight"))
+        ow.append(load_named_bf16(ctx, path, entries, name2idx, p + "self_attn.o_proj.weight"))
         ln2.append(load_named(ctx, path, entries, name2idx, p + "post_attention_layernorm.weight"))
-        gate.append(load_named(ctx, path, entries, name2idx, p + "mlp.gate_proj.weight"))
-        up.append(load_named(ctx, path, entries, name2idx, p + "mlp.up_proj.weight"))
-        down.append(load_named(ctx, path, entries, name2idx, p + "mlp.down_proj.weight"))
+        gate.append(load_named_bf16(ctx, path, entries, name2idx, p + "mlp.gate_proj.weight"))
+        up.append(load_named_bf16(ctx, path, entries, name2idx, p + "mlp.up_proj.weight"))
+        down.append(load_named_bf16(ctx, path, entries, name2idx, p + "mlp.down_proj.weight"))
     return Weights(embed^, final_norm^, ln1^, qw^, qb^, kw^, kb^, vw^, vb^, ow^, ln2^, gate^, up^, down^)
 
 
 # ── op launchers (each runs one kernel, returns a new device buffer) ───────────
 
-def mm(ctx: DeviceContext, mut x: DevBuf, mut w: DevBuf, mut b: DevBuf,
+def mm(ctx: DeviceContext, mut x: DevBuf, mut w: WBuf, mut b: DevBuf,
        M: Int, K: Int, N: Int, use_bias: Int) raises -> DevBuf:
     var y = ctx.enqueue_create_buffer[DType.float32](M * N)
     var lay = row_major(M * N)
@@ -343,7 +367,7 @@ def silu_mul(ctx: DeviceContext, mut a: DevBuf, mut b: DevBuf, n: Int) raises ->
     )
     return y^
 
-def embed_tokens(ctx: DeviceContext, mut ids: DeviceBuffer[DType.int32], mut emb: DevBuf, T: Int) raises -> DevBuf:
+def embed_tokens(ctx: DeviceContext, mut ids: DeviceBuffer[DType.int32], mut emb: WBuf, T: Int) raises -> DevBuf:
     var h = ctx.enqueue_create_buffer[DType.float32](T * H)
     var lay = row_major(T * H)
     comptime k = embed_kernel[type_of(lay)]

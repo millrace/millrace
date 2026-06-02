@@ -24,6 +24,15 @@ comptime THETA = Float32(1000000.0)
 comptime EPS = Float32(1.0e-6)
 
 
+@always_inline
+def bf16_widen(u: Scalar[DType.uint16]) -> Float32:
+    """Widen a bf16 (stored as its raw u16 bits) to f32 — exact, since bf16 is
+    the top 16 bits of f32. Weights live on-device as bf16 to halve matmul read
+    traffic; the accumulate stays f32 (§11 #12)."""
+    var bits: UInt32 = UInt32(u) << 16
+    return UnsafePointer(to=bits).bitcast[Float32]()[0]
+
+
 def cvt_kernel[
     LT: TensorLayout
 ](
@@ -44,7 +53,7 @@ def embed_kernel[
     LT: TensorLayout
 ](
     ids: TileTensor[DType.int32, LT, MutAnyOrigin],
-    emb: TileTensor[DType.float32, LT, MutAnyOrigin],
+    emb: TileTensor[DType.uint16, LT, MutAnyOrigin],   # bf16 embedding table
     dst: TileTensor[DType.float32, LT, MutAnyOrigin],
     T: Int,
     H: Int,
@@ -56,7 +65,7 @@ def embed_kernel[
     var t = i // H
     var d = i % H
     var tok = Int(rebind[Scalar[DType.int32]](ids[t]))
-    dst[i] = rebind[dst.ElementType](emb[tok * H + d])
+    dst[i] = rebind[dst.ElementType](bf16_widen(rebind[Scalar[DType.uint16]](emb[tok * H + d])))
 
 
 def add_kernel[
@@ -109,7 +118,7 @@ def matmul_kernel[
     LT: TensorLayout
 ](
     X: TileTensor[DType.float32, LT, MutAnyOrigin],
-    W: TileTensor[DType.float32, LT, MutAnyOrigin],
+    W: TileTensor[DType.uint16, LT, MutAnyOrigin],   # bf16 weights (raw u16 bits)
     B: TileTensor[DType.float32, LT, MutAnyOrigin],
     Y: TileTensor[DType.float32, LT, MutAnyOrigin],
     M: Int,
@@ -137,7 +146,7 @@ def matmul_kernel[
     var acc = Float32(0.0)
     for k in range(lane, K, WARP_SIZE):
         var xv = rebind[Scalar[DType.float32]](X[m * K + k])
-        var wv = rebind[Scalar[DType.float32]](W[n * K + k])
+        var wv = bf16_widen(rebind[Scalar[DType.uint16]](W[n * K + k]))
         acc += xv * wv
     var total = warp_sum(acc)
     if lane == 0:

@@ -20,6 +20,23 @@ def upload_f32(ctx: DeviceContext, host: List[Float32]) raises -> DevBuf:
     return dev^
 
 
+def upload_bf16(ctx: DeviceContext, host: List[Float32]) raises -> DeviceBuffer[DType.uint16]:
+    """Truncate f32 → bf16 (round-to-nearest-even on the dropped 16 bits) and
+    upload as raw u16 — matches how the model's bf16 weights live on device, so
+    the matmul gate exercises the real (bf16-weight) kernel path (§11 #12)."""
+    var n = len(host)
+    var dev = ctx.enqueue_create_buffer[DType.uint16](n)
+    with dev.map_to_host() as m:
+        var mt = TileTensor(m, row_major(n))
+        for i in range(n):
+            var f = host[i]
+            var bits = UnsafePointer(to=f).bitcast[UInt32]()[0]
+            # round-to-nearest-even: add 0x7FFF + lsb of the kept mantissa
+            var rounded = bits + 0x7FFF + ((bits >> 16) & 1)
+            mt[i] = rebind[mt.ElementType](UInt16(rounded >> 16))
+    return dev^
+
+
 def read_text(path: String) raises -> String:
     with open(path, "r") as f:
         return f.read()

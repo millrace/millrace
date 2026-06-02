@@ -28,6 +28,17 @@ FIX_ROOT = os.path.abspath(
 F32 = np.float32
 
 
+def to_bf16(a):
+    """Round f32 -> bf16 -> f32 (round-to-nearest-even). The engine keeps weights
+    as bf16 on device and widens per element in the matmul (ARCHITECTURE §11 #12),
+    so synthetic matmul/SwiGLU references must use bf16 weights to match the
+    kernel. (Real fixtures use the model's already-bf16 weights, so this is a
+    no-op for them.)"""
+    u = np.ascontiguousarray(a, dtype=F32).view(np.uint32)
+    r = (u + 0x7FFF + ((u >> 16) & 1)) & np.uint32(0xFFFF0000)
+    return r.view(np.float32)
+
+
 def save(name, arrays, meta):
     d = os.path.join(FIX_ROOT, name)
     os.makedirs(d, exist_ok=True)
@@ -47,15 +58,15 @@ def synthetic(eps):
 
     M, K, N = 8, 128, 256
     x = rng.randn(M, K).astype(F32)
-    W = (rng.randn(N, K) * 0.05).astype(F32)
+    W = to_bf16(rng.randn(N, K) * 0.05)   # weights live as bf16 on device
     b = (rng.randn(N) * 0.05).astype(F32)
     save("syn_matmul", {"x": x, "W": W, "b": b, "expected": ref.matmul_bias(x, W, b)}, [M, K, N, 1])
 
     T, H, I = 8, 128, 512
     x = rng.randn(T, H).astype(F32)
-    wg = (rng.randn(I, H) * 0.05).astype(F32)
-    wu = (rng.randn(I, H) * 0.05).astype(F32)
-    wd = (rng.randn(H, I) * 0.05).astype(F32)
+    wg = to_bf16(rng.randn(I, H) * 0.05)
+    wu = to_bf16(rng.randn(I, H) * 0.05)
+    wd = to_bf16(rng.randn(H, I) * 0.05)
     save(
         "syn_swiglu",
         {"x": x, "w_gate": wg, "w_up": wu, "w_down": wd, "expected": ref.swiglu_mlp(x, wg, wu, wd)},
