@@ -14,10 +14,16 @@ from value import Value
 from json import parse_json, bytes_to_string, string_to_bytes
 
 
+def _hex_nibble(n: Int) -> UInt8:
+    return UInt8(48 + n) if n < 10 else UInt8(97 + n - 10)  # 0-9, a-f
+
 def json_escape_str(b: List[UInt8]) -> String:
     """JSON-escape UTF-8 bytes into a string. Operates at the byte level so
     multibyte UTF-8 (é, emoji, CJK…) passes through intact — building the string
-    with `chr(byte)` per byte would mojibake it."""
+    with `chr(byte)` per byte would mojibake it. All control bytes < 0x20 must be
+    escaped for valid JSON: the common ones get short escapes, the rest `\\u00XX`
+    (the model can emit e.g. form-feed/vertical-tab, which a raw byte would make
+    the response invalid JSON)."""
     var out = List[UInt8]()
     for i in range(len(b)):
         var c = Int(b[i])
@@ -36,6 +42,13 @@ def json_escape_str(b: List[UInt8]) -> String:
         elif c == 9:
             out.append(92)
             out.append(116)  # \t
+        elif c < 0x20:  # other control char -> \u00XX
+            out.append(92)   # backslash
+            out.append(117)  # u
+            out.append(48)   # 0
+            out.append(48)   # 0
+            out.append(_hex_nibble((c >> 4) & 0xF))
+            out.append(_hex_nibble(c & 0xF))
         else:
             out.append(b[i])
     return bytes_to_string(out)
