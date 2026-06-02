@@ -11,7 +11,7 @@ head_dim 64, RoPE θ=1e6, RMSNorm ε=1e-6.
 
 from std.math import sqrt, exp, log, cos, sin
 from std.gpu import global_idx, WARP_SIZE
-from std.gpu.primitives.warp import sum as warp_sum
+from std.gpu.primitives.warp import sum as warp_sum, max as warp_max
 from std.collections import InlineArray
 from layout import TileTensor, TensorLayout
 
@@ -86,15 +86,20 @@ def rmsnorm_kernel[
     H: Int,
 ):
     comptime assert X.flat_rank == 1
-    var t = global_idx.x
+    # One warp per row: the old kernel ran the whole H-element reduction on a
+    # single thread (one thread per row → 1 thread for decode's T=1), which made
+    # RMSNorm as costly as a 4864-wide matmul (§11 #12). Lanes split the row,
+    # warp_sum reduces, then each lane writes its slice (coalesced).
+    var t = Int(global_idx.x) // WARP_SIZE
+    var lane = Int(global_idx.x) % WARP_SIZE
     if t >= T:
         return
     var ss = Float32(0.0)
-    for d in range(H):
+    for d in range(lane, H, WARP_SIZE):
         var v = rebind[Scalar[DType.float32]](X[t * H + d])
         ss += v * v
-    var rms = sqrt(ss / Float32(H) + EPS)
-    for d in range(H):
+    var rms = sqrt(warp_sum(ss) / Float32(H) + EPS)   # warp_sum broadcasts to all lanes
+    for d in range(lane, H, WARP_SIZE):
         var v = rebind[Scalar[DType.float32]](X[t * H + d])
         var wv = rebind[Scalar[DType.float32]](W[d])
         Y[t * H + d] = rebind[Y.ElementType](v / rms * wv)
@@ -206,63 +211,90 @@ def rope_k_kernel[
         Kc[outbase + d + HALF] = rebind[Kc.ElementType](x1 * c + x0 * s)
 
 
+def rope_q_kernel[
+    LT: TensorLayout
+](
+    Q: TileTensor[DType.float32, LT, MutAnyOrigin],     # [Tq, HQ, HEAD_DIM] raw
+    Qr: TileTensor[DType.float32, LT, MutAnyOrigin],    # [Tq, HQ, HEAD_DIM] rotated out
+    Tq: Int,
+    q_offset: Int,
+):
+    """Apply RoPE to Q (one thread per query×head) into a rotated buffer, so the
+    attention kernel itself does no transcendentals — same as K is rotated on
+    write (§11 #12). Position = absolute query position q_offset+t."""
+    comptime assert Q.flat_rank == 1
+    var idx = Int(global_idx.x)
+    if idx >= Tq * HQ:
+        return
+    var t = idx // HQ
+    var pos = q_offset + t
+    var base = idx * HEAD_DIM
+    for d in range(HALF):
+        var freq = exp(-(2.0 * Float32(d) / Float32(HEAD_DIM)) * log(THETA))
+        var ang = Float32(pos) * freq
+        var c = cos(ang)
+        var s = sin(ang)
+        var x0 = rebind[Scalar[DType.float32]](Q[base + d])
+        var x1 = rebind[Scalar[DType.float32]](Q[base + d + HALF])
+        Qr[base + d] = rebind[Qr.ElementType](x0 * c - x1 * s)
+        Qr[base + d + HALF] = rebind[Qr.ElementType](x1 * c + x0 * s)
+
+
 def attn_cached_kernel[
     LT: TensorLayout
 ](
-    Q: TileTensor[DType.float32, LT, MutAnyOrigin],     # [Tq, HQ, HEAD_DIM] raw (pre-RoPE)
-    Kc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM] *RoPE-rotated*, row = abs position
+    Q: TileTensor[DType.float32, LT, MutAnyOrigin],     # [Tq, HQ, HEAD_DIM] *RoPE-rotated*
+    Kc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM] RoPE-rotated, row = abs position
     Vc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM]
     O: TileTensor[DType.float32, LT, MutAnyOrigin],     # [Tq, HQ, HEAD_DIM]
     Tq: Int,
     q_offset: Int,
 ):
-    """Attention of Tq queries (at absolute positions q_offset..q_offset+Tq-1)
-    over a KV cache. K is stored already RoPE-rotated (rope_k_kernel applies it
-    once on write, keyed by cache row = absolute position), so the per-key
-    transcendental recompute that used to run for every past key on every step
-    is gone — the score loop is now a plain rotated_q · rotated_k dot (§11 #12).
-    Only Q is rotated here (once per query)."""
+    """Causal GQA attention over a KV cache — one *warp* per (query, head).
+
+    The old kernel ran one *thread* per (query, head): for a decode step that is
+    14 threads total, each looping every past key serially, so attention was the
+    dominant decode cost and grew badly with context (§11 #12). Here the warp's
+    32 lanes split the keys; each lane runs a flash/online softmax over its
+    subset, then a single cross-lane merge (max → rescale → sum) combines them.
+    Q and K are already RoPE-rotated (rope_q/rope_k), so this kernel has no
+    transcendentals — just dot products + the online softmax."""
     comptime assert Q.flat_rank == 1
-    var h = global_idx.x % HQ
-    var t = global_idx.x // HQ
+    var qh = Int(global_idx.x) // WARP_SIZE     # one warp per (query, head)
+    var lane = Int(global_idx.x) % WARP_SIZE
+    var h = qh % HQ
+    var t = qh // HQ
     if t >= Tq:
         return
     var kvh = h // GROUP
     var qpos = q_offset + t
-
     var qbase = (t * HQ + h) * HEAD_DIM
-    var qr = InlineArray[Float32, HEAD_DIM](fill=0.0)
-    for d in range(HALF):
-        var freq = exp(-(2.0 * Float32(d) / Float32(HEAD_DIM)) * log(THETA))
-        var ang = Float32(qpos) * freq
-        var c = cos(ang)
-        var s = sin(ang)
-        var x0 = rebind[Scalar[DType.float32]](Q[qbase + d])
-        var x1 = rebind[Scalar[DType.float32]](Q[qbase + d + HALF])
-        qr[d] = x0 * c - x1 * s
-        qr[d + HALF] = x1 * c + x0 * s
-
     var scale = 1.0 / sqrt(Float32(HEAD_DIM))
+
+    # Each lane runs flash softmax over its slice of keys (j = lane, lane+32, …).
     var m = Float32(-1.0e30)
     var l = Float32(0.0)
     var acc = InlineArray[Float32, HEAD_DIM](fill=0.0)
-
-    for j in range(qpos + 1):
+    for j in range(lane, qpos + 1, WARP_SIZE):
         var kbase = (j * HKV + kvh) * HEAD_DIM
         var score = Float32(0.0)
         for d in range(HEAD_DIM):
-            score += qr[d] * rebind[Scalar[DType.float32]](Kc[kbase + d])
+            score += rebind[Scalar[DType.float32]](Q[qbase + d]) * rebind[Scalar[DType.float32]](Kc[kbase + d])
         score *= scale
-
         var m_new = max(m, score)
         var corr = exp(m - m_new)
         var p = exp(score - m_new)
         l = l * corr + p
-        var vbase = (j * HKV + kvh) * HEAD_DIM
         for d in range(HEAD_DIM):
-            acc[d] = acc[d] * corr + p * rebind[Scalar[DType.float32]](Vc[vbase + d])
+            acc[d] = acc[d] * corr + p * rebind[Scalar[DType.float32]](Vc[kbase + d])
         m = m_new
 
+    # Cross-lane merge: global max, rescale each lane's partials, then sum.
+    var m_g = warp_max(m)
+    var f = exp(m - m_g)
+    var l_g = warp_sum(l * f)
     var obase = (t * HQ + h) * HEAD_DIM
     for d in range(HEAD_DIM):
-        O[obase + d] = rebind[O.ElementType](acc[d] / l)
+        var a = warp_sum(acc[d] * f)
+        if lane == 0:
+            O[obase + d] = rebind[O.ElementType](a / l_g)

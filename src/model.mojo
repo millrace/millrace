@@ -18,8 +18,9 @@ from layout import TileTensor, row_major
 
 from kernels import (
     cvt_kernel, embed_kernel, add_kernel, rmsnorm_kernel, matmul_kernel,
-    silu_mul_kernel, attn_cached_kernel, copy_kernel, rope_k_kernel,
+    silu_mul_kernel, attn_cached_kernel, copy_kernel, rope_k_kernel, rope_q_kernel,
 )
+comptime HQ = 14
 
 comptime H = 896
 comptime NKV = 128
@@ -318,7 +319,7 @@ def rmsnorm(ctx: DeviceContext, mut x: DevBuf, mut w: DevBuf, T: Int, dim: Int) 
     comptime k = rmsnorm_kernel[type_of(lay)]
     ctx.enqueue_function[k](
         TileTensor(x, lay), TileTensor(w, row_major(dim)), TileTensor(y, lay), T, dim,
-        grid_dim=ceildiv(T, 64), block_dim=64,
+        grid_dim=ceildiv(T * WARP_SIZE, BLOCK), block_dim=BLOCK,   # one warp per row
     )
     return y^
 
@@ -374,13 +375,22 @@ def rope_k(ctx: DeviceContext, mut kin: DevBuf, mut kc: DevBuf,
 
 def attn_cached(ctx: DeviceContext, mut q: DevBuf, mut kc: DevBuf, mut vc: DevBuf,
                 Tq: Int, q_offset: Int, cache_len: Int) raises -> DevBuf:
+    # Rotate Q first (rope_q), then attend; K is already rotated in the cache.
+    var qr = ctx.enqueue_create_buffer[DType.float32](Tq * H)
+    var qlay = row_major(Tq * H)
+    comptime kq = rope_q_kernel[type_of(qlay)]
+    ctx.enqueue_function[kq](
+        TileTensor(q, qlay), TileTensor(qr, qlay), Tq, q_offset,
+        grid_dim=ceildiv(Tq * HQ, BLOCK), block_dim=BLOCK,
+    )
     var o = ctx.enqueue_create_buffer[DType.float32](Tq * H)
     var lay = row_major(Tq * H)
     comptime k = attn_cached_kernel[type_of(lay)]
     ctx.enqueue_function[k](
-        TileTensor(q, row_major(Tq * H)), TileTensor(kc, row_major(cache_len)),
+        TileTensor(qr, row_major(Tq * H)), TileTensor(kc, row_major(cache_len)),
         TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset,
-        grid_dim=ceildiv(Tq * 14, 14), block_dim=14,
+        # one warp per (query, head): Tq*HQ*WARP_SIZE threads
+        grid_dim=ceildiv(Tq * HQ * WARP_SIZE, BLOCK), block_dim=BLOCK,
     )
     return o^
 
