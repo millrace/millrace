@@ -18,11 +18,12 @@ from layout import TileTensor, row_major
 
 from kernels import (
     cvt_kernel, embed_kernel, add_kernel, rmsnorm_kernel, matmul_kernel,
-    silu_mul_kernel, attn_cached_kernel, copy_kernel,
+    silu_mul_kernel, attn_cached_kernel, copy_kernel, rope_k_kernel,
 )
 
 comptime H = 896
 comptime NKV = 128
+comptime HKV = 2
 comptime INTER = 4864
 comptime VOCAB = 151936
 comptime NLAYERS = 24
@@ -360,6 +361,17 @@ def copy_into(ctx: DeviceContext, mut src: DevBuf, mut dst: DevBuf, dst_offset: 
         grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK,
     )
 
+def rope_k(ctx: DeviceContext, mut kin: DevBuf, mut kc: DevBuf,
+           Tq: Int, q_offset: Int, cache_len: Int) raises:
+    """Apply RoPE to projected K and store it (rotated) at its cache rows —
+    replaces the plain K copy so attention reads pre-rotated K (§11 #12)."""
+    var lay = row_major(Tq * NKV)
+    comptime k = rope_k_kernel[type_of(lay)]
+    ctx.enqueue_function[k](
+        TileTensor(kin, lay), TileTensor(kc, row_major(cache_len)), Tq, q_offset,
+        grid_dim=ceildiv(Tq * HKV, BLOCK), block_dim=BLOCK,
+    )
+
 def attn_cached(ctx: DeviceContext, mut q: DevBuf, mut kc: DevBuf, mut vc: DevBuf,
                 Tq: Int, q_offset: Int, cache_len: Int) raises -> DevBuf:
     var o = ctx.enqueue_create_buffer[DType.float32](Tq * H)
@@ -383,8 +395,8 @@ def layer_cached(ctx: DeviceContext, mut w: Weights, l: Int, mut h: DevBuf,
     var q = mm(ctx, ln1, w.qw[l], w.qb[l], Tq, H, H, 1)
     var kk = mm(ctx, ln1, w.kw[l], w.kb[l], Tq, H, NKV, 1)
     var vv = mm(ctx, ln1, w.vw[l], w.vb[l], Tq, H, NKV, 1)
-    copy_into(ctx, kk, kc, q_offset * NKV, Tq * NKV, cache_len)
-    copy_into(ctx, vv, vc, q_offset * NKV, Tq * NKV, cache_len)
+    rope_k(ctx, kk, kc, Tq, q_offset, cache_len)                  # store K RoPE-rotated
+    copy_into(ctx, vv, vc, q_offset * NKV, Tq * NKV, cache_len)   # V is not rotated
     var o = attn_cached(ctx, q, kc, vc, Tq, q_offset, cache_len)
     var o2 = mm(ctx, o, w.ow[l], dummy, Tq, H, H, 0)
     var h2 = add(ctx, h, o2, Tq * H)

@@ -8,7 +8,7 @@ the output matches the NumPy reference. `pixi run test-attention`.
 from std.sys import has_accelerator
 from std.gpu.host import DeviceContext
 
-from model import attn_cached
+from model import attn_cached, rope_k
 from testio import read_f32, upload_f32, max_abs
 
 comptime HQ = 14
@@ -21,10 +21,13 @@ def run(ctx: DeviceContext, dir: String) raises -> Bool:
     var q = read_f32(dir + "/q.bin")
     var T = len(q) // (HQ * HEAD_DIM)
     var qd = upload_f32(ctx, q)
-    var kd = upload_f32(ctx, read_f32(dir + "/k.bin"))
+    var kraw = upload_f32(ctx, read_f32(dir + "/k.bin"))
     var vd = upload_f32(ctx, read_f32(dir + "/v.bin"))
     var cache_len = T * HKV * HEAD_DIM
-    var o = attn_cached(ctx, qd, kd, vd, T, 0, cache_len)
+    # K is now RoPE-rotated on write into the cache (§11 #12); rotate then attend.
+    var kc = ctx.enqueue_create_buffer[DType.float32](cache_len)
+    rope_k(ctx, kraw, kc, T, 0, cache_len)
+    var o = attn_cached(ctx, qd, kc, vd, T, 0, cache_len)
     ctx.synchronize()
     var m = max_abs(o, read_f32(dir + "/expected.bin"))
     var ok = m < TOL

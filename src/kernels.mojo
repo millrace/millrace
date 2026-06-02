@@ -173,19 +173,55 @@ def copy_kernel[
     dst[dst_offset + i] = rebind[dst.ElementType](src[i])
 
 
+def rope_k_kernel[
+    LT: TensorLayout
+](
+    Kin: TileTensor[DType.float32, LT, MutAnyOrigin],   # [Tq, HKV, HEAD_DIM] raw K from projection
+    Kc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM] cache (rotated)
+    Tq: Int,
+    q_offset: Int,
+):
+    """Apply RoPE to freshly-projected K and write it into the cache at its
+    absolute-position rows. Doing this once on write (one thread per token×kv-
+    head) replaces recomputing K's RoPE for every past key on every decode step
+    inside attention (§11 #12). Same split-half rotation/θ as the Q path."""
+    comptime assert Kin.flat_rank == 1
+    var nkv = HKV * HEAD_DIM
+    var idx = Int(global_idx.x)
+    if idx >= Tq * HKV:
+        return
+    var t = idx // HKV
+    var kvh = idx % HKV
+    var pos = q_offset + t
+    var inbase = t * nkv + kvh * HEAD_DIM
+    var outbase = (q_offset + t) * nkv + kvh * HEAD_DIM   # cache row = absolute position
+    for d in range(HALF):
+        var freq = exp(-(2.0 * Float32(d) / Float32(HEAD_DIM)) * log(THETA))
+        var ang = Float32(pos) * freq
+        var c = cos(ang)
+        var s = sin(ang)
+        var x0 = rebind[Scalar[DType.float32]](Kin[inbase + d])
+        var x1 = rebind[Scalar[DType.float32]](Kin[inbase + d + HALF])
+        Kc[outbase + d] = rebind[Kc.ElementType](x0 * c - x1 * s)
+        Kc[outbase + d + HALF] = rebind[Kc.ElementType](x1 * c + x0 * s)
+
+
 def attn_cached_kernel[
     LT: TensorLayout
 ](
     Q: TileTensor[DType.float32, LT, MutAnyOrigin],     # [Tq, HQ, HEAD_DIM] raw (pre-RoPE)
-    Kc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM] raw, row = abs position
+    Kc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM] *RoPE-rotated*, row = abs position
     Vc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM]
     O: TileTensor[DType.float32, LT, MutAnyOrigin],     # [Tq, HQ, HEAD_DIM]
     Tq: Int,
     q_offset: Int,
 ):
     """Attention of Tq queries (at absolute positions q_offset..q_offset+Tq-1)
-    over a KV cache. RoPE applied here using the cache row as the position, so
-    the cache stores raw K/V — no separate rope pass or rotated cache needed."""
+    over a KV cache. K is stored already RoPE-rotated (rope_k_kernel applies it
+    once on write, keyed by cache row = absolute position), so the per-key
+    transcendental recompute that used to run for every past key on every step
+    is gone — the score loop is now a plain rotated_q · rotated_k dot (§11 #12).
+    Only Q is rotated here (once per query)."""
     comptime assert Q.flat_rank == 1
     var h = global_idx.x % HQ
     var t = global_idx.x // HQ
@@ -214,14 +250,8 @@ def attn_cached_kernel[
     for j in range(qpos + 1):
         var kbase = (j * HKV + kvh) * HEAD_DIM
         var score = Float32(0.0)
-        for d in range(HALF):
-            var freq = exp(-(2.0 * Float32(d) / Float32(HEAD_DIM)) * log(THETA))
-            var ang = Float32(j) * freq
-            var c = cos(ang)
-            var s = sin(ang)
-            var x0 = rebind[Scalar[DType.float32]](Kc[kbase + d])
-            var x1 = rebind[Scalar[DType.float32]](Kc[kbase + d + HALF])
-            score += qr[d] * (x0 * c - x1 * s) + qr[d + HALF] * (x1 * c + x0 * s)
+        for d in range(HEAD_DIM):
+            score += qr[d] * rebind[Scalar[DType.float32]](Kc[kbase + d])
         score *= scale
 
         var m_new = max(m, score)
