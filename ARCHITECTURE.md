@@ -541,9 +541,10 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
     (follow-up). The decode loop is factored into a `Session` (KV caches +
     position) in model.mojo — `sess_prefill`/`sess_step` — shared by greedy,
     sampled, and streaming (greedy parity gate still passes). **opencode
-    integration:** `assets/opencode.json` declares a `millrace` provider via
-    `@ai-sdk/openai-compatible`; `pixi run opencode` points opencode at the
-    running service. Empirically opencode drives **`/v1/chat/completions`** (not
+    integration:** `pixi run opencode` queries the server's `/v1/models`
+    (`opencode_config.py`) and generates a config declaring a `millrace` provider
+    (`@ai-sdk/openai-compatible`) for exactly the served model, then points
+    opencode at it. Empirically opencode drives **`/v1/chat/completions`** (not
     `/v1/responses` as max-backend's note guessed — that provider uses chat
     completions); verified live, opencode's request hit the chat endpoint and got
     a real completion. **The whole path — flare → tokenizer → GPU model →
