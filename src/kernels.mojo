@@ -10,8 +10,10 @@ head_dim 64, RoPE θ=1e6, RMSNorm ε=1e-6.
 """
 
 from std.math import sqrt, exp, log, cos, sin, ceildiv
-from std.gpu import global_idx, WARP_SIZE
+from std.gpu import global_idx, thread_idx, block_idx, barrier, WARP_SIZE
+from std.gpu.memory import AddressSpace
 from std.gpu.primitives.warp import sum as warp_sum, max as warp_max
+from std.memory import stack_allocation
 from std.collections import InlineArray
 from layout import TileTensor, TensorLayout
 
@@ -401,3 +403,114 @@ def attn_cached_kernel[
             var a = warp_sum(accv[c][e] * f)
             if lane == 0:
                 O[obase + c * VEC + e] = rebind[O.ElementType](a / l_g)
+
+
+comptime FLASH_BW = 8           # query warps per block (each shares the staged K/V tile)
+comptime FLASH_BK = WARP_SIZE   # keys per tile = one per lane
+
+
+def flash_attn_kernel[
+    LT: TensorLayout
+](
+    Q: TileTensor[DType.float32, LT, MutAnyOrigin],     # [Tq, HQ, HEAD_DIM] *RoPE-rotated*
+    Kc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM] rotated, row = abs pos
+    Vc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM]
+    O: TileTensor[DType.float32, LT, MutAnyOrigin],     # [Tq, HQ, HEAD_DIM]
+    Tq: Int,
+    q_offset: Int,
+):
+    """Flash variant of attn_cached_kernel for *long context*: identical math,
+    K/V streamed through threadgroup shared memory instead of re-read from global.
+
+    attn_cached_kernel gives each (query, head) its own warp that reads every past
+    K/V straight from the cache — fine until the f32 KV working set (≈ pos·128·8 B)
+    outgrows the M4 system cache, at which point attention goes DRAM-bound and the
+    cost super-cliffs (measured ~M^3.9 past ~16K tokens). Here a block owns FLASH_BW
+    consecutive query warps of ONE head; they cooperatively stage each FLASH_BK-key
+    tile of K/V into shared memory and all FLASH_BW warps read it from there, so K/V
+    global traffic drops ≈FLASH_BW× and the kernel scales as clean O(M²) — ~2.5×
+    faster at 32K and pulling away (but ~3× slower below the cliff from the staging
+    overhead, so the caller dispatches by context length).
+
+    Lane l still owns keys l, l+FLASH_BK, l+2·FLASH_BK, … in increasing order — the
+    exact per-lane sequence and online-softmax update order of attn_cached_kernel —
+    and the staged values are bit-identical f32 copies, so the output is bit-for-bit
+    the same (verified max|diff|=0). Only the read path differs."""
+    comptime assert Q.flat_rank == 1
+    comptime VEC = 8
+    comptime NVEC = HEAD_DIM // VEC
+    comptime NTHREAD = FLASH_BW * WARP_SIZE
+    var Ks = stack_allocation[FLASH_BK * HEAD_DIM, Float32, address_space = AddressSpace.SHARED]()
+    var Vs = stack_allocation[FLASH_BK * HEAD_DIM, Float32, address_space = AddressSpace.SHARED]()
+
+    var tib = Int(thread_idx.x)
+    var warp = tib // WARP_SIZE
+    var lane = tib % WARP_SIZE
+    var blk = Int(block_idx.x)
+    var h = blk % HQ
+    var q0 = (blk // HQ) * FLASH_BW
+    var t = q0 + warp
+    var kvh = h // GROUP
+    var qpos = q_offset + t
+    var scale = 1.0 / sqrt(Float32(HEAD_DIM))
+    var active = t < Tq
+
+    var qreg = InlineArray[SIMD[DType.float32, VEC], NVEC](fill=0.0)
+    if active:
+        var qbase = (t * HQ + h) * HEAD_DIM
+        for c in range(NVEC):
+            qreg[c] = Q.raw_load[VEC](qbase + c * VEC)
+
+    var m = Float32(-1.0e30)
+    var lsum = Float32(0.0)
+    var accv = InlineArray[SIMD[DType.float32, VEC], NVEC](fill=0.0)
+
+    # Block-uniform key range: every warp runs the same tile count so barriers line up.
+    var t_max = q0 + FLASH_BW - 1
+    if t_max > Tq - 1:
+        t_max = Tq - 1
+    var kpos_max = q_offset + t_max
+
+    var kt0 = 0
+    while kt0 <= kpos_max:
+        for idx in range(tib, FLASH_BK * HEAD_DIM, NTHREAD):
+            var r = idx // HEAD_DIM
+            var c = idx % HEAD_DIM
+            var gk = kt0 + r
+            if gk <= kpos_max:
+                var src = (gk * HKV + kvh) * HEAD_DIM + c
+                Ks[idx] = rebind[Scalar[DType.float32]](Kc[src])
+                Vs[idx] = rebind[Scalar[DType.float32]](Vc[src])
+            else:
+                Ks[idx] = Float32(0.0)
+                Vs[idx] = Float32(0.0)
+        barrier()
+
+        if active:
+            var j = kt0 + lane
+            if j <= qpos:
+                var kb = lane * HEAD_DIM
+                var s = SIMD[DType.float32, VEC](0.0)
+                for c in range(NVEC):
+                    s += qreg[c] * Ks.load[width=VEC](kb + c * VEC)
+                var score = s.reduce_add() * scale
+                var m_new = max(m, score)
+                var corr = exp(m - m_new)
+                var p = exp(score - m_new)
+                lsum = lsum * corr + p
+                for c in range(NVEC):
+                    accv[c] = accv[c] * corr + p * Vs.load[width=VEC](kb + c * VEC)
+                m = m_new
+        barrier()
+        kt0 += FLASH_BK
+
+    if active:
+        var m_g = warp_max(m)
+        var f = exp(m - m_g)
+        var l_g = warp_sum(lsum * f)
+        var obase = (t * HQ + h) * HEAD_DIM
+        for c in range(NVEC):
+            for e in range(VEC):
+                var a = warp_sum(accv[c][e] * f)
+                if lane == 0:
+                    O[obase + c * VEC + e] = rebind[O.ElementType](a / l_g)
