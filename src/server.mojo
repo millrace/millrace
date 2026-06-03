@@ -600,7 +600,11 @@ def main() raises:
     var tmpl = load_chat_template(TEMPLATE)
     var ctx = DeviceContext()
     var w = load_weights(ctx, String(ckpt))
-    var sess = new_session(ctx, MAX_SEQ)  # one persistent KV cache for the process
+    # One persistent KV cache for the process, sized to the detected arch.
+    var sess = new_session(ctx, MAX_SEQ, w.nlayers, w.nkv)
+    print("  arch: ", "Qwen2.5-3B" if w.arch == 1 else "Qwen2.5-0.5B",
+          " (hidden=", w.hidden, ", layers=", w.nlayers, ", heads=", w.hq, "/", w.hkv,
+          ", head_dim=", w.head_dim, ")", sep="")
 
     var state = ServerState(ctx^, w^, tok^, tmpl^, sess^)
     var sp = alloc[ServerState](1)

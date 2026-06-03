@@ -44,6 +44,33 @@ curl -s localhost:8000/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"In one sentence, what is the capital of France?"}]}'
 ```
 
+## Models (0.5B / 3B)
+
+The engine auto-detects the architecture from the checkpoint — **Qwen2.5-0.5B**
+(the default) and **Qwen2.5-3B** are both supported from one build. The 0.5B and
+3B share a tokenizer and chat template, so only the checkpoint changes; the loader
+handles both a single `.safetensors` file and a sharded checkpoint
+(`model.safetensors.index.json` + shards).
+
+To run the larger model, download its weights and point the engine at the printed
+snapshot directory:
+
+```sh
+pixi run -e oracle download-model -- Qwen/Qwen2.5-3B-Instruct   # prints <snapshot-dir>
+```
+
+Then either set the checkpoint for one run via the env var, or persist it in the
+fixture:
+
+```sh
+QWEN_SAFETENSORS=<snapshot-dir> pixi run chat -- "your prompt"   # one-off (CLI)
+# or: put <snapshot-dir> on line 2 of tests/fixtures/forward/meta.txt, then `pixi run serve`
+```
+
+`serve` logs the detected arch on startup (`arch: Qwen2.5-3B (hidden=2048, …)`).
+The 3B needs more memory (~6 GB weights + ~2.4 GB KV cache at the 32K-token
+default) and decodes slower than the 0.5B.
+
 ## Connect OpenCode
 
 `assets/opencode.json` declares a `millrace` provider (via

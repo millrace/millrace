@@ -96,6 +96,11 @@ serve = { cmd = "mkdir -p build && mojo build src/server.mojo -I ../minja2/src -
 opencode = { cmd = "OPENCODE_CONFIG=$PIXI_PROJECT_ROOT/assets/opencode.json OPENAI_BASE_URL=http://127.0.0.1:8000/v1 OPENAI_API_KEY=millrace opencode" }
 
 [feature.oracle.tasks]
+# Download a HF model's weights (safetensors + metadata only) into the local cache
+# and print the snapshot dir — drop it into tests/fixtures/forward/meta.txt line 2.
+# The loader auto-detects single-file vs sharded / 0.5B vs 3B. Usage:
+#   pixi run -e oracle download-model -- Qwen/Qwen2.5-3B-Instruct
+download-model = "python tests/manual/download_model.py"
 # Generates tests/fixtures/attention/{synthetic,real_L0,real_L23}/ : q/k/v.bin,
 # expected.bin (NumPy ref), meta.txt. Also asserts NumPy ref ≈ HF context.
 attn-capture = "python tests/manual/attention_spike/capture.py"
