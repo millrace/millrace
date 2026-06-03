@@ -17,13 +17,13 @@ from std.memory import stack_allocation
 from std.collections import InlineArray
 from layout import TileTensor, TensorLayout
 
-comptime HQ = 14
-comptime HKV = 2
-comptime HEAD_DIM = 64
-comptime HALF = HEAD_DIM // 2
-comptime GROUP = HQ // HKV
-comptime THETA = Float32(1000000.0)
-comptime EPS = Float32(1.0e-6)
+# Head/hidden dims are NOT fixed here: the head-sensitive kernels (rope_q/k,
+# attn_cached, flash) take HQ/HKV/HEAD_DIM as comptime params so one build serves
+# multiple Qwen2.5 sizes (0.5B: 14/2/64, 3B: 16/2/128). THETA/EPS are shared
+# across all Qwen2.5 sizes, so they stay module constants.
+comptime THETA = Float32(1000000.0)   # RoPE base
+comptime EPS = Float32(1.0e-6)        # RMSNorm epsilon
+comptime FLASH_PW = 3                 # flash query-tile: warps/block = FLASH_PW * GROUP
 
 
 @always_inline
@@ -269,7 +269,7 @@ def slice_row_kernel[
 
 
 def rope_k_kernel[
-    LT: TensorLayout
+    LT: TensorLayout, HKV: Int, HEAD_DIM: Int
 ](
     Kin: TileTensor[DType.float32, LT, MutAnyOrigin],   # [Tq, HKV, HEAD_DIM] raw K from projection
     Kc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM] cache (rotated)
@@ -281,6 +281,7 @@ def rope_k_kernel[
     head) replaces recomputing K's RoPE for every past key on every decode step
     inside attention (§11 #12). Same split-half rotation/θ as the Q path."""
     comptime assert Kin.flat_rank == 1
+    comptime HALF = HEAD_DIM // 2
     var nkv = HKV * HEAD_DIM
     var idx = Int(global_idx.x)
     if idx >= Tq * HKV:
@@ -302,7 +303,7 @@ def rope_k_kernel[
 
 
 def rope_q_kernel[
-    LT: TensorLayout
+    LT: TensorLayout, HQ: Int, HEAD_DIM: Int
 ](
     Q: TileTensor[DType.float32, LT, MutAnyOrigin],     # [Tq, HQ, HEAD_DIM] raw
     Qr: TileTensor[DType.float32, LT, MutAnyOrigin],    # [Tq, HQ, HEAD_DIM] rotated out
@@ -313,6 +314,7 @@ def rope_q_kernel[
     attention kernel itself does no transcendentals — same as K is rotated on
     write (§11 #12). Position = absolute query position q_offset+t."""
     comptime assert Q.flat_rank == 1
+    comptime HALF = HEAD_DIM // 2
     var idx = Int(global_idx.x)
     if idx >= Tq * HQ:
         return
@@ -331,7 +333,7 @@ def rope_q_kernel[
 
 
 def attn_cached_kernel[
-    LT: TensorLayout
+    LT: TensorLayout, HQ: Int, HKV: Int, HEAD_DIM: Int
 ](
     Q: TileTensor[DType.float32, LT, MutAnyOrigin],     # [Tq, HQ, HEAD_DIM] *RoPE-rotated*
     Kc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM] RoPE-rotated, row = abs position
@@ -359,6 +361,7 @@ def attn_cached_kernel[
     comptime assert Q.flat_rank == 1
     comptime VEC = 8
     comptime NVEC = HEAD_DIM // VEC
+    comptime GROUP = HQ // HKV
     var qh = Int(global_idx.x) // WARP_SIZE     # one warp per (query, head)
     var lane = Int(global_idx.x) % WARP_SIZE
     var h = qh % HQ
@@ -405,13 +408,11 @@ def attn_cached_kernel[
                 O[obase + c * VEC + e] = rebind[O.ElementType](a / l_g)
 
 
-comptime FLASH_PW = 3           # query positions per block (× GROUP heads of one kv-head)
-comptime FLASH_BK = WARP_SIZE   # keys per tile = one per lane
-comptime FLASH_NWARP = FLASH_PW * GROUP   # warps per block = 3 × 7 = 21
+comptime FLASH_BK = WARP_SIZE   # flash keys per tile = one per lane
 
 
 def flash_attn_kernel[
-    LT: TensorLayout
+    LT: TensorLayout, HQ: Int, HKV: Int, HEAD_DIM: Int, PW: Int
 ](
     Q: TileTensor[DType.float32, LT, MutAnyOrigin],     # [Tq, HQ, HEAD_DIM] *RoPE-rotated*
     Kc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM] rotated, row = abs pos
@@ -427,7 +428,7 @@ def flash_attn_kernel[
     K/V straight from the cache — fine until the f32 KV working set (≈ pos·128·8 B)
     outgrows the M4 system cache, at which point attention goes DRAM-bound and the
     cost super-cliffs (measured ~M^3.9 past ~16K tokens). Here a block owns FLASH_PW
-    consecutive query positions × all GROUP query heads of one kv-head — FLASH_NWARP
+    consecutive query positions × all GROUP query heads of one kv-head — PW*GROUP
     warps that all share the *same* K/V. They cooperatively stage each FLASH_BK-key
     tile of K/V into shared memory once and every warp reads it from there, so K/V
     global traffic drops by the full GROUP (head reuse) × FLASH_PW (query reuse) and
@@ -444,7 +445,9 @@ def flash_attn_kernel[
     comptime assert Q.flat_rank == 1
     comptime VEC = 8
     comptime NVEC = HEAD_DIM // VEC
-    comptime NTHREAD = FLASH_NWARP * WARP_SIZE
+    comptime GROUP = HQ // HKV
+    comptime NWARP = PW * GROUP
+    comptime NTHREAD = NWARP * WARP_SIZE
     var Ks = stack_allocation[FLASH_BK * HEAD_DIM, Float32, address_space = AddressSpace.SHARED]()
     var Vs = stack_allocation[FLASH_BK * HEAD_DIM, Float32, address_space = AddressSpace.SHARED]()
 
@@ -453,8 +456,8 @@ def flash_attn_kernel[
     var lane = tib % WARP_SIZE
     var blk = Int(block_idx.x)
     var kvh = blk % HKV
-    var q0 = (blk // HKV) * FLASH_PW
-    var qi = warp // GROUP          # query position within the tile (0 … FLASH_PW-1)
+    var q0 = (blk // HKV) * PW
+    var qi = warp // GROUP          # query position within the tile (0 … PW-1)
     var gi = warp % GROUP           # head within the kv-group (0 … GROUP-1)
     var t = q0 + qi
     var h = kvh * GROUP + gi
@@ -473,7 +476,7 @@ def flash_attn_kernel[
     var accv = InlineArray[SIMD[DType.float32, VEC], NVEC](fill=0.0)
 
     # Block-uniform key range: every warp runs the same tile count so barriers line up.
-    var t_max = q0 + FLASH_PW - 1
+    var t_max = q0 + PW - 1
     if t_max > Tq - 1:
         t_max = Tq - 1
     var kpos_max = q_offset + t_max

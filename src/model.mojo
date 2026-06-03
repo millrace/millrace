@@ -19,7 +19,7 @@ from layout import TileTensor, row_major
 from kernels import (
     cvt_kernel, embed_kernel, add_kernel, rmsnorm_kernel, matmul_kernel,
     matmul_tiled_kernel, slice_row_kernel,
-    silu_mul_kernel, attn_cached_kernel, flash_attn_kernel, FLASH_PW, FLASH_NWARP,
+    silu_mul_kernel, attn_cached_kernel, flash_attn_kernel, FLASH_PW,
     copy_kernel, rope_k_kernel, rope_q_kernel,
 )
 
@@ -244,10 +244,10 @@ def load_one(ctx: DeviceContext, path: String, begin: Int, end: Int) raises -> D
         ctx.synchronize()
     return dev_f32^
 
-def load_named(ctx: DeviceContext, path: String, entries: List[TensorEntry],
+def load_named(ctx: DeviceContext, paths: List[String], entries: List[TensorEntry],
                name2idx: Dict[String, Int], name: String) raises -> DevBuf:
     var idx = name2idx[name]
-    return load_one(ctx, path, entries[idx].begin, entries[idx].end)
+    return load_one(ctx, paths[idx], entries[idx].begin, entries[idx].end)
 
 
 def load_one_bf16(ctx: DeviceContext, path: String, begin: Int, end: Int) raises -> WBuf:
@@ -267,10 +267,99 @@ def load_one_bf16(ctx: DeviceContext, path: String, begin: Int, end: Int) raises
         ctx.synchronize()
     return dev_u16^
 
-def load_named_bf16(ctx: DeviceContext, path: String, entries: List[TensorEntry],
+def load_named_bf16(ctx: DeviceContext, paths: List[String], entries: List[TensorEntry],
                     name2idx: Dict[String, Int], name: String) raises -> WBuf:
     var idx = name2idx[name]
-    return load_one_bf16(ctx, path, entries[idx].begin, entries[idx].end)
+    return load_one_bf16(ctx, paths[idx], entries[idx].begin, entries[idx].end)
+
+
+def _str_bytes(s: String) -> List[UInt8]:
+    var out = List[UInt8]()
+    var b = s.as_bytes()
+    for i in range(len(b)):
+        out.append(b[i])
+    return out^
+
+
+def _parse_shard_names(buf: List[UInt8]) raises -> List[String]:
+    """Distinct shard filenames from a safetensors `model.safetensors.index.json`
+    weight_map. Reuses the tiny safetensors-header JSON helpers (no minja2 dep, so
+    model.mojo still builds without the -I include the tests use)."""
+    var names = List[String]()
+    var pos = 0
+    skip_ws(buf, pos)
+    expect(buf, pos, LBRACE)
+    skip_ws(buf, pos)
+    if Int(buf[pos]) == RBRACE:
+        return names^
+    while True:
+        skip_ws(buf, pos)
+        var key = parse_string(buf, pos)
+        skip_ws(buf, pos)
+        expect(buf, pos, COLON)
+        skip_ws(buf, pos)
+        if key == "weight_map":
+            expect(buf, pos, LBRACE)
+            skip_ws(buf, pos)
+            if Int(buf[pos]) != RBRACE:
+                while True:
+                    skip_ws(buf, pos)
+                    _ = parse_string(buf, pos)          # tensor name (ignored)
+                    skip_ws(buf, pos)
+                    expect(buf, pos, COLON)
+                    skip_ws(buf, pos)
+                    var shard = parse_string(buf, pos)  # shard filename
+                    var seen = False
+                    for i in range(len(names)):
+                        if names[i] == shard:
+                            seen = True
+                            break
+                    if not seen:
+                        names.append(shard)
+                    skip_ws(buf, pos)
+                    if Int(buf[pos]) == COMMA:
+                        pos += 1
+                        continue
+                    break
+            expect(buf, pos, RBRACE)
+        else:
+            skip_value(buf, pos)
+        skip_ws(buf, pos)
+        if pos < len(buf) and Int(buf[pos]) == COMMA:
+            pos += 1
+            continue
+        break
+    return names^
+
+
+def gather_tensors(path: String) raises -> Tuple[List[TensorEntry], List[String]]:
+    """Resolve a checkpoint into (entries, per-entry file path). `path` is either a
+    single .safetensors file (0.5B in the HF cache is one blob) or a directory
+    holding sharded shards + model.safetensors.index.json (3B). Detection: try to
+    open the index inside `path`-as-dir; absent → treat `path` as a single file."""
+    var entries = List[TensorEntry]()
+    var paths = List[String]()
+    var shards = List[String]()
+    var sharded = False
+    try:
+        with open(path + "/model.safetensors.index.json", "r") as f:
+            shards = _parse_shard_names(_str_bytes(f.read()))
+        sharded = True
+    except:
+        pass
+    if sharded:
+        for si in range(len(shards)):
+            var sp = path + "/" + shards[si]
+            var se = read_header(sp)
+            for e in range(len(se)):
+                entries.append(se[e].copy())
+                paths.append(sp)
+    else:
+        var se = read_header(path)
+        for e in range(len(se)):
+            entries.append(se[e].copy())
+            paths.append(path)
+    return (entries^, paths^)
 
 
 @fieldwise_init
@@ -289,16 +378,59 @@ struct Weights(Movable):
     var gate: List[WBuf]
     var up: List[WBuf]
     var down: List[WBuf]
+    # Architecture dims, auto-detected from the checkpoint (see load_weights).
+    # `arch` selects the comptime head-kernel instantiation: 0 = 0.5B, 1 = 3B.
+    var arch: Int
+    var nlayers: Int
+    var hidden: Int       # H
+    var inter: Int        # INTER (MLP)
+    var nkv: Int          # HKV * HEAD_DIM (K/V row width)
+    var hq: Int           # query heads
+    var hkv: Int          # kv heads
+    var head_dim: Int
+    var vocab: Int
+
+
+def _hidden_size(entries: List[TensorEntry], name2idx: Dict[String, Int]) raises -> Int:
+    """Hidden size = the width of an RMSNorm weight ([hidden], bf16 → /2 bytes)."""
+    var idx = name2idx["model.layers.0.input_layernorm.weight"]
+    return (entries[idx].end - entries[idx].begin) // 2
 
 
 def load_weights(ctx: DeviceContext, path: String) raises -> Weights:
-    var entries = read_header(path)
+    var gathered = gather_tensors(path)
+    var entries = gathered[0].copy()
+    var paths = gathered[1].copy()
     var name2idx = Dict[String, Int]()
     for e in range(len(entries)):
         name2idx[entries[e].name] = e
 
-    var embed = load_named_bf16(ctx, path, entries, name2idx, "model.embed_tokens.weight")
-    var final_norm = load_named(ctx, path, entries, name2idx, "model.norm.weight")
+    # Auto-detect which Qwen2.5 this checkpoint is from its hidden size, and pick
+    # the matching dims. Both sizes share vocab/θ/ε/tokenizer/template and tie the
+    # LM head, so only these dims differ. arch selects the comptime head kernels.
+    var hidden = _hidden_size(entries, name2idx)
+    var arch = 0
+    var hq = HQ
+    var hkv = HKV
+    var head_dim = 64
+    var inter = INTER
+    var nlayers = NLAYERS
+    if hidden == 2048:           # Qwen2.5-3B
+        arch = 1
+        hq = 16
+        hkv = 2
+        head_dim = 128
+        inter = 11008
+        nlayers = 36
+    elif hidden != 896:          # Qwen2.5-0.5B is the default preset above
+        raise Error(
+            "unsupported hidden size " + String(hidden)
+            + " (expected 896 = Qwen2.5-0.5B or 2048 = Qwen2.5-3B)"
+        )
+    var nkv = hkv * head_dim
+
+    var embed = load_named_bf16(ctx, paths, entries, name2idx, "model.embed_tokens.weight")
+    var final_norm = load_named(ctx, paths, entries, name2idx, "model.norm.weight")
     var ln1 = List[DevBuf]()
     var qw = List[WBuf]()
     var qb = List[DevBuf]()
@@ -311,21 +443,22 @@ def load_weights(ctx: DeviceContext, path: String) raises -> Weights:
     var gate = List[WBuf]()
     var up = List[WBuf]()
     var down = List[WBuf]()
-    for l in range(NLAYERS):
+    for l in range(nlayers):
         var p = "model.layers." + String(l) + "."
-        ln1.append(load_named(ctx, path, entries, name2idx, p + "input_layernorm.weight"))
-        qw.append(load_named_bf16(ctx, path, entries, name2idx, p + "self_attn.q_proj.weight"))
-        qb.append(load_named(ctx, path, entries, name2idx, p + "self_attn.q_proj.bias"))
-        kw.append(load_named_bf16(ctx, path, entries, name2idx, p + "self_attn.k_proj.weight"))
-        kb.append(load_named(ctx, path, entries, name2idx, p + "self_attn.k_proj.bias"))
-        vw.append(load_named_bf16(ctx, path, entries, name2idx, p + "self_attn.v_proj.weight"))
-        vb.append(load_named(ctx, path, entries, name2idx, p + "self_attn.v_proj.bias"))
-        ow.append(load_named_bf16(ctx, path, entries, name2idx, p + "self_attn.o_proj.weight"))
-        ln2.append(load_named(ctx, path, entries, name2idx, p + "post_attention_layernorm.weight"))
-        gate.append(load_named_bf16(ctx, path, entries, name2idx, p + "mlp.gate_proj.weight"))
-        up.append(load_named_bf16(ctx, path, entries, name2idx, p + "mlp.up_proj.weight"))
-        down.append(load_named_bf16(ctx, path, entries, name2idx, p + "mlp.down_proj.weight"))
-    return Weights(embed^, final_norm^, ln1^, qw^, qb^, kw^, kb^, vw^, vb^, ow^, ln2^, gate^, up^, down^)
+        ln1.append(load_named(ctx, paths, entries, name2idx, p + "input_layernorm.weight"))
+        qw.append(load_named_bf16(ctx, paths, entries, name2idx, p + "self_attn.q_proj.weight"))
+        qb.append(load_named(ctx, paths, entries, name2idx, p + "self_attn.q_proj.bias"))
+        kw.append(load_named_bf16(ctx, paths, entries, name2idx, p + "self_attn.k_proj.weight"))
+        kb.append(load_named(ctx, paths, entries, name2idx, p + "self_attn.k_proj.bias"))
+        vw.append(load_named_bf16(ctx, paths, entries, name2idx, p + "self_attn.v_proj.weight"))
+        vb.append(load_named(ctx, paths, entries, name2idx, p + "self_attn.v_proj.bias"))
+        ow.append(load_named_bf16(ctx, paths, entries, name2idx, p + "self_attn.o_proj.weight"))
+        ln2.append(load_named(ctx, paths, entries, name2idx, p + "post_attention_layernorm.weight"))
+        gate.append(load_named_bf16(ctx, paths, entries, name2idx, p + "mlp.gate_proj.weight"))
+        up.append(load_named_bf16(ctx, paths, entries, name2idx, p + "mlp.up_proj.weight"))
+        down.append(load_named_bf16(ctx, paths, entries, name2idx, p + "mlp.down_proj.weight"))
+    return Weights(embed^, final_norm^, ln1^, qw^, qb^, kw^, kb^, vw^, vb^, ow^, ln2^, gate^, up^, down^,
+                   arch, nlayers, hidden, inter, nkv, hq, hkv, head_dim, VOCAB)
 
 
 # ── op launchers (each runs one kernel, returns a new device buffer) ───────────
@@ -389,14 +522,15 @@ def silu_mul(ctx: DeviceContext, mut a: DevBuf, mut b: DevBuf, n: Int) raises ->
     )
     return y^
 
-def embed_tokens(ctx: DeviceContext, mut ids: DeviceBuffer[DType.int32], mut emb: WBuf, T: Int) raises -> DevBuf:
-    var h = ctx.enqueue_create_buffer[DType.float32](T * H)
-    var lay = row_major(T * H)
-    comptime k = embed_kernel[type_of(lay)]
+def embed_tokens(ctx: DeviceContext, mut ids: DeviceBuffer[DType.int32], mut emb: WBuf, T: Int,
+                 hidden: Int = H, vocab: Int = VOCAB) raises -> DevBuf:
+    var h = ctx.enqueue_create_buffer[DType.float32](T * hidden)
+    var lay = row_major(T * hidden)
+    comptime k = embed_kernel[type_of(lay)]   # dimension-agnostic (runtime T, hidden)
     ctx.enqueue_function[k](
-        TileTensor(ids, row_major(T)), TileTensor(emb, row_major(VOCAB * H)),
-        TileTensor(h, lay), T, H,
-        grid_dim=ceildiv(T * H, BLOCK), block_dim=BLOCK,
+        TileTensor(ids, row_major(T)), TileTensor(emb, row_major(vocab * hidden)),
+        TileTensor(h, lay), T, hidden,
+        grid_dim=ceildiv(T * hidden, BLOCK), block_dim=BLOCK,
     )
     return h^
 
@@ -420,45 +554,67 @@ def copy_into(ctx: DeviceContext, mut src: DevBuf, mut dst: DevBuf, dst_offset: 
     )
 
 def rope_k(ctx: DeviceContext, mut kin: DevBuf, mut kc: DevBuf,
-           Tq: Int, q_offset: Int, cache_len: Int) raises:
+           Tq: Int, q_offset: Int, cache_len: Int,
+           hkv: Int = HKV, head_dim: Int = 64, arch: Int = 0) raises:
     """Apply RoPE to projected K and store it (rotated) at its cache rows —
-    replaces the plain K copy so attention reads pre-rotated K (§11 #12)."""
-    var lay = row_major(Tq * NKV)
-    comptime k = rope_k_kernel[type_of(lay)]
-    ctx.enqueue_function[k](
-        TileTensor(kin, lay), TileTensor(kc, row_major(cache_len)), Tq, q_offset,
-        grid_dim=ceildiv(Tq * HKV, BLOCK), block_dim=BLOCK,
-    )
-
-def attn_cached(ctx: DeviceContext, mut q: DevBuf, mut kc: DevBuf, mut vc: DevBuf,
-                Tq: Int, q_offset: Int, cache_len: Int) raises -> DevBuf:
-    # Rotate Q first (rope_q), then attend; K is already rotated in the cache.
-    var qr = ctx.enqueue_create_buffer[DType.float32](Tq * H)
-    var qlay = row_major(Tq * H)
-    comptime kq = rope_q_kernel[type_of(qlay)]
-    ctx.enqueue_function[kq](
-        TileTensor(q, qlay), TileTensor(qr, qlay), Tq, q_offset,
-        grid_dim=ceildiv(Tq * HQ, BLOCK), block_dim=BLOCK,
-    )
-    var o = ctx.enqueue_create_buffer[DType.float32](Tq * H)
-    var lay = row_major(Tq * H)
-    if q_offset + Tq > FLASH_THRESHOLD:
-        # Long context: stream K/V through shared memory (bit-identical, no cliff).
-        comptime kf = flash_attn_kernel[type_of(lay)]
-        ctx.enqueue_function[kf](
-            TileTensor(qr, row_major(Tq * H)), TileTensor(kc, row_major(cache_len)),
-            TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset,
-            # one block per (query-tile of FLASH_PW, kv-head); FLASH_NWARP warps each
-            # (FLASH_PW queries × GROUP heads sharing the staged K/V)
-            grid_dim=ceildiv(Tq, FLASH_PW) * HKV, block_dim=FLASH_NWARP * WARP_SIZE,
+    replaces the plain K copy so attention reads pre-rotated K (§11 #12).
+    arch selects the comptime head-dim instantiation (0 = 0.5B, 1 = 3B)."""
+    var lay = row_major(Tq * hkv * head_dim)
+    if arch == 1:
+        comptime k = rope_k_kernel[type_of(lay), 2, 128]
+        ctx.enqueue_function[k](
+            TileTensor(kin, lay), TileTensor(kc, row_major(cache_len)), Tq, q_offset,
+            grid_dim=ceildiv(Tq * hkv, BLOCK), block_dim=BLOCK,
         )
     else:
-        comptime k = attn_cached_kernel[type_of(lay)]
+        comptime k = rope_k_kernel[type_of(lay), 2, 64]
         ctx.enqueue_function[k](
-            TileTensor(qr, row_major(Tq * H)), TileTensor(kc, row_major(cache_len)),
+            TileTensor(kin, lay), TileTensor(kc, row_major(cache_len)), Tq, q_offset,
+            grid_dim=ceildiv(Tq * hkv, BLOCK), block_dim=BLOCK,
+        )
+
+def attn_cached(ctx: DeviceContext, mut q: DevBuf, mut kc: DevBuf, mut vc: DevBuf,
+                Tq: Int, q_offset: Int, cache_len: Int,
+                hidden: Int = H, hq: Int = HQ, hkv: Int = HKV, head_dim: Int = 64,
+                arch: Int = 0) raises -> DevBuf:
+    # Rotate Q first (rope_q), then attend; K is already rotated in the cache.
+    var qr = ctx.enqueue_create_buffer[DType.float32](Tq * hidden)
+    var qlay = row_major(Tq * hidden)
+    if arch == 1:
+        comptime kq = rope_q_kernel[type_of(qlay), 16, 128]
+        ctx.enqueue_function[kq](TileTensor(q, qlay), TileTensor(qr, qlay), Tq, q_offset,
+            grid_dim=ceildiv(Tq * hq, BLOCK), block_dim=BLOCK)
+    else:
+        comptime kq = rope_q_kernel[type_of(qlay), 14, 64]
+        ctx.enqueue_function[kq](TileTensor(q, qlay), TileTensor(qr, qlay), Tq, q_offset,
+            grid_dim=ceildiv(Tq * hq, BLOCK), block_dim=BLOCK)
+
+    var o = ctx.enqueue_create_buffer[DType.float32](Tq * hidden)
+    var lay = row_major(Tq * hidden)
+    if arch == 0 and q_offset + Tq > FLASH_THRESHOLD:
+        # 0.5B long context: stream K/V through shared memory (bit-identical, no cliff).
+        # Flash is 0.5B-only: HEAD_DIM=128 would double the staged tile to ~32 KB
+        # (Metal threadgroup limit), so 3B always uses attn_cached_kernel.
+        comptime kf = flash_attn_kernel[type_of(lay), 14, 2, 64, FLASH_PW]
+        comptime nwarp = FLASH_PW * 7    # GROUP = 14/2
+        ctx.enqueue_function[kf](
+            TileTensor(qr, row_major(Tq * hidden)), TileTensor(kc, row_major(cache_len)),
             TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset,
-            # one warp per (query, head): Tq*HQ*WARP_SIZE threads
-            grid_dim=ceildiv(Tq * HQ * WARP_SIZE, BLOCK), block_dim=BLOCK,
+            grid_dim=ceildiv(Tq, FLASH_PW) * hkv, block_dim=nwarp * WARP_SIZE,
+        )
+    elif arch == 1:
+        comptime k = attn_cached_kernel[type_of(lay), 16, 2, 128]
+        ctx.enqueue_function[k](
+            TileTensor(qr, row_major(Tq * hidden)), TileTensor(kc, row_major(cache_len)),
+            TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset,
+            grid_dim=ceildiv(Tq * hq * WARP_SIZE, BLOCK), block_dim=BLOCK,
+        )
+    else:
+        comptime k = attn_cached_kernel[type_of(lay), 14, 2, 64]
+        ctx.enqueue_function[k](
+            TileTensor(qr, row_major(Tq * hidden)), TileTensor(kc, row_major(cache_len)),
+            TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset,
+            grid_dim=ceildiv(Tq * hq * WARP_SIZE, BLOCK), block_dim=BLOCK,
         )
     return o^
 
@@ -468,22 +624,26 @@ def attn_cached(ctx: DeviceContext, mut q: DevBuf, mut kc: DevBuf, mut vc: DevBu
 def layer_cached(ctx: DeviceContext, mut w: Weights, l: Int, mut h: DevBuf,
                  mut kc: DevBuf, mut vc: DevBuf, Tq: Int, q_offset: Int,
                  cache_len: Int, mut dummy: DevBuf) raises -> DevBuf:
-    """One decoder layer. Prefill = (Tq=P, q_offset=0); decode = (Tq=1, q_offset=pos)."""
-    var ln1 = rmsnorm(ctx, h, w.ln1[l], Tq, H)
-    var q = mm(ctx, ln1, w.qw[l], w.qb[l], Tq, H, H, 1)
-    var kk = mm(ctx, ln1, w.kw[l], w.kb[l], Tq, H, NKV, 1)
-    var vv = mm(ctx, ln1, w.vw[l], w.vb[l], Tq, H, NKV, 1)
-    rope_k(ctx, kk, kc, Tq, q_offset, cache_len)                  # store K RoPE-rotated
-    copy_into(ctx, vv, vc, q_offset * NKV, Tq * NKV, cache_len)   # V is not rotated
-    var o = attn_cached(ctx, q, kc, vc, Tq, q_offset, cache_len)
-    var o2 = mm(ctx, o, w.ow[l], dummy, Tq, H, H, 0)
-    var h2 = add(ctx, h, o2, Tq * H)
-    var ln2 = rmsnorm(ctx, h2, w.ln2[l], Tq, H)
-    var g = mm(ctx, ln2, w.gate[l], dummy, Tq, H, INTER, 0)
-    var u = mm(ctx, ln2, w.up[l], dummy, Tq, H, INTER, 0)
-    var gu = silu_mul(ctx, g, u, Tq * INTER)
-    var dn = mm(ctx, gu, w.down[l], dummy, Tq, INTER, H, 0)
-    return add(ctx, h2, dn, Tq * H)
+    """One decoder layer. Prefill = (Tq=P, q_offset=0); decode = (Tq=1, q_offset=pos).
+    Dims come from the loaded Weights, so this serves any supported arch."""
+    var hd = w.hidden
+    var nkv = w.nkv
+    var ln1 = rmsnorm(ctx, h, w.ln1[l], Tq, hd)
+    var q = mm(ctx, ln1, w.qw[l], w.qb[l], Tq, hd, hd, 1)
+    var kk = mm(ctx, ln1, w.kw[l], w.kb[l], Tq, hd, nkv, 1)
+    var vv = mm(ctx, ln1, w.vw[l], w.vb[l], Tq, hd, nkv, 1)
+    rope_k(ctx, kk, kc, Tq, q_offset, cache_len, w.hkv, w.head_dim, w.arch)   # store K RoPE-rotated
+    copy_into(ctx, vv, vc, q_offset * nkv, Tq * nkv, cache_len)               # V is not rotated
+    var o = attn_cached(ctx, q, kc, vc, Tq, q_offset, cache_len,
+                        w.hidden, w.hq, w.hkv, w.head_dim, w.arch)
+    var o2 = mm(ctx, o, w.ow[l], dummy, Tq, hd, hd, 0)
+    var h2 = add(ctx, h, o2, Tq * hd)
+    var ln2 = rmsnorm(ctx, h2, w.ln2[l], Tq, hd)
+    var g = mm(ctx, ln2, w.gate[l], dummy, Tq, hd, w.inter, 0)
+    var u = mm(ctx, ln2, w.up[l], dummy, Tq, hd, w.inter, 0)
+    var gu = silu_mul(ctx, g, u, Tq * w.inter)
+    var dn = mm(ctx, gu, w.down[l], dummy, Tq, w.inter, hd, 0)
+    return add(ctx, h2, dn, Tq * hd)
 
 def argmax_last(ctx: DeviceContext, mut w: Weights, mut h: DevBuf, T: Int, mut dummy: DevBuf) raises -> Int:
     """Final RMSNorm + tied LM head; argmax over the last position's logits.
@@ -491,15 +651,15 @@ def argmax_last(ctx: DeviceContext, mut w: Weights, mut h: DevBuf, T: Int, mut d
     Only row T-1 feeds the LM head: the VOCAB-wide (151936) head is the largest
     matmul in the net, so at prefill running it on all T rows and keeping one was
     the dominant cost (§11 #12). Slice the last hidden row first → one GEMV."""
-    var hl = last_row(ctx, h, T, H)
-    var hn = rmsnorm(ctx, hl, w.final_norm, 1, H)
-    var logits = mm(ctx, hn, w.embed, dummy, 1, H, VOCAB, 0)
+    var hl = last_row(ctx, h, T, w.hidden)
+    var hn = rmsnorm(ctx, hl, w.final_norm, 1, w.hidden)
+    var logits = mm(ctx, hn, w.embed, dummy, 1, w.hidden, w.vocab, 0)
     ctx.synchronize()
     var best = -1
     var best_v = Float32(-1.0e30)
     with logits.map_to_host() as m:
-        var mt = TileTensor(m, row_major(VOCAB))
-        for i in range(VOCAB):
+        var mt = TileTensor(m, row_major(w.vocab))
+        for i in range(w.vocab):
             var v = rebind[Scalar[DType.float32]](mt[i])
             if v > best_v:
                 best_v = v
@@ -509,14 +669,14 @@ def argmax_last(ctx: DeviceContext, mut w: Weights, mut h: DevBuf, T: Int, mut d
 def logits_last(ctx: DeviceContext, mut w: Weights, mut h: DevBuf, T: Int, mut dummy: DevBuf) raises -> List[Float32]:
     """Final RMSNorm + tied LM head; returns the last position's logits on host.
     Slices row T-1 before the head so prefill runs it once, not T times (§11 #12)."""
-    var hl = last_row(ctx, h, T, H)
-    var hn = rmsnorm(ctx, hl, w.final_norm, 1, H)
-    var logits = mm(ctx, hn, w.embed, dummy, 1, H, VOCAB, 0)
+    var hl = last_row(ctx, h, T, w.hidden)
+    var hn = rmsnorm(ctx, hl, w.final_norm, 1, w.hidden)
+    var logits = mm(ctx, hn, w.embed, dummy, 1, w.hidden, w.vocab, 0)
     ctx.synchronize()
     var out = List[Float32]()
     with logits.map_to_host() as m:
-        var mt = TileTensor(m, row_major(VOCAB))
-        for i in range(VOCAB):
+        var mt = TileTensor(m, row_major(w.vocab))
+        for i in range(w.vocab):
             out.append(rebind[Scalar[DType.float32]](mt[i]))
     return out^
 
@@ -647,11 +807,11 @@ struct Session(Movable):
     var pos: Int
 
 
-def new_session(ctx: DeviceContext, max_seq: Int) raises -> Session:
-    var cache_len = max_seq * NKV
+def new_session(ctx: DeviceContext, max_seq: Int, nlayers: Int = NLAYERS, nkv: Int = NKV) raises -> Session:
+    var cache_len = max_seq * nkv
     var kcs = List[DevBuf]()
     var vcs = List[DevBuf]()
-    for _ in range(NLAYERS):
+    for _ in range(nlayers):
         kcs.append(ctx.enqueue_create_buffer[DType.float32](cache_len))
         vcs.append(ctx.enqueue_create_buffer[DType.float32](cache_len))
     return Session(kcs^, vcs^, ctx.enqueue_create_buffer[DType.float32](1), cache_len, 0)
@@ -660,8 +820,8 @@ def new_session(ctx: DeviceContext, max_seq: Int) raises -> Session:
 def sess_prefill(ctx: DeviceContext, mut w: Weights, mut s: Session, prompt: List[Int]) raises -> List[Float32]:
     var P = len(prompt)
     var ids_dev = upload_ids(ctx, prompt)
-    var h = embed_tokens(ctx, ids_dev, w.embed, P)
-    for l in range(NLAYERS):
+    var h = embed_tokens(ctx, ids_dev, w.embed, P, w.hidden, w.vocab)
+    for l in range(w.nlayers):
         h = layer_cached(ctx, w, l, h, s.kcs[l], s.vcs[l], P, 0, s.cache_len, s.dummy)
     s.pos = P
     return logits_last(ctx, w, h, P, s.dummy)
@@ -676,8 +836,8 @@ def sess_prefill_suffix(ctx: DeviceContext, mut w: Weights, mut s: Session,
     the rotated K and the attention mask stay correct for the reused prefix."""
     var Q = len(suffix)
     var ids_dev = upload_ids(ctx, suffix)
-    var h = embed_tokens(ctx, ids_dev, w.embed, Q)
-    for l in range(NLAYERS):
+    var h = embed_tokens(ctx, ids_dev, w.embed, Q, w.hidden, w.vocab)
+    for l in range(w.nlayers):
         h = layer_cached(ctx, w, l, h, s.kcs[l], s.vcs[l], Q, offset, s.cache_len, s.dummy)
     s.pos = offset + Q
     return logits_last(ctx, w, h, Q, s.dummy)
@@ -685,8 +845,8 @@ def sess_prefill_suffix(ctx: DeviceContext, mut w: Weights, mut s: Session,
 
 def sess_step(ctx: DeviceContext, mut w: Weights, mut s: Session, token: Int) raises -> List[Float32]:
     var one = upload_ids(ctx, [token])
-    var h = embed_tokens(ctx, one, w.embed, 1)
-    for l in range(NLAYERS):
+    var h = embed_tokens(ctx, one, w.embed, 1, w.hidden, w.vocab)
+    for l in range(w.nlayers):
         h = layer_cached(ctx, w, l, h, s.kcs[l], s.vcs[l], 1, s.pos, s.cache_len, s.dummy)
     s.pos += 1
     return logits_last(ctx, w, h, 1, s.dummy)
@@ -694,7 +854,7 @@ def sess_step(ctx: DeviceContext, mut w: Weights, mut s: Session, token: Int) ra
 
 def generate(ctx: DeviceContext, mut w: Weights, prompt: List[Int], max_new: Int) raises -> List[Int]:
     """Greedy decode: prefill the prompt then emit tokens until EOS or max_new."""
-    var s = new_session(ctx, len(prompt) + max_new + 2)
+    var s = new_session(ctx, len(prompt) + max_new + 2, w.nlayers, w.nkv)
     var nxt = argmax_f(sess_prefill(ctx, w, s, prompt))
     var gen = List[Int]()
     gen.append(nxt)
@@ -708,7 +868,7 @@ def generate_sample(ctx: DeviceContext, mut w: Weights, prompt: List[Int], max_n
                     temp: Float32, top_k: Int, top_p: Float32, rep_pen: Float32,
                     seed: UInt64) raises -> List[Int]:
     """Greedy-structure decode but draw each token from the processed distribution."""
-    var s = new_session(ctx, len(prompt) + max_new + 2)
+    var s = new_session(ctx, len(prompt) + max_new + 2, w.nlayers, w.nkv)
     var rng = seed if seed != 0 else UInt64(0x9E3779B97F4A7C15)
     var context = prompt.copy()
     var nxt = sample(process_logits(sess_prefill(ctx, w, s, prompt), context, temp, top_k, top_p, rep_pen), rng)
