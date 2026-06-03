@@ -40,6 +40,7 @@ from model import (
 from tokenizer import Tokenizer, load_tokenizer
 from chat import load_chat_template, render_value, json_escape_str
 from toolcall import parse_tool_calls, ToolCall
+from blockcache import BlockCache
 from template import Template
 from value import Value
 from json import parse_json, bytes_to_string
@@ -49,6 +50,11 @@ from json import parse_json, bytes_to_string
 # the prefix they share instead of re-prefilling it. 32768 = Qwen2.5's native
 # context; the cache is ~MAX_SEQ * 24 KiB ≈ 805 MB resident on the GPU.
 comptime MAX_SEQ = 32768
+
+# Disk-backed prefix cache: K/V persisted in BLOCK_TOK-token blocks so prefills
+# survive restarts and are shared across conversations (blockcache.mojo).
+comptime BLOCK_TOK = 256
+comptime KV_BUDGET_BYTES = 8 * 1024 * 1024 * 1024   # 8 GB LRU cap
 
 comptime TEMPLATE = "assets/qwen2.5-chat-template.jinja"
 # Default served model ids by detected arch (used when no explicit id is given on
@@ -89,10 +95,11 @@ struct ServerState(Movable):
     var sess: Session      # one long-lived KV cache, reused across requests
     var cached: List[Int]  # token ids currently held in sess rows [0, len)
     var model_id: String   # id reported by /v1/models + every response
+    var bcache: BlockCache # disk-backed prefix cache (survives restarts)
 
     def __init__(out self, var ctx: DeviceContext, var w: Weights,
                  var tok: Tokenizer, var tmpl: Template, var sess: Session,
-                 var model_id: String):
+                 var model_id: String, var bcache: BlockCache):
         self.ctx = ctx^
         self.w = w^
         self.tok = tok^
@@ -100,6 +107,7 @@ struct ServerState(Movable):
         self.sess = sess^
         self.cached = List[Int]()
         self.model_id = model_id^
+        self.bcache = bcache^
 
 
 # ── small helpers ────────────────────────────────────────────────────────────
@@ -241,14 +249,29 @@ def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
                     + String(MAX_SEQ))
     var cap = max_new if max_new < room else room
 
-    # Longest common prefix with what's cached; always recompute the last prompt
-    # token so we have its logits to sample the first new token from.
+    # Reuse = longest prefix already valid in GPU (in-memory, free), extended by
+    # the longest leading run of blocks on disk (loaded into the session). Always
+    # recompute the last prompt token so we have its logits.
     var lim = len(s.cached)
     if len(ids) - 1 < lim:
         lim = len(ids) - 1
-    var reuse = 0
-    while reuse < lim and s.cached[reuse] == ids[reuse]:
-        reuse += 1
+    var mem_reuse = 0
+    while mem_reuse < lim and s.cached[mem_reuse] == ids[mem_reuse]:
+        mem_reuse += 1
+
+    var hashes = s.bcache.chained_hashes(ids)
+    var disk_run = s.bcache.longest_run(hashes, ids)          # # leading blocks on disk
+    while disk_run > 0 and disk_run * BLOCK_TOK > len(ids) - 1:  # keep ≥1 token to prefill
+        disk_run -= 1
+    var reuse = mem_reuse
+    var loaded = 0
+    if disk_run * BLOCK_TOK > mem_reuse:
+        # load disk blocks covering (mem_reuse … disk_run) into the GPU session
+        var first = mem_reuse // BLOCK_TOK
+        s.bcache.restore_blocks(s.sess.kcs, s.sess.vcs, hashes, first, disk_run)
+        s.sess.pos = disk_run * BLOCK_TOK
+        loaded = disk_run - first
+        reuse = disk_run * BLOCK_TOK
 
     var suffix = List[Int]()
     for i in range(reuse, len(ids)):
@@ -258,6 +281,13 @@ def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
     var logits = sess_prefill_suffix(s.ctx, s.w, s.sess, suffix, reuse, True)
     var t_pf = perf_counter_ns()
     s.cached = ids.copy()  # prompt is now resident; generated tokens are not cached
+
+    # Persist newly-computed full blocks to disk + refresh LRU (warm prefix stays hot).
+    var nblocks = len(ids) // BLOCK_TOK
+    s.bcache.store_blocks(s.sess.kcs, s.sess.vcs, hashes, ids, disk_run, nblocks)
+    s.bcache.touch_and_evict(hashes, nblocks)
+    if loaded > 0:
+        print("    kv-cache: restored ", loaded, " block(s) from disk (", loaded * BLOCK_TOK, " tok)", sep="")
 
     var context = ids.copy()
     var rng = SEED
@@ -665,7 +695,16 @@ def main() raises:
     print("  serving ", model_id, "  (hidden=", w.hidden, ", layers=", w.nlayers,
           ", heads=", w.hq, "/", w.hkv, ", head_dim=", w.head_dim, ")", sep="")
 
-    var state = ServerState(ctx^, w^, tok^, tmpl^, sess^, model_id^)
+    # Disk-backed prefix cache (per model), survives restarts.
+    var kvdir = String(getenv("HOME")) + "/.cache/millrace/kv/" + _slug(model_id)
+    var bcache = BlockCache(kvdir, BLOCK_TOK, w.nkv, w.nlayers, KV_BUDGET_BYTES, model_id)
+    if bcache.enabled:
+        print("  kv-cache: ", kvdir, " (", len(bcache.order), " blocks cached, cap ",
+              bcache.max_blocks, " blocks)", sep="")
+    else:
+        print("  kv-cache: disabled")
+
+    var state = ServerState(ctx^, w^, tok^, tmpl^, sess^, model_id^, bcache^)
     var sp = alloc[ServerState](1)
     sp.init_pointee_move(state^)
     var api = Api(sp)

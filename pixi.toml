@@ -73,6 +73,10 @@ test-sample = "mojo run src/test_sample.mojo"
 # for the JSON parser/serializer.
 test-toolcall = "mojo run -I ../minja2/src src/test_toolcall.mojo"
 
+# Disk block KV-cache roundtrip (src/blockcache.mojo): store -> corrupt -> restore
+# bit-identical, chained-hash determinism, collision guard. Needs the GPU.
+test-blockcache = "mojo run src/test_blockcache.mojo"
+
 # Phase 6a end-to-end chat CLI (ARCHITECTURE.md §6): prompt -> text, pure Mojo on
 # the GPU. Usage: pixi run chat -- "Your question". Needs tok-capture (tokenizer
 # tables) + a checkpoint path ($QWEN_SAFETENSORS or forward-capture's meta).
