@@ -255,7 +255,7 @@ def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
         suffix.append(ids[i])
 
     var t0 = perf_counter_ns()
-    var logits = sess_prefill_suffix(s.ctx, s.w, s.sess, suffix, reuse)
+    var logits = sess_prefill_suffix(s.ctx, s.w, s.sess, suffix, reuse, True)
     var t_pf = perf_counter_ns()
     s.cached = ids.copy()  # prompt is now resident; generated tokens are not cached
 
@@ -263,6 +263,7 @@ def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
     var rng = SEED
     var gen = List[Int]()
     var stopped = False
+    var last_beat = t_pf   # throttle for the ~5s decode heartbeat
     while len(gen) < cap:
         var nxt = (
             sample(process_logits(logits, context, temp, top_k, top_p, DEF_REP), rng)
@@ -276,6 +277,12 @@ def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
         if len(gen) >= cap:
             break
         logits = sess_step(s.ctx, s.w, s.sess, nxt)
+        # sess_step already synced (host logits copy), so this is real wall-clock.
+        var now = perf_counter_ns()
+        if Float64(now - last_beat) >= 5.0e9:
+            var rate = Float64(len(gen)) * 1.0e9 / Float64(now - t_pf)
+            print("  decoding: ", len(gen), " tokens (", Int(rate + 0.5), " tok/s)", sep="")
+            last_beat = now
     var t_dec = perf_counter_ns()
 
     var pf_ms = Float64(t_pf - t0) / 1.0e6

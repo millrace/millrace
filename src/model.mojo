@@ -14,6 +14,7 @@ from std.math import ceildiv, exp
 from std.gpu import WARP_SIZE
 from std.gpu.host import DeviceContext, DeviceBuffer
 from std.memory import memcpy
+from std.time import perf_counter_ns
 from layout import TileTensor, row_major
 
 from kernels import (
@@ -827,18 +828,59 @@ def sess_prefill(ctx: DeviceContext, mut w: Weights, mut s: Session, prompt: Lis
     return logits_last(ctx, w, h, P, s.dummy)
 
 
+# Below this suffix length, prefill is sub-second and frequent (the prefix-cache
+# common case), so progress reporting — and its per-layer synchronize — is skipped
+# entirely, leaving that hot path byte-for-byte as before.
+comptime PROGRESS_MIN_TOK = 2048
+comptime PROGRESS_EVERY_NS = 5_000_000_000   # ~5 s between progress lines
+
+
+def _ktok(n: Int) -> String:
+    """Compact token count: 9562 -> '9.5k', 800 -> '800'."""
+    if n < 1000:
+        return String(n)
+    return String(n // 1000) + "." + String((n % 1000) // 100) + "k"
+
+def _dur(secs: Float64) -> String:
+    var s = Int(secs + 0.5)
+    if s < 90:
+        return String(s) + "s"
+    return String(s // 60) + "m" + String(s % 60) + "s"
+
+
 def sess_prefill_suffix(ctx: DeviceContext, mut w: Weights, mut s: Session,
-                        suffix: List[Int], offset: Int) raises -> List[Float32]:
+                        suffix: List[Int], offset: Int, progress: Bool = False) raises -> List[Float32]:
     """Prefill `suffix` tokens at cache position `offset`, reusing the K/V already
     stored in rows [0, offset). Returns the last-row logits. This is the engine
     behind the server's cross-request prefix cache; `sess_prefill` is just the
     offset==0 / whole-prompt special case. RoPE positions come from `offset`, so
-    the rotated K and the attention mask stay correct for the reused prefix."""
+    the rotated K and the attention mask stay correct for the reused prefix.
+
+    With `progress` (and a large enough suffix), prints a throttled stdout line
+    with percent done + ETA. Layers are uniform cost, so elapsed/layers-done
+    extrapolates accurately. It synchronizes per layer to time real GPU progress;
+    that adds no throughput cost (layers are a sequential dependency chain anyway)
+    but is gated off below PROGRESS_MIN_TOK so the frequent tiny prefills are
+    untouched. Granularity is per-layer — a kernel already running can't be
+    interrupted — so very long contexts tick per layer rather than exactly 5 s."""
     var Q = len(suffix)
     var ids_dev = upload_ids(ctx, suffix)
     var h = embed_tokens(ctx, ids_dev, w.embed, Q, w.hidden, w.vocab)
+    var report = progress and Q >= PROGRESS_MIN_TOK
+    var t0 = perf_counter_ns()
+    var last = t0
     for l in range(w.nlayers):
         h = layer_cached(ctx, w, l, h, s.kcs[l], s.vcs[l], Q, offset, s.cache_len, s.dummy)
+        if report:
+            ctx.synchronize()
+            var now = perf_counter_ns()
+            if Float64(now - last) >= Float64(PROGRESS_EVERY_NS):
+                var done = l + 1
+                var elapsed = Float64(now - t0) / 1.0e9
+                var eta = elapsed * Float64(w.nlayers - done) / Float64(done)
+                print("  prefill ", _ktok(Q), "tok: ", (done * 100) // w.nlayers,
+                      "% (layer ", done, "/", w.nlayers, "), ~", _dur(eta), " left", sep="")
+                last = now
     s.pos = offset + Q
     return logits_last(ctx, w, h, Q, s.dummy)
 
