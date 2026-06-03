@@ -73,19 +73,21 @@ default) and decodes slower than the 0.5B.
 
 ## Connect OpenCode
 
-`assets/opencode.json` declares a `millrace` provider (via
-`@ai-sdk/openai-compatible`, pointed at `http://127.0.0.1:8000/v1`) so the local
-model appears in OpenCode's picker. With the server running in another terminal:
+With the server running in another terminal:
 
 ```sh
 pixi run opencode                       # interactive
 pixi run opencode -- run "your prompt"   # one-shot
 ```
 
-The task sets `OPENCODE_CONFIG` to `assets/opencode.json` and the
-`OPENAI_BASE_URL`/`OPENAI_API_KEY` env vars for you; the active model is
-`millrace/qwen2.5-0.5b-instruct`.
+The task queries the server's `/v1/models`, generates an OpenCode config that
+declares a `millrace` provider (`@ai-sdk/openai-compatible`, pointed at
+`http://127.0.0.1:8000/v1`) listing **exactly the model the server is serving**
+(`opencode_config.py`), and points OpenCode at it via `OPENCODE_CONFIG`. So
+whatever you launched `serve` with — 0.5B or, e.g., `serve -- Qwen/Qwen2.5-3B-Instruct`
+— shows up in OpenCode's picker automatically. (It errors if the server isn't up;
+start `serve` first.)
 
-To point an existing OpenCode install at the server instead of using the task,
-copy the `provider` block from `assets/opencode.json` into your
-`~/.config/opencode/opencode.json` and select the `millrace` model.
+To point an existing OpenCode install at the server by hand, run
+`python opencode_config.py http://127.0.0.1:8000/v1` and merge the `provider`
+block from the file it prints into your `~/.config/opencode/opencode.json`.
