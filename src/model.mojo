@@ -19,8 +19,14 @@ from layout import TileTensor, row_major
 from kernels import (
     cvt_kernel, embed_kernel, add_kernel, rmsnorm_kernel, matmul_kernel,
     matmul_tiled_kernel, slice_row_kernel,
-    silu_mul_kernel, attn_cached_kernel, copy_kernel, rope_k_kernel, rope_q_kernel,
+    silu_mul_kernel, attn_cached_kernel, flash_attn_kernel, FLASH_BW,
+    copy_kernel, rope_k_kernel, rope_q_kernel,
 )
+
+# Above this context length (keys = q_offset + Tq) the f32 KV working set spills
+# the M4 system cache and attn_cached_kernel super-cliffs; flash_attn_kernel
+# (shared-memory K/V staging, bit-identical output) wins past the ~20K crossover.
+comptime FLASH_THRESHOLD = 20480
 comptime HQ = 14
 
 comptime H = 896
@@ -436,13 +442,23 @@ def attn_cached(ctx: DeviceContext, mut q: DevBuf, mut kc: DevBuf, mut vc: DevBu
     )
     var o = ctx.enqueue_create_buffer[DType.float32](Tq * H)
     var lay = row_major(Tq * H)
-    comptime k = attn_cached_kernel[type_of(lay)]
-    ctx.enqueue_function[k](
-        TileTensor(qr, row_major(Tq * H)), TileTensor(kc, row_major(cache_len)),
-        TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset,
-        # one warp per (query, head): Tq*HQ*WARP_SIZE threads
-        grid_dim=ceildiv(Tq * HQ * WARP_SIZE, BLOCK), block_dim=BLOCK,
-    )
+    if q_offset + Tq > FLASH_THRESHOLD:
+        # Long context: stream K/V through shared memory (bit-identical, no cliff).
+        comptime kf = flash_attn_kernel[type_of(lay)]
+        ctx.enqueue_function[kf](
+            TileTensor(qr, row_major(Tq * H)), TileTensor(kc, row_major(cache_len)),
+            TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset,
+            # one block per (query-tile of FLASH_BW, head); FLASH_BW warps each
+            grid_dim=ceildiv(Tq, FLASH_BW) * HQ, block_dim=FLASH_BW * WARP_SIZE,
+        )
+    else:
+        comptime k = attn_cached_kernel[type_of(lay)]
+        ctx.enqueue_function[k](
+            TileTensor(qr, row_major(Tq * H)), TileTensor(kc, row_major(cache_len)),
+            TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset,
+            # one warp per (query, head): Tq*HQ*WARP_SIZE threads
+            grid_dim=ceildiv(Tq * HQ * WARP_SIZE, BLOCK), block_dim=BLOCK,
+        )
     return o^
 
 
