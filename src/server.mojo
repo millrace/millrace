@@ -26,6 +26,8 @@ single-threaded here — one request in flight at a time (max-backend §10 #4).
 from std.gpu.host import DeviceContext
 from std.memory import alloc
 from std.time import perf_counter_ns
+from std.sys import argv
+from std.os import getenv
 
 from flare.prelude import *
 from flare.http import Handler, SseChannel, SseEvent, sse_response
@@ -49,7 +51,11 @@ from json import parse_json, bytes_to_string
 comptime MAX_SEQ = 32768
 
 comptime TEMPLATE = "assets/qwen2.5-chat-template.jinja"
-comptime MODEL_ID = "qwen2.5-0.5b-instruct"
+# Default served model ids by detected arch (used when no explicit id is given on
+# the CLI). The served id is otherwise whatever `serve <hf-id>` was launched with,
+# and is what /v1/models and every response report.
+comptime MODEL_05B = "Qwen/Qwen2.5-0.5B-Instruct"
+comptime MODEL_3B = "Qwen/Qwen2.5-3B-Instruct"
 comptime PORT = 8000
 
 # minja2 Value tags (value.mojo)
@@ -82,15 +88,18 @@ struct ServerState(Movable):
     var tmpl: Template
     var sess: Session      # one long-lived KV cache, reused across requests
     var cached: List[Int]  # token ids currently held in sess rows [0, len)
+    var model_id: String   # id reported by /v1/models + every response
 
     def __init__(out self, var ctx: DeviceContext, var w: Weights,
-                 var tok: Tokenizer, var tmpl: Template, var sess: Session):
+                 var tok: Tokenizer, var tmpl: Template, var sess: Session,
+                 var model_id: String):
         self.ctx = ctx^
         self.w = w^
         self.tok = tok^
         self.tmpl = tmpl^
         self.sess = sess^
         self.cached = List[Int]()
+        self.model_id = model_id^
 
 
 # ── small helpers ────────────────────────────────────────────────────────────
@@ -281,23 +290,23 @@ def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
 # ── JSON envelopes ───────────────────────────────────────────────────────────
 
 
-def models_json() -> String:
+def models_json(model: String) -> String:
     return (
-        '{"object":"list","data":[{"id":"' + MODEL_ID
+        '{"object":"list","data":[{"id":"' + model
         + '","object":"model","created":0,"owned_by":"millrace"}]}'
     )
 
-def completion_json(content: String, n_prompt: Int, n_gen: Int, finish: String) -> String:
+def completion_json(model: String, content: String, n_prompt: Int, n_gen: Int, finish: String) -> String:
     return (
         '{"id":"chatcmpl-millrace","object":"chat.completion","created":0,"model":"'
-        + MODEL_ID + '","choices":[{"index":0,"message":{"role":"assistant","content":"'
+        + model + '","choices":[{"index":0,"message":{"role":"assistant","content":"'
         + content + '"},"finish_reason":"' + finish + '"}],'
         + '"usage":{"prompt_tokens":' + String(n_prompt)
         + ',"completion_tokens":' + String(n_gen)
         + ',"total_tokens":' + String(n_prompt + n_gen) + "}}"
     )
 
-def chunk_json(delta: String, finish: Bool, fin: String) -> String:
+def chunk_json(model: String, delta: String, finish: Bool, fin: String) -> String:
     var delta_obj = String("{}")
     var finish_reason = String("null")
     if finish:
@@ -306,7 +315,7 @@ def chunk_json(delta: String, finish: Bool, fin: String) -> String:
         delta_obj = '{"content":"' + delta + '"}'
     return (
         '{"id":"chatcmpl-millrace","object":"chat.completion.chunk","created":0,"model":"'
-        + MODEL_ID + '","choices":[{"index":0,"delta":' + delta_obj
+        + model + '","choices":[{"index":0,"delta":' + delta_obj
         + ',"finish_reason":' + finish_reason + "}]}"
     )
 
@@ -329,29 +338,29 @@ def tool_calls_array_json(calls: List[ToolCall]) -> String:
         )
     return s + "]"
 
-def completion_tools_json(content: String, calls: List[ToolCall],
+def completion_tools_json(model: String, content: String, calls: List[ToolCall],
                           n_prompt: Int, n_gen: Int) -> String:
     var content_field = String("null")
     if content.byte_length() > 0:
         content_field = '"' + esc(content) + '"'
     return (
         '{"id":"chatcmpl-millrace","object":"chat.completion","created":0,"model":"'
-        + MODEL_ID + '","choices":[{"index":0,"message":{"role":"assistant","content":'
+        + model + '","choices":[{"index":0,"message":{"role":"assistant","content":'
         + content_field + ',"tool_calls":' + tool_calls_array_json(calls)
         + '},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":' + String(n_prompt)
         + ',"completion_tokens":' + String(n_gen)
         + ',"total_tokens":' + String(n_prompt + n_gen) + "}}"
     )
 
-def chunk_role_json() -> String:
+def chunk_role_json(model: String) -> String:
     """Opening streaming chunk announcing the assistant role (content null)."""
     return (
         '{"id":"chatcmpl-millrace","object":"chat.completion.chunk","created":0,"model":"'
-        + MODEL_ID + '","choices":[{"index":0,"delta":{"role":"assistant","content":null}'
+        + model + '","choices":[{"index":0,"delta":{"role":"assistant","content":null}'
         + ',"finish_reason":null}]}'
     )
 
-def chunk_toolcall_json(i: Int, call: ToolCall) -> String:
+def chunk_toolcall_json(model: String, i: Int, call: ToolCall) -> String:
     """One streaming chunk carrying a whole tool call at `index` i (name +
     full arguments). Clients accumulate per index; emitting it in one delta is
     valid since generation is already buffered."""
@@ -362,7 +371,7 @@ def chunk_toolcall_json(i: Int, call: ToolCall) -> String:
     )
     return (
         '{"id":"chatcmpl-millrace","object":"chat.completion.chunk","created":0,"model":"'
-        + MODEL_ID + '","choices":[{"index":0,"delta":' + delta + ',"finish_reason":null}]}'
+        + model + '","choices":[{"index":0,"delta":' + delta + ',"finish_reason":null}]}'
     )
 
 def function_call_item_json(i: Int, name: String, args: String, status: String) -> String:
@@ -389,24 +398,24 @@ def output_message_json(content: String, status: String) -> String:
         + content + '","annotations":[]}]}'
     )
 
-def response_object_raw(output: String, status: String,
+def response_object_raw(model: String, output: String, status: String,
                         n_prompt: Int, n_gen: Int) -> String:
     """Responses-API `response` object with a pre-built `output` array (a list
     of message and/or function_call items)."""
     return (
         '{"id":"' + RESP_ID + '","object":"response","created_at":0,"status":"'
-        + status + '","model":"' + MODEL_ID + '","output":' + output
+        + status + '","model":"' + model + '","output":' + output
         + ',"usage":{"input_tokens":' + String(n_prompt)
         + ',"output_tokens":' + String(n_gen)
         + ',"total_tokens":' + String(n_prompt + n_gen) + "}}"
     )
 
-def response_object_json(content: String, status: String, with_output: Bool,
+def response_object_json(model: String, content: String, status: String, with_output: Bool,
                          n_prompt: Int, n_gen: Int) -> String:
     var output = String("[]")
     if with_output:
         output = "[" + output_message_json(content, "completed") + "]"
-    return response_object_raw(output, status, n_prompt, n_gen)
+    return response_object_raw(model, output, status, n_prompt, n_gen)
 
 def resp_event(type: String, payload: String) -> SseEvent:
     # Named SSE frame: an `event:` line plus a matching `"type"` in the JSON
@@ -450,7 +459,7 @@ struct Api(Handler, Copyable, Movable):
         if path == "/" or path == "/health":
             return ok("millrace ok")
         if path == "/v1/models":
-            return ok_json(models_json())
+            return ok_json(models_json(self.st[].model_id))
         if is_post and path == "/v1/chat/completions":
             return self.handle_chat(req)
         if is_post and path == "/v1/responses":
@@ -480,29 +489,29 @@ struct Api(Handler, Copyable, Movable):
                 print("    -> ", len(tc.calls), " tool call(s)", sep="")
                 if want_stream:
                     var ch = SseChannel()
-                    ch.push(SseEvent.message(chunk_role_json()))
+                    ch.push(SseEvent.message(chunk_role_json(s.model_id)))
                     if tc.content.byte_length() > 0:
-                        ch.push(SseEvent.message(chunk_json(esc(tc.content), False, fin)))
+                        ch.push(SseEvent.message(chunk_json(s.model_id, esc(tc.content), False, fin)))
                     for i in range(len(tc.calls)):
-                        ch.push(SseEvent.message(chunk_toolcall_json(i, tc.calls[i])))
-                    ch.push(SseEvent.message(chunk_json("", True, "tool_calls")))
+                        ch.push(SseEvent.message(chunk_toolcall_json(s.model_id, i, tc.calls[i])))
+                    ch.push(SseEvent.message(chunk_json(s.model_id, "", True, "tool_calls")))
                     ch.push(SseEvent.message("[DONE]"))
                     ch.close()
                     return sse_response(ch)
-                return ok_json(completion_tools_json(tc.content, tc.calls, len(ids), len(r.ids)))
+                return ok_json(completion_tools_json(s.model_id, tc.content, tc.calls, len(ids), len(r.ids)))
 
         if want_stream:
             var ch = SseChannel()
             var deltas = stream_deltas(s, r.ids)
             for i in range(len(deltas)):
-                ch.push(SseEvent.message(chunk_json(deltas[i], False, fin)))
-            ch.push(SseEvent.message(chunk_json("", True, fin)))
+                ch.push(SseEvent.message(chunk_json(s.model_id, deltas[i], False, fin)))
+            ch.push(SseEvent.message(chunk_json(s.model_id, "", True, fin)))
             ch.push(SseEvent.message("[DONE]"))
             ch.close()
             return sse_response(ch)
 
         var content = json_escape_str(s.tok.decode(r.ids))
-        return ok_json(completion_json(content, len(ids), len(r.ids), fin))
+        return ok_json(completion_json(s.model_id, content, len(ids), len(r.ids), fin))
 
     def handle_responses(self, req: Request) raises -> Response:
         ref s = self.st[]
@@ -533,10 +542,10 @@ struct Api(Handler, Copyable, Movable):
                 print("    -> ", len(tc.calls), " tool call(s)", sep="")
                 var out_arr = function_calls_output_json(tc.calls)
                 if not want_stream:
-                    return ok_json(response_object_raw(out_arr, "completed", len(ids), len(r.ids)))
+                    return ok_json(response_object_raw(s.model_id, out_arr, "completed", len(ids), len(r.ids)))
                 var tch = SseChannel()
                 tch.push(resp_event("response.created",
-                    '"response":' + response_object_raw("[]", "in_progress", len(ids), 0)))
+                    '"response":' + response_object_raw(s.model_id, "[]", "in_progress", len(ids), 0)))
                 for i in range(len(tc.calls)):
                     var nm = tc.calls[i].name
                     var ar = tc.calls[i].arguments
@@ -553,16 +562,16 @@ struct Api(Handler, Copyable, Movable):
                         '"output_index":' + String(i) + ',"item":'
                         + function_call_item_json(i, nm, ar, "completed")))
                 tch.push(resp_event("response.completed",
-                    '"response":' + response_object_raw(out_arr, "completed", len(ids), len(r.ids))))
+                    '"response":' + response_object_raw(s.model_id, out_arr, "completed", len(ids), len(r.ids))))
                 tch.close()
                 return sse_response(tch)
 
         if not want_stream:
-            return ok_json(response_object_json(full, "completed", True, len(ids), len(r.ids)))
+            return ok_json(response_object_json(s.model_id, full, "completed", True, len(ids), len(r.ids)))
 
         var ch = SseChannel()
         ch.push(resp_event("response.created",
-            '"response":' + response_object_json("", "in_progress", False, len(ids), 0)))
+            '"response":' + response_object_json(s.model_id, "", "in_progress", False, len(ids), 0)))
         ch.push(resp_event("response.output_item.added",
             '"output_index":0,"item":{"type":"message","id":"' + MSG_ID
             + '","status":"in_progress","role":"assistant","content":[]}'))
@@ -583,7 +592,7 @@ struct Api(Handler, Copyable, Movable):
         ch.push(resp_event("response.output_item.done",
             '"output_index":0,"item":' + output_message_json(full, "completed")))
         ch.push(resp_event("response.completed",
-            '"response":' + response_object_json(full, "completed", True, len(ids), len(r.ids))))
+            '"response":' + response_object_json(s.model_id, full, "completed", True, len(ids), len(r.ids))))
         ch.close()
         return sse_response(ch)
 
@@ -593,20 +602,63 @@ def read_text(path: String) raises -> String:
         return f.read()
 
 
+def _slug(model_id: String) -> String:
+    """HF repo id -> cache dir suffix: 'Qwen/Qwen2.5-3B-Instruct' -> 'Qwen--Qwen2.5-3B-Instruct'."""
+    var b = model_id.as_bytes()
+    var out = List[UInt8]()
+    for i in range(len(b)):
+        if b[i] == 47:           # '/'
+            out.append(45); out.append(45)   # '--'
+        else:
+            out.append(b[i])
+    return bytes_to_string(out)
+
+def hf_cache_path(model_id: String) raises -> String:
+    """Local snapshot dir of an already-downloaded HF model, mirroring
+    huggingface_hub's layout: <hub>/models--<slug>/snapshots/<refs/main>. Raises if
+    not cached (no refs/main) — caller then treats the arg as a literal path."""
+    var home = String(getenv("HF_HOME"))
+    var hub = (home + "/hub") if home.byte_length() > 0 else (String(getenv("HOME")) + "/.cache/huggingface/hub")
+    var repo = hub + "/models--" + _slug(model_id)
+    var commit = String(read_text(repo + "/refs/main")).strip()
+    return repo + "/snapshots/" + String(commit)
+
+
 def main() raises:
-    var ckpt = String(read_text("tests/fixtures/forward/meta.txt").split("\n")[1]).strip()
+    # Checkpoint selection: `serve <hf-id-or-path>` (CLI) > $QWEN_SAFETENSORS > meta.txt.
+    # An HF id resolves to its cached snapshot dir (weights assumed downloaded); the
+    # served model id (reported by /v1/models) is that id, else derived from the arch.
+    var ckpt: String
+    var model_id = String("")
+    if len(argv()) > 1:
+        var spec = String(argv()[1])
+        try:
+            ckpt = hf_cache_path(spec)
+            model_id = spec
+            print("model: ", spec, sep="")
+        except:
+            ckpt = spec   # not in the HF cache — use as a literal checkpoint path
+            print("model: ", spec, " (path)", sep="")
+    else:
+        var env = String(getenv("QWEN_SAFETENSORS"))
+        if env.byte_length() > 0:
+            ckpt = env
+        else:
+            ckpt = String(String(read_text("tests/fixtures/forward/meta.txt").split("\n")[1]).strip())
+
     print("loading tokenizer + weights…")
     var tok = load_tokenizer("tests/fixtures/tokenizer/")
     var tmpl = load_chat_template(TEMPLATE)
     var ctx = DeviceContext()
-    var w = load_weights(ctx, String(ckpt))
+    var w = load_weights(ctx, ckpt)
+    if model_id.byte_length() == 0:   # default id from detected arch
+        model_id = String(MODEL_3B) if w.arch == 1 else String(MODEL_05B)
     # One persistent KV cache for the process, sized to the detected arch.
     var sess = new_session(ctx, MAX_SEQ, w.nlayers, w.nkv)
-    print("  arch: ", "Qwen2.5-3B" if w.arch == 1 else "Qwen2.5-0.5B",
-          " (hidden=", w.hidden, ", layers=", w.nlayers, ", heads=", w.hq, "/", w.hkv,
-          ", head_dim=", w.head_dim, ")", sep="")
+    print("  serving ", model_id, "  (hidden=", w.hidden, ", layers=", w.nlayers,
+          ", heads=", w.hq, "/", w.hkv, ", head_dim=", w.head_dim, ")", sep="")
 
-    var state = ServerState(ctx^, w^, tok^, tmpl^, sess^)
+    var state = ServerState(ctx^, w^, tok^, tmpl^, sess^, model_id^)
     var sp = alloc[ServerState](1)
     sp.init_pointee_move(state^)
     var api = Api(sp)
