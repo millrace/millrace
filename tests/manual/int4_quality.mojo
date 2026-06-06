@@ -142,8 +142,7 @@ def eval_scheme(ctx: DeviceContext, ckpt: String, label: String, bits: Int, grou
         _ = fakequant_rows(ctx, w.kw[l].bf16, w.nkv, w.hidden, bits, group)
         _ = fakequant_rows(ctx, w.vw[l].bf16, w.nkv, w.hidden, bits, group)
         _ = fakequant_rows(ctx, w.ow[l].bf16, w.hidden, w.hidden, bits, group)
-        _ = fakequant_rows(ctx, w.gate[l].bf16, w.inter, w.hidden, bits, group)
-        _ = fakequant_rows(ctx, w.up[l].bf16, w.inter, w.hidden, bits, group)
+        _ = fakequant_rows(ctx, w.gate_up[l].bf16, 2 * w.inter, w.hidden, bits, group)
 
     var nsteps = len(ref_tokens)
     var s2 = new_session(ctx, len(ids) + MAX_NEW + 2, w.nlayers, w.nkv)

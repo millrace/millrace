@@ -23,6 +23,7 @@ from kernels import (
     silu_mul_kernel, attn_cached_kernel, flash_attn_kernel, FLASH_PW,
     copy_kernel, rope_k_kernel, rope_q_kernel,
     matmul_q4_kernel, matmul_tiled_q4_kernel, matmul_simd_q4_kernel, Q4_GROUP, bf16_widen,
+    matmul_resid_kernel, matmul_q4_resid_kernel, silu_mul_cat_kernel,
 )
 
 # Above this context length (keys = q_offset + Tq) the f32 KV working set spills
@@ -359,6 +360,51 @@ def load_proj(ctx: DeviceContext, paths: List[String], entries: List[TensorEntry
     return qmat_bf16(ctx, load_one_bf16(ctx, paths[idx], entries[idx].begin, entries[idx].end))
 
 
+def fuse_pair(ctx: DeviceContext, var a: QMat, var b: QMat,
+              Na: Int, Nb: Int, K: Int, q4: Bool) raises -> QMat:
+    """Concatenate two same-K projection weights along the output dim N (a's rows
+    then b's) into one QMat, so a single GEMV computes both (e.g. gate|up, q|k|v).
+    Host-side copy at load — a/b are already the right representation."""
+    if q4:
+        var wa = Na * K // 8
+        var wb = Nb * K // 8
+        var sa = Na * (K // Q4_GROUP)
+        var sb = Nb * (K // Q4_GROUP)
+        var pc = ctx.enqueue_create_buffer[DType.uint32](wa + wb)
+        var sc = ctx.enqueue_create_buffer[DType.float32](sa + sb)
+        with pc.map_to_host() as d:
+            with a.packed.map_to_host() as ah:
+                memcpy(dest=d.unsafe_ptr().bitcast[UInt8](), src=ah.unsafe_ptr().bitcast[UInt8](), count=wa * 4)
+            with b.packed.map_to_host() as bh:
+                memcpy(dest=(d.unsafe_ptr() + wa).bitcast[UInt8](), src=bh.unsafe_ptr().bitcast[UInt8](), count=wb * 4)
+        with sc.map_to_host() as d:
+            with a.scales.map_to_host() as ah:
+                memcpy(dest=d.unsafe_ptr().bitcast[UInt8](), src=ah.unsafe_ptr().bitcast[UInt8](), count=sa * 4)
+            with b.scales.map_to_host() as bh:
+                memcpy(dest=(d.unsafe_ptr() + sa).bitcast[UInt8](), src=bh.unsafe_ptr().bitcast[UInt8](), count=sb * 4)
+        return QMat(ctx.enqueue_create_buffer[DType.uint16](1), pc^, sc^, True)
+    var na = Na * K
+    var nb = Nb * K
+    var bc = ctx.enqueue_create_buffer[DType.uint16](na + nb)
+    with bc.map_to_host() as d:
+        with a.bf16.map_to_host() as ah:
+            memcpy(dest=d.unsafe_ptr().bitcast[UInt8](), src=ah.unsafe_ptr().bitcast[UInt8](), count=na * 2)
+        with b.bf16.map_to_host() as bh:
+            memcpy(dest=(d.unsafe_ptr() + na).bitcast[UInt8](), src=bh.unsafe_ptr().bitcast[UInt8](), count=nb * 2)
+    return QMat(bc^, ctx.enqueue_create_buffer[DType.uint32](1), ctx.enqueue_create_buffer[DType.float32](1), False)
+
+
+def concat_bias(ctx: DeviceContext, var a: DevBuf, var b: DevBuf, na: Int, nb: Int) raises -> DevBuf:
+    """Concatenate two f32 bias vectors (for the fused QKV bias)."""
+    var c = ctx.enqueue_create_buffer[DType.float32](na + nb)
+    with c.map_to_host() as d:
+        with a.map_to_host() as ah:
+            memcpy(dest=d.unsafe_ptr().bitcast[UInt8](), src=ah.unsafe_ptr().bitcast[UInt8](), count=na * 4)
+        with b.map_to_host() as bh:
+            memcpy(dest=(d.unsafe_ptr() + na).bitcast[UInt8](), src=bh.unsafe_ptr().bitcast[UInt8](), count=nb * 4)
+    return c^
+
+
 def _str_bytes(s: String) -> List[UInt8]:
     var out = List[UInt8]()
     var b = s.as_bytes()
@@ -461,8 +507,7 @@ struct Weights(Movable):
     var vb: List[DevBuf]
     var ow: List[QMat]
     var ln2: List[DevBuf]
-    var gate: List[QMat]
-    var up: List[QMat]
+    var gate_up: List[QMat]   # gate_proj and up_proj concatenated along N (one GEMV)
     var down: List[QMat]
     # Architecture dims, auto-detected from the checkpoint (see load_weights).
     # `arch` selects the comptime head-kernel instantiation: 0 = 0.5B, 1 = 3B.
@@ -534,8 +579,7 @@ def load_weights(ctx: DeviceContext, path: String, q4: Bool = False) raises -> W
     var vb = List[DevBuf]()
     var ow = List[QMat]()
     var ln2 = List[DevBuf]()
-    var gate = List[QMat]()
-    var up = List[QMat]()
+    var gate_up = List[QMat]()
     var down = List[QMat]()
     for l in range(nlayers):
         var p = "model.layers." + String(l) + "."
@@ -548,10 +592,11 @@ def load_weights(ctx: DeviceContext, path: String, q4: Bool = False) raises -> W
         vb.append(load_named(ctx, paths, entries, name2idx, p + "self_attn.v_proj.bias"))
         ow.append(load_proj(ctx, paths, entries, name2idx, p + "self_attn.o_proj.weight", hidden, q4))
         ln2.append(load_named(ctx, paths, entries, name2idx, p + "post_attention_layernorm.weight"))
-        gate.append(load_proj(ctx, paths, entries, name2idx, p + "mlp.gate_proj.weight", hidden, q4))
-        up.append(load_proj(ctx, paths, entries, name2idx, p + "mlp.up_proj.weight", hidden, q4))
+        var gp = load_proj(ctx, paths, entries, name2idx, p + "mlp.gate_proj.weight", hidden, q4)
+        var upj = load_proj(ctx, paths, entries, name2idx, p + "mlp.up_proj.weight", hidden, q4)
+        gate_up.append(fuse_pair(ctx, gp^, upj^, inter, inter, hidden, q4))
         down.append(load_proj(ctx, paths, entries, name2idx, p + "mlp.down_proj.weight", inter, q4))
-    return Weights(embed^, final_norm^, ln1^, qw^, qb^, kw^, kb^, vw^, vb^, ow^, ln2^, gate^, up^, down^,
+    return Weights(embed^, final_norm^, ln1^, qw^, qb^, kw^, kb^, vw^, vb^, ow^, ln2^, gate_up^, down^,
                    arch, nlayers, hidden, inter, nkv, hq, hkv, head_dim, VOCAB, False, q4)
 
 
@@ -630,6 +675,35 @@ def mm_w(ctx: DeviceContext, mut x: DevBuf, mut w: QMat, mut b: DevBuf,
         ctx.enqueue_function[kt](xt, pt, st, bt, yt, M, K, N, NG, use_bias,
             grid_dim=ceildiv(ceildiv(N, CN) * ceildiv(M, TM) * WARP_SIZE, BLOCK), block_dim=BLOCK)
     return y^
+
+def mm_w_add(ctx: DeviceContext, mut x: DevBuf, mut w: QMat, mut b: DevBuf, mut resid: DevBuf,
+             M: Int, K: Int, N: Int, use_bias: Int, simd_ok: Bool = False) raises -> DevBuf:
+    """Y = x·Wᵀ(+bias) + resid. At decode (M=1) the residual add is fused into the
+    proj GEMV epilogue (one launch instead of GEMV+add); prefill (M>1) falls back
+    to mm_w + add (the simd GEMM has no residual variant), so prefill is unchanged."""
+    if M != 1:
+        var y0 = mm_w(ctx, x, w, b, M, K, N, use_bias, simd_ok)
+        return add(ctx, resid, y0, M * N)
+    var y = ctx.enqueue_create_buffer[DType.float32](M * N)
+    var lay = row_major(M * N)
+    var bt = TileTensor(b, row_major(N if use_bias != 0 else 1))
+    if w.q4:
+        var NG = K // Q4_GROUP
+        comptime kq = matmul_q4_resid_kernel[type_of(lay)]
+        ctx.enqueue_function[kq](
+            TileTensor(x, row_major(M * K)), TileTensor(w.packed, row_major(N * K // 8)),
+            TileTensor(w.scales, row_major(N * NG)), bt, TileTensor(resid, lay), TileTensor(y, lay),
+            M, K, N, NG, use_bias, grid_dim=ceildiv(M * N * WARP_SIZE, BLOCK), block_dim=BLOCK,
+        )
+    else:
+        comptime kb = matmul_resid_kernel[type_of(lay)]
+        ctx.enqueue_function[kb](
+            TileTensor(x, row_major(M * K)), TileTensor(w.bf16, row_major(N * K)), bt,
+            TileTensor(resid, lay), TileTensor(y, lay),
+            M, K, N, use_bias, grid_dim=ceildiv(M * N * WARP_SIZE, BLOCK), block_dim=BLOCK,
+        )
+    return y^
+
 
 def probe_simd_gemm(ctx: DeviceContext) raises -> Bool:
     """Runtime capability gate for the simdgroup-matrix GEMM. Runs a tiny
@@ -715,6 +789,17 @@ def silu_mul(ctx: DeviceContext, mut a: DevBuf, mut b: DevBuf, n: Int) raises ->
     ctx.enqueue_function[k](
         TileTensor(a, lay), TileTensor(b, lay), TileTensor(y, lay), n,
         grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK,
+    )
+    return y^
+
+def silu_mul_cat(ctx: DeviceContext, mut gu: DevBuf, T: Int, inter: Int) raises -> DevBuf:
+    """SwiGLU on the fused gate+up GEMV output [T, 2*inter] → [T, inter]."""
+    var y = ctx.enqueue_create_buffer[DType.float32](T * inter)
+    var lay = row_major(T * inter)
+    comptime k = silu_mul_cat_kernel[type_of(lay)]
+    ctx.enqueue_function[k](
+        TileTensor(gu, row_major(T * 2 * inter)), TileTensor(y, lay), T, inter,
+        grid_dim=ceildiv(T * inter, BLOCK), block_dim=BLOCK,
     )
     return y^
 
@@ -832,14 +917,11 @@ def layer_cached(ctx: DeviceContext, mut w: Weights, l: Int, mut h: DevBuf,
     copy_into(ctx, vv, vc, q_offset * nkv, Tq * nkv, cache_len)               # V is not rotated
     var o = attn_cached(ctx, q, kc, vc, Tq, q_offset, cache_len,
                         w.hidden, w.hq, w.hkv, w.head_dim, w.arch)
-    var o2 = mm_w(ctx, o, w.ow[l], dummy, Tq, hd, hd, 0, w.simd_ok)
-    var h2 = add(ctx, h, o2, Tq * hd)
+    var h2 = mm_w_add(ctx, o, w.ow[l], dummy, h, Tq, hd, hd, 0, w.simd_ok)   # o_proj(o) + h
     var ln2 = rmsnorm(ctx, h2, w.ln2[l], Tq, hd)
-    var g = mm_w(ctx, ln2, w.gate[l], dummy, Tq, hd, w.inter, 0, w.simd_ok)
-    var u = mm_w(ctx, ln2, w.up[l], dummy, Tq, hd, w.inter, 0, w.simd_ok)
-    var gu = silu_mul(ctx, g, u, Tq * w.inter)
-    var dn = mm_w(ctx, gu, w.down[l], dummy, Tq, w.inter, hd, 0, w.simd_ok)
-    return add(ctx, h2, dn, Tq * hd)
+    var gu = mm_w(ctx, ln2, w.gate_up[l], dummy, Tq, hd, 2 * w.inter, 0, w.simd_ok)   # [gate|up]
+    var act = silu_mul_cat(ctx, gu, Tq, w.inter)                                       # silu(gate)·up
+    return mm_w_add(ctx, act, w.down[l], dummy, h2, Tq, w.inter, hd, 0, w.simd_ok)     # down(act) + h2
 
 def argmax_last(ctx: DeviceContext, mut w: Weights, mut h: DevBuf, T: Int, mut dummy: DevBuf) raises -> Int:
     """Final RMSNorm + tied LM head; argmax over the last position's logits.

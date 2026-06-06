@@ -408,6 +408,79 @@ def matmul_q4_kernel[
         Y[m * N + n] = rebind[Y.ElementType](total)
 
 
+def matmul_q4_resid_kernel[
+    LT: TensorLayout
+](
+    X: TileTensor[DType.float32, LT, MutAnyOrigin],
+    P: TileTensor[DType.uint32, LT, MutAnyOrigin],
+    S: TileTensor[DType.float32, LT, MutAnyOrigin],
+    B: TileTensor[DType.float32, LT, MutAnyOrigin],
+    R: TileTensor[DType.float32, LT, MutAnyOrigin],   # residual added in the epilogue
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],
+    M: Int, K: Int, N: Int, NG: Int, use_bias: Int,
+):
+    """matmul_q4_kernel with a fused residual add (Y = X·Wᵀ(+bias) + R). Folds the
+    decode residual into the proj GEMV, saving one launch per layer (×2: o & down)."""
+    comptime assert X.flat_rank == 1
+    var out = Int(global_idx.x) // WARP_SIZE
+    var lane = Int(global_idx.x) % WARP_SIZE
+    if out >= M * N:
+        return
+    var m = out // N
+    var n = out % N
+    var words = K // 8
+    var rowword = n * words
+    var xbase = m * K
+    var acc = Float32(0.0)
+    for w in range(lane, words, WARP_SIZE):
+        var packed = rebind[Scalar[DType.uint32]](P[rowword + w])
+        var k0 = w * 8
+        var s = rebind[Scalar[DType.float32]](S[n * NG + (k0 >> Q4_SHIFT)])
+        var nibs = (SIMD[DType.uint32, 8](packed) >> _Q4_SHIFTS) & 0xF
+        var qf = (nibs.cast[DType.int32]() - 8).cast[DType.float32]()
+        var xv = SIMD[DType.float32, 8](0.0)
+        for o in range(8):
+            xv[o] = rebind[Scalar[DType.float32]](X[xbase + k0 + o])
+        acc += (qf * xv).reduce_add() * s
+    var total = warp_sum(acc)
+    if lane == 0:
+        if use_bias != 0:
+            total += rebind[Scalar[DType.float32]](B[n])
+        total += rebind[Scalar[DType.float32]](R[m * N + n])
+        Y[m * N + n] = rebind[Y.ElementType](total)
+
+
+def matmul_resid_kernel[
+    LT: TensorLayout
+](
+    X: TileTensor[DType.float32, LT, MutAnyOrigin],
+    W: TileTensor[DType.uint16, LT, MutAnyOrigin],   # bf16 weights (raw u16 bits)
+    B: TileTensor[DType.float32, LT, MutAnyOrigin],
+    R: TileTensor[DType.float32, LT, MutAnyOrigin],   # residual added in the epilogue
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],
+    M: Int, K: Int, N: Int, use_bias: Int,
+):
+    """matmul_kernel (bf16 decode GEMV) with a fused residual add."""
+    comptime assert X.flat_rank == 1
+    var out = Int(global_idx.x) // WARP_SIZE
+    var lane = Int(global_idx.x) % WARP_SIZE
+    if out >= M * N:
+        return
+    var m = out // N
+    var n = out % N
+    var acc = Float32(0.0)
+    for k in range(lane, K, WARP_SIZE):
+        var xv = rebind[Scalar[DType.float32]](X[m * K + k])
+        var wv = bf16_widen(rebind[Scalar[DType.uint16]](W[n * K + k]))
+        acc += xv * wv
+    var total = warp_sum(acc)
+    if lane == 0:
+        if use_bias != 0:
+            total += rebind[Scalar[DType.float32]](B[n])
+        total += rebind[Scalar[DType.float32]](R[m * N + n])
+        Y[m * N + n] = rebind[Y.ElementType](total)
+
+
 def matmul_tiled_q4_kernel[
     LT: TensorLayout, TM: Int, CN: Int
 ](
@@ -542,6 +615,28 @@ def silu_mul_kernel[
     var a = rebind[Scalar[DType.float32]](A[i])
     var b = rebind[Scalar[DType.float32]](B[i])
     Y[i] = rebind[Y.ElementType]((a / (1.0 + exp(-a))) * b)
+
+
+def silu_mul_cat_kernel[
+    LT: TensorLayout
+](
+    GU: TileTensor[DType.float32, LT, MutAnyOrigin],   # [T, 2*inter]: row = gate(inter) ++ up(inter)
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],    # [T, inter]
+    T: Int,
+    inter: Int,
+):
+    """SwiGLU activation reading the *fused* gate+up GEMV output (one buffer, gate
+    then up per row): Y = silu(gate)·up. Lets gate+up be one GEMV instead of two —
+    the split happens here for free instead of via separate buffers."""
+    comptime assert GU.flat_rank == 1
+    var idx = global_idx.x
+    if idx >= T * inter:
+        return
+    var t = idx // inter
+    var i = idx % inter
+    var g = rebind[Scalar[DType.float32]](GU[t * 2 * inter + i])
+    var u = rebind[Scalar[DType.float32]](GU[t * 2 * inter + i + inter])
+    Y[idx] = rebind[Y.ElementType]((g / (1.0 + exp(-g))) * u)
 
 
 def copy_kernel[
