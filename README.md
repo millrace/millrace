@@ -1,8 +1,45 @@
 # mojo-backend
 
-A native-Mojo, GPU-only re-implementation of Qwen2.5-0.5B-Instruct inference on
-Apple Silicon (Metal). Pure Mojo forward pass, served over an OpenAI-compatible
-HTTP API. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design.
+A from-scratch, **pure-Mojo** GPU inference engine for **Qwen2.5** (0.5B and 3B)
+on Apple Silicon (Metal), served over an OpenAI-compatible HTTP API. Every GPU
+kernel — matmul, attention, RMSNorm, RoPE, SwiGLU, the int4 dequant path — is
+hand-written in Mojo (Apple's `simdgroup_matrix` units reached via AIR
+`external_call`); there are **no C++ / CUDA / Metal-shader GPU dependencies**.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the design.
+
+## How it compares
+
+This is a learning/research engine: one language end to end, no external GPU
+libraries, a small readable codebase. The mature frameworks are faster — that
+gap is the interesting part, and it's documented honestly below.
+
+**Approach**
+
+|                     | **millrace**                          | [MLX](https://github.com/ml-explore/mlx) ([`mlx-lm`](https://github.com/ml-explore/mlx-lm)) | [Ollama](https://github.com/ollama/ollama) ([`llama.cpp`](https://github.com/ggml-org/llama.cpp)) |
+|---------------------|---------------------------------------|------------------------------|-----------------------------|
+| Implementation      | pure Mojo                             | C++/Metal core, Python API   | C/C++, Metal backend        |
+| GPU kernels         | hand-written Mojo (Metal via AIR)     | MLX framework                | llama.cpp Metal shaders     |
+| GPU dependencies    | **none**                              | MLX                          | llama.cpp                   |
+| Weights             | bf16, or group-128 **int4**           | 4-bit affine (grouped)       | GGUF (Q4_K_M, …)            |
+| Models              | Qwen2.5 0.5B / 3B (one build)         | many                         | many (GGUF)                 |
+| API                 | OpenAI-compatible (+ prefix cache)    | OpenAI-compatible            | OpenAI-compatible           |
+
+**Performance** — Qwen2.5-3B, all ~4-bit, Apple M4, each engine measured in
+isolation (`pixi run bench`; two-point method). Lower-is-better for prefill,
+higher-is-better for decode.
+
+| metric (3B, 4-bit)            | **millrace** (int4) | MLX (4-bit) | Ollama (4-bit) |
+|-------------------------------|--------------------:|------------:|---------------:|
+| decode (tok/s)                |               ~18   |        52   |          47    |
+| prefill, ~70-tok prompt (ms)  |              540    |       220   |         165    |
+| prefill, ~1.5K-tok prompt (s) |               22    |       2.8   |         2.9    |
+
+We're ~3× slower on decode and several× on prefill. The decode gap is **per-token
+Metal dispatch overhead** (closed from ~5× to ~3× by the kernel fusions in this
+repo). The prefill gap is a **toolchain ceiling**: MLX hits 3–4 TFLOP/s via
+register-blocked `simdgroup_matrix` (compact 2-floats/thread fragments), which
+isn't reachable from Mojo on the M4 today — our `external_call` path tops out at
+~1.1 TFLOP/s. Details + raw numbers in [`bench/results/`](bench/results/).
 
 ## Prerequisites
 
@@ -31,6 +68,9 @@ It compiles `src/server.mojo`, builds the native TLS helper (`libflare_tls.so`),
 loads the weights onto the GPU, and listens on **http://127.0.0.1:8000**:
 
 ```
+serving Qwen/Qwen2.5-0.5B-Instruct  (hidden=896, layers=24, heads=14/2, head_dim=64)
+  prefill GEMM: simdgroup-matrix (~4.5x)
+  weights: bf16
 millrace serving on http://127.0.0.1:8000  (flare)
   GET  /v1/models
   POST /v1/chat/completions  (stream + non-stream)
@@ -52,24 +92,40 @@ The engine auto-detects the architecture from the checkpoint — **Qwen2.5-0.5B*
 handles both a single `.safetensors` file and a sharded checkpoint
 (`model.safetensors.index.json` + shards).
 
-To run the larger model, download its weights and point the engine at the printed
-snapshot directory:
+To run the larger model, download its weights and point the engine at it (an HF id
+resolves to its cached snapshot directory):
 
 ```sh
-pixi run -e oracle download-model -- Qwen/Qwen2.5-3B-Instruct   # prints <snapshot-dir>
+pixi run -e oracle download-model -- Qwen/Qwen2.5-3B-Instruct   # download to the HF cache
+pixi run serve -- Qwen/Qwen2.5-3B-Instruct                     # serve it
 ```
 
-Then either set the checkpoint for one run via the env var, or persist it in the
-fixture:
+You can also set `QWEN_SAFETENSORS=<snapshot-dir>` for one run, or put the dir on
+line 2 of `tests/fixtures/forward/meta.txt` to make it the default. The 3B needs
+more memory (~6 GB bf16 weights) and decodes slower than the 0.5B.
+
+## int4 quantization
+
+Set `QWEN_Q4=1` to load the projection weights (q/k/v/o/gate/up/down) as
+**group-128 int4** instead of bf16 (the embedding / LM head stays bf16):
 
 ```sh
-QWEN_SAFETENSORS=<snapshot-dir> pixi run chat -- "your prompt"   # one-off (CLI)
-# or: put <snapshot-dir> on line 2 of tests/fixtures/forward/meta.txt, then `pixi run serve`
+QWEN_Q4=1 pixi run serve -- Qwen/Qwen2.5-3B-Instruct
 ```
 
-`serve` logs the detected arch on startup (`arch: Qwen2.5-3B (hidden=2048, …)`).
-The 3B needs more memory (~6 GB weights + ~2.4 GB KV cache at the 32K-token
-default) and decodes slower than the 0.5B.
+On the 3B this gives **~2× faster decode GEMVs and ~4× smaller projection
+weights** at coherent quality (~84% top-1 vs bf16). The startup banner reports
+`weights: group-128 int4 (proj) + bf16 (embed)` and tags the model id `-int4`.
+int4 only holds quality group-wise and is intended for the **3B** — the 0.5B
+degrades noticeably, so keep it bf16. Validate with `pixi run q4-validate` (int4
+vs bf16 agreement) and `pixi run q4-kernels` (kernel correctness + speed).
+
+## Benchmark
+
+`pixi run bench` measures prefill latency, decode tok/s, and cold-vs-warm prefix
+reuse against any running OpenAI-compatible servers (millrace, `mlx_lm.server`,
+Ollama) — see [`bench/README.md`](bench/README.md) for how to start each engine
+and read the numbers, and [`bench/results/`](bench/results/) for a captured run.
 
 ## Connect OpenCode
 
@@ -84,9 +140,9 @@ The task queries the server's `/v1/models`, generates an OpenCode config that
 declares a `millrace` provider (`@ai-sdk/openai-compatible`, pointed at
 `http://127.0.0.1:8000/v1`) listing **exactly the model the server is serving**
 (`opencode_config.py`), and points OpenCode at it via `OPENCODE_CONFIG`. So
-whatever you launched `serve` with — 0.5B or, e.g., `serve -- Qwen/Qwen2.5-3B-Instruct`
-— shows up in OpenCode's picker automatically. (It errors if the server isn't up;
-start `serve` first.)
+whatever you launched `serve` with — 0.5B, `serve -- Qwen/Qwen2.5-3B-Instruct`,
+or that plus `QWEN_Q4=1` — shows up in OpenCode's picker automatically. (It errors
+if the server isn't up; start `serve` first.)
 
 To point an existing OpenCode install at the server by hand, run
 `python opencode_config.py http://127.0.0.1:8000/v1` and merge the `provider`
