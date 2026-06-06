@@ -6,7 +6,15 @@ splitting + ASCII-correct Qwen pretokenization + rank-greedy BPE. Loads the tabl
 `tok-capture` dumps (vocab/merges resolved to ids). Verified by test_tokenizer.mojo.
 
 Scope: ASCII-correct; non-ASCII \\p{L}/\\p{N} pretokenization is deferred.
+
+Two loaders build the same `Tokenizer`:
+  - `load_tokenizer(dir)`         — tok-capture's resolved `.tsv` dumps (dev/tests).
+  - `load_tokenizer_json(path)`   — HuggingFace `tokenizer.json` directly (what the
+                                    native downloader fetches), so a freshly
+                                    downloaded checkpoint serves with no tok-capture.
 """
+
+from json import parse_json
 
 comptime MUL = 200000          # pair key = left*MUL + right (ids < 151936)
 comptime APOS = 39
@@ -214,6 +222,100 @@ def hex_to_bytes(s: String) -> List[UInt8]:
 def _read(path: String) raises -> String:
     with open(path, "r") as f:
         return f.read()
+
+def _byte_decoder() -> Dict[Int, Int]:
+    """GPT-2 byte-level decoder: token-string codepoint -> raw byte (inverse of
+    `bytes_to_unicode`). Printable bytes map to themselves; the rest to 256+n in
+    order. HF `tokenizer.json` vocab keys are encoded with this bijection."""
+    var dec = Dict[Int, Int]()
+    var inbs = List[Bool]()
+    for _ in range(256):
+        inbs.append(False)
+    for v in range(33, 127):        # '!'..'~'
+        inbs[v] = True; dec[v] = v
+    for v in range(161, 173):       # '¡'..'¬'
+        inbs[v] = True; dec[v] = v
+    for v in range(174, 256):       # '®'..'ÿ'
+        inbs[v] = True; dec[v] = v
+    var n = 0
+    for b in range(256):
+        if not inbs[b]:
+            dec[256 + n] = b
+            n += 1
+    return dec^
+
+
+def _decode_token(s: String, dec: Dict[Int, Int]) raises -> List[UInt8]:
+    """Decode one byte-level token string back to its raw bytes."""
+    var out = List[UInt8]()
+    for cp in s.codepoints():
+        var v = Int(cp)
+        if v in dec:
+            out.append(UInt8(dec[v]))
+    return out^
+
+
+def load_tokenizer_json(path: String) raises -> Tokenizer:
+    """Build a `Tokenizer` straight from a HuggingFace `tokenizer.json` (byte-level
+    BPE, `model.type == "BPE"`): decode each vocab token to raw bytes, resolve each
+    `"A B"` merge to an (id,id)->merged-id rule, and take `added_tokens` as the
+    special-token table. Produces the same tables as `load_tokenizer`."""
+    var root = parse_json(_read(path))
+    var model = root.map_get("model").value()
+    var vocab = model.map_get("vocab").value()
+    var merges = model.map_get("merges").value()
+    var added = root.map_get("added_tokens").value()
+    var dec = _byte_decoder()
+
+    var byte_id = List[Int]()
+    for _ in range(256):
+        byte_id.append(-1)
+    var id_to_bytes = Dict[Int, List[UInt8]]()
+    var vocab_map = Dict[String, Int]()       # token string -> id (merge resolution)
+
+    ref vkeys = vocab.c[].keys
+    ref vvals = vocab.c[].vals
+    for k in range(len(vkeys)):
+        var tok = vkeys[k]
+        var id = vvals[k].i
+        vocab_map[tok] = id
+        var raw = _decode_token(tok, dec)
+        if len(raw) == 1:
+            byte_id[Int(raw[0])] = id
+        id_to_bytes[id] = raw^
+
+    var merge_rank = Dict[Int, Int]()
+    var merge_id = Dict[Int, Int]()
+    ref mvals = merges.c[].vals
+    for r in range(len(mvals)):
+        # "A B": neither side contains a literal space (byte 0x20 encodes as 'Ġ'),
+        # so split on the single separator; merged token = A concatenated with B.
+        var parts = String(mvals[r].s).split(" ")
+        if len(parts) != 2:
+            continue
+        var a = String(parts[0])
+        var b = String(parts[1])
+        var merged = a + b
+        if a not in vocab_map or b not in vocab_map or merged not in vocab_map:
+            continue
+        var key = vocab_map[a] * MUL + vocab_map[b]
+        merge_rank[key] = r
+        merge_id[key] = vocab_map[merged]
+
+    var sp_text = List[List[UInt8]]()
+    var sp_id = List[Int]()
+    ref avals = added.c[].vals
+    for a in range(len(avals)):
+        ref obj = avals[a]
+        sp_id.append(obj.map_get("id").value().i)
+        var tb = List[UInt8]()
+        var cb = String(obj.map_get("content").value().s).as_bytes()
+        for i in range(len(cb)):
+            tb.append(cb[i])
+        sp_text.append(tb^)
+
+    return Tokenizer(byte_id^, merge_rank^, merge_id^, id_to_bytes^, sp_text^, sp_id^)
+
 
 def load_tokenizer(dir: String) raises -> Tokenizer:
     var byte_id = List[Int]()

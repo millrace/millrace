@@ -11,6 +11,7 @@ Hardcoded to Qwen2.5-0.5B (ARCHITECTURE.md §2). Verified by the test_*.mojo gat
 """
 
 from std.math import ceildiv, exp
+from std.os.path import isdir
 from std.gpu import WARP_SIZE
 from std.gpu.host import DeviceContext, DeviceBuffer
 from std.memory import memcpy
@@ -487,10 +488,15 @@ def gather_tensors(path: String) raises -> Tuple[List[TensorEntry], List[String]
                 entries.append(se[e].copy())
                 paths.append(sp)
     else:
-        var se = read_header(path)
+        # Single-file checkpoint. `path` may be the file itself or (HF cache /
+        # native downloader) the snapshot directory holding model.safetensors.
+        var file = path
+        if isdir(path):
+            file = path + "/model.safetensors"
+        var se = read_header(file)
         for e in range(len(se)):
             entries.append(se[e].copy())
-            paths.append(path)
+            paths.append(file)
     return (entries^, paths^)
 
 
