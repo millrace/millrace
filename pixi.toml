@@ -126,6 +126,15 @@ flare-tls = { cmd = "clang++ -O2 -std=c++17 -fPIC -DNDEBUG -shared -o $CONDA_PRE
 # The server reports the served model at /v1/models.
 serve = { cmd = "mkdir -p build && mojo build src/server.mojo -I ../minja2/src -I ../flare -o build/server && ./build/server", depends-on = ["flare-tls"] }
 
+# Native-Mojo Qwen weights downloader — no huggingface_hub / no Python HF wheel.
+# Fetches safetensors (single-file for 0.5B, sharded for 3B) + config + tokenizer
+# assets over HTTPS via flare's TLS client into the standard HF cache layout
+# (<hub>/models--<slug>/snapshots/<commit>/ + refs/main), so `serve <id>` resolves
+# it unchanged. Usage:
+#   pixi run download -- Qwen/Qwen2.5-3B-Instruct
+#   pixi run download -- Qwen/Qwen2.5-0.5B-Instruct --revision main
+download = { cmd = "mkdir -p build && mojo build src/download.mojo -I ../flare -o build/download && ./build/download", depends-on = ["flare-tls"] }
+
 # Launch opencode pointed at the running service. Start `pixi run serve` (in another
 # terminal) first. opencode_config.py queries the server's /v1/models and writes a
 # matching opencode config (so the picker shows exactly what's served — whatever
