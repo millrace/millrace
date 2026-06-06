@@ -28,6 +28,7 @@ from std.memory import alloc
 from std.time import perf_counter_ns
 from std.sys import argv
 from std.os import getenv
+from std.os.path import exists, isdir
 
 from flare.prelude import *
 from flare.http import Handler, SseChannel, SseEvent, sse_response
@@ -37,7 +38,7 @@ from model import (
     Session, new_session, sess_prefill_suffix, sess_step,
     argmax_f, process_logits, sample,
 )
-from tokenizer import Tokenizer, load_tokenizer
+from tokenizer import Tokenizer, load_tokenizer, load_tokenizer_json
 from chat import load_chat_template, render_value, json_escape_str
 from toolcall import parse_tool_calls, ToolCall
 from blockcache import BlockCache
@@ -651,6 +652,23 @@ def read_text(path: String) raises -> String:
         return f.read()
 
 
+def _dirname(path: String) -> String:
+    """Directory component of `path` (everything before the last '/'), or '.'."""
+    var b = path.as_bytes()
+    var cut = -1
+    for i in range(len(b)):
+        if b[i] == 47:           # '/'
+            cut = i
+    if cut < 0:
+        return String(".")
+    if cut == 0:
+        return String("/")
+    var out = List[UInt8]()
+    for i in range(cut):
+        out.append(b[i])
+    return String(StringSlice(unsafe_from_utf8=Span(out)))
+
+
 def _slug(model_id: String) -> String:
     """HF repo id -> cache dir suffix: 'Qwen/Qwen2.5-3B-Instruct' -> 'Qwen--Qwen2.5-3B-Instruct'."""
     var b = model_id.as_bytes()
@@ -700,7 +718,18 @@ def main() raises:
     # cost that is coherent on the 3B but degrades the 0.5B (see model.QMat).
     var q4 = String(getenv("QWEN_Q4")) == "1"
     print("loading tokenizer + weights…")
-    var tok = load_tokenizer("tests/fixtures/tokenizer/")
+    # Prefer the checkpoint's own HuggingFace tokenizer.json (what the native
+    # downloader fetches) so a freshly downloaded model serves with no tok-capture;
+    # fall back to the tok-capture .tsv fixtures (dev/tests). ckpt is the snapshot
+    # dir (sharded/HF cache) or a single .safetensors path — look beside either.
+    var ckpt_dir = ckpt if isdir(ckpt) else _dirname(ckpt)
+    var tok_json = ckpt_dir + "/tokenizer.json"
+    var tok: Tokenizer
+    if exists(tok_json):
+        print("  tokenizer: ", tok_json, sep="")
+        tok = load_tokenizer_json(tok_json)
+    else:
+        tok = load_tokenizer("tests/fixtures/tokenizer/")
     var tmpl = load_chat_template(TEMPLATE)
     var ctx = DeviceContext()
     var w = load_weights(ctx, ckpt, q4)
