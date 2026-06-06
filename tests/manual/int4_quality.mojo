@@ -132,15 +132,14 @@ def eval_scheme(ctx: DeviceContext, ckpt: String, label: String, bits: Int, grou
     # load bf16 (q4=False) — projection weights are QMat-wrapped bf16; .bf16 gets
     # the underlying buffer this fake-quant gate mutates in place.
     var w = load_weights(ctx, ckpt)
-    var e_q = fakequant_rows(ctx, w.qw[0].bf16, w.hidden, w.hidden, bits, group)
+    var qkvN = w.hidden + 2 * w.nkv
+    var e_q = fakequant_rows(ctx, w.qkv[0].bf16, qkvN, w.hidden, bits, group)
     var e_down = fakequant_rows(ctx, w.down[0].bf16, w.hidden, w.inter, bits, group)
     _ = fakequant_rows(ctx, w.embed, w.vocab, w.hidden, bits, group)
     for l in range(w.nlayers):
         if l != 0:
-            _ = fakequant_rows(ctx, w.qw[l].bf16, w.hidden, w.hidden, bits, group)
+            _ = fakequant_rows(ctx, w.qkv[l].bf16, qkvN, w.hidden, bits, group)
             _ = fakequant_rows(ctx, w.down[l].bf16, w.hidden, w.inter, bits, group)
-        _ = fakequant_rows(ctx, w.kw[l].bf16, w.nkv, w.hidden, bits, group)
-        _ = fakequant_rows(ctx, w.vw[l].bf16, w.nkv, w.hidden, bits, group)
         _ = fakequant_rows(ctx, w.ow[l].bf16, w.hidden, w.hidden, bits, group)
         _ = fakequant_rows(ctx, w.gate_up[l].bf16, 2 * w.inter, w.hidden, bits, group)
 

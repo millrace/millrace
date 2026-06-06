@@ -21,7 +21,7 @@ from kernels import (
     cvt_kernel, embed_kernel, add_kernel, rmsnorm_kernel, matmul_kernel,
     matmul_tiled_kernel, matmul_simd_kernel, SG_BM, SG_BN, SG_TPB, slice_row_kernel,
     silu_mul_kernel, attn_cached_kernel, flash_attn_kernel, FLASH_PW,
-    copy_kernel, rope_k_kernel, rope_q_kernel,
+    copy_kernel, copy_strided_kernel, rope_k_kernel, rope_q_kernel,
     matmul_q4_kernel, matmul_tiled_q4_kernel, matmul_simd_q4_kernel, Q4_GROUP, bf16_widen,
     matmul_resid_kernel, matmul_q4_resid_kernel, silu_mul_cat_kernel,
 )
@@ -499,12 +499,8 @@ struct Weights(Movable):
     var embed: WBuf            # bf16 — used as both embedding table and (tied) lm-head
     var final_norm: DevBuf
     var ln1: List[DevBuf]
-    var qw: List[QMat]
-    var qb: List[DevBuf]
-    var kw: List[QMat]
-    var kb: List[DevBuf]
-    var vw: List[QMat]
-    var vb: List[DevBuf]
+    var qkv: List[QMat]       # q_proj|k_proj|v_proj concatenated along N (one GEMV)
+    var qkv_b: List[DevBuf]   # concatenated q|k|v biases
     var ow: List[QMat]
     var ln2: List[DevBuf]
     var gate_up: List[QMat]   # gate_proj and up_proj concatenated along N (one GEMV)
@@ -571,12 +567,8 @@ def load_weights(ctx: DeviceContext, path: String, q4: Bool = False) raises -> W
     var embed = load_named_bf16(ctx, paths, entries, name2idx, "model.embed_tokens.weight")
     var final_norm = load_named(ctx, paths, entries, name2idx, "model.norm.weight")
     var ln1 = List[DevBuf]()
-    var qw = List[QMat]()
-    var qb = List[DevBuf]()
-    var kw = List[QMat]()
-    var kb = List[DevBuf]()
-    var vw = List[QMat]()
-    var vb = List[DevBuf]()
+    var qkv = List[QMat]()
+    var qkv_b = List[DevBuf]()
     var ow = List[QMat]()
     var ln2 = List[DevBuf]()
     var gate_up = List[QMat]()
@@ -584,19 +576,24 @@ def load_weights(ctx: DeviceContext, path: String, q4: Bool = False) raises -> W
     for l in range(nlayers):
         var p = "model.layers." + String(l) + "."
         ln1.append(load_named(ctx, paths, entries, name2idx, p + "input_layernorm.weight"))
-        qw.append(load_proj(ctx, paths, entries, name2idx, p + "self_attn.q_proj.weight", hidden, q4))
-        qb.append(load_named(ctx, paths, entries, name2idx, p + "self_attn.q_proj.bias"))
-        kw.append(load_proj(ctx, paths, entries, name2idx, p + "self_attn.k_proj.weight", hidden, q4))
-        kb.append(load_named(ctx, paths, entries, name2idx, p + "self_attn.k_proj.bias"))
-        vw.append(load_proj(ctx, paths, entries, name2idx, p + "self_attn.v_proj.weight", hidden, q4))
-        vb.append(load_named(ctx, paths, entries, name2idx, p + "self_attn.v_proj.bias"))
+        # q|k|v concatenated along N → one GEMV (q rows, then k, then v).
+        var qpw = load_proj(ctx, paths, entries, name2idx, p + "self_attn.q_proj.weight", hidden, q4)
+        var kpw = load_proj(ctx, paths, entries, name2idx, p + "self_attn.k_proj.weight", hidden, q4)
+        var vpw = load_proj(ctx, paths, entries, name2idx, p + "self_attn.v_proj.weight", hidden, q4)
+        var qk = fuse_pair(ctx, qpw^, kpw^, hidden, nkv, hidden, q4)
+        qkv.append(fuse_pair(ctx, qk^, vpw^, hidden + nkv, nkv, hidden, q4))
+        var qpb = load_named(ctx, paths, entries, name2idx, p + "self_attn.q_proj.bias")
+        var kpb = load_named(ctx, paths, entries, name2idx, p + "self_attn.k_proj.bias")
+        var vpb = load_named(ctx, paths, entries, name2idx, p + "self_attn.v_proj.bias")
+        var qkb = concat_bias(ctx, qpb^, kpb^, hidden, nkv)
+        qkv_b.append(concat_bias(ctx, qkb^, vpb^, hidden + nkv, nkv))
         ow.append(load_proj(ctx, paths, entries, name2idx, p + "self_attn.o_proj.weight", hidden, q4))
         ln2.append(load_named(ctx, paths, entries, name2idx, p + "post_attention_layernorm.weight"))
         var gp = load_proj(ctx, paths, entries, name2idx, p + "mlp.gate_proj.weight", hidden, q4)
         var upj = load_proj(ctx, paths, entries, name2idx, p + "mlp.up_proj.weight", hidden, q4)
         gate_up.append(fuse_pair(ctx, gp^, upj^, inter, inter, hidden, q4))
         down.append(load_proj(ctx, paths, entries, name2idx, p + "mlp.down_proj.weight", inter, q4))
-    return Weights(embed^, final_norm^, ln1^, qw^, qb^, kw^, kb^, vw^, vb^, ow^, ln2^, gate_up^, down^,
+    return Weights(embed^, final_norm^, ln1^, qkv^, qkv_b^, ow^, ln2^, gate_up^, down^,
                    arch, nlayers, hidden, inter, nkv, hq, hkv, head_dim, VOCAB, False, q4)
 
 
@@ -834,40 +831,60 @@ def copy_into(ctx: DeviceContext, mut src: DevBuf, mut dst: DevBuf, dst_offset: 
         grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK,
     )
 
+def copy_strided(ctx: DeviceContext, mut src: DevBuf, mut dst: DevBuf,
+                 T: Int, in_stride: Int, in_off: Int, dst_off: Int, n: Int, dst_len: Int) raises:
+    """Copy a [T, n] slice out of a strided source (V part of a fused [q|k|v]) into
+    dst[dst_off:] — V into its cache rows."""
+    var lay = row_major(T * in_stride)
+    comptime k = copy_strided_kernel[type_of(lay)]
+    ctx.enqueue_function[k](
+        TileTensor(src, lay), TileTensor(dst, row_major(dst_len)), T, in_stride, in_off, dst_off, n,
+        grid_dim=ceildiv(T * n, BLOCK), block_dim=BLOCK,
+    )
+
 def rope_k(ctx: DeviceContext, mut kin: DevBuf, mut kc: DevBuf,
            Tq: Int, q_offset: Int, cache_len: Int,
-           hkv: Int = HKV, head_dim: Int = 64, arch: Int = 0) raises:
+           hkv: Int = HKV, head_dim: Int = 64, arch: Int = 0,
+           in_stride: Int = -1, in_off: Int = 0) raises:
     """Apply RoPE to projected K and store it (rotated) at its cache rows —
     replaces the plain K copy so attention reads pre-rotated K (§11 #12).
-    arch selects the comptime head-dim instantiation (0 = 0.5B, 1 = 3B)."""
-    var lay = row_major(Tq * hkv * head_dim)
+    arch selects the comptime head-dim instantiation (0 = 0.5B, 1 = 3B). `kin`
+    may be a strided K-slice of a fused [q|k|v] buffer (in_stride/in_off);
+    in_stride<0 defaults to the contiguous nkv stride."""
+    var nkv = hkv * head_dim
+    var strd = in_stride if in_stride >= 0 else nkv
+    var lay = row_major(Tq * strd)
     if arch == 1:
         comptime k = rope_k_kernel[type_of(lay), 2, 128]
         ctx.enqueue_function[k](
-            TileTensor(kin, lay), TileTensor(kc, row_major(cache_len)), Tq, q_offset,
+            TileTensor(kin, lay), TileTensor(kc, row_major(cache_len)), Tq, q_offset, strd, in_off,
             grid_dim=ceildiv(Tq * hkv, BLOCK), block_dim=BLOCK,
         )
     else:
         comptime k = rope_k_kernel[type_of(lay), 2, 64]
         ctx.enqueue_function[k](
-            TileTensor(kin, lay), TileTensor(kc, row_major(cache_len)), Tq, q_offset,
+            TileTensor(kin, lay), TileTensor(kc, row_major(cache_len)), Tq, q_offset, strd, in_off,
             grid_dim=ceildiv(Tq * hkv, BLOCK), block_dim=BLOCK,
         )
 
 def attn_cached(ctx: DeviceContext, mut q: DevBuf, mut kc: DevBuf, mut vc: DevBuf,
                 Tq: Int, q_offset: Int, cache_len: Int,
                 hidden: Int = H, hq: Int = HQ, hkv: Int = HKV, head_dim: Int = 64,
-                arch: Int = 0) raises -> DevBuf:
+                arch: Int = 0, q_stride: Int = -1, q_off: Int = 0) raises -> DevBuf:
     # Rotate Q first (rope_q), then attend; K is already rotated in the cache.
+    # `q` may be a strided Q-slice of a fused [q|k|v] buffer (q_stride/q_off);
+    # q_stride<0 means the contiguous hidden stride.
+    var qstr = q_stride if q_stride >= 0 else hidden
     var qr = ctx.enqueue_create_buffer[DType.float32](Tq * hidden)
     var qlay = row_major(Tq * hidden)
+    var qslay = row_major(Tq * qstr)
     if arch == 1:
         comptime kq = rope_q_kernel[type_of(qlay), 16, 128]
-        ctx.enqueue_function[kq](TileTensor(q, qlay), TileTensor(qr, qlay), Tq, q_offset,
+        ctx.enqueue_function[kq](TileTensor(q, qslay), TileTensor(qr, qlay), Tq, q_offset, qstr, q_off,
             grid_dim=ceildiv(Tq * hq, BLOCK), block_dim=BLOCK)
     else:
         comptime kq = rope_q_kernel[type_of(qlay), 14, 64]
-        ctx.enqueue_function[kq](TileTensor(q, qlay), TileTensor(qr, qlay), Tq, q_offset,
+        ctx.enqueue_function[kq](TileTensor(q, qslay), TileTensor(qr, qlay), Tq, q_offset, qstr, q_off,
             grid_dim=ceildiv(Tq * hq, BLOCK), block_dim=BLOCK)
 
     var o = ctx.enqueue_create_buffer[DType.float32](Tq * hidden)
@@ -910,13 +927,13 @@ def layer_cached(ctx: DeviceContext, mut w: Weights, l: Int, mut h: DevBuf,
     var hd = w.hidden
     var nkv = w.nkv
     var ln1 = rmsnorm(ctx, h, w.ln1[l], Tq, hd)
-    var q = mm_w(ctx, ln1, w.qw[l], w.qb[l], Tq, hd, hd, 1, w.simd_ok)
-    var kk = mm_w(ctx, ln1, w.kw[l], w.kb[l], Tq, hd, nkv, 1, w.simd_ok)
-    var vv = mm_w(ctx, ln1, w.vw[l], w.vb[l], Tq, hd, nkv, 1, w.simd_ok)
-    rope_k(ctx, kk, kc, Tq, q_offset, cache_len, w.hkv, w.head_dim, w.arch)   # store K RoPE-rotated
-    copy_into(ctx, vv, vc, q_offset * nkv, Tq * nkv, cache_len)               # V is not rotated
-    var o = attn_cached(ctx, q, kc, vc, Tq, q_offset, cache_len,
-                        w.hidden, w.hq, w.hkv, w.head_dim, w.arch)
+    # one GEMV for q|k|v; rope/copy/attn read the q,k,v slices in place (stride W).
+    var W = hd + 2 * nkv
+    var qkv = mm_w(ctx, ln1, w.qkv[l], w.qkv_b[l], Tq, hd, W, 1, w.simd_ok)
+    rope_k(ctx, qkv, kc, Tq, q_offset, cache_len, w.hkv, w.head_dim, w.arch, W, hd)   # K slice [hd:hd+nkv]
+    copy_strided(ctx, qkv, vc, Tq, W, hd + nkv, q_offset * nkv, nkv, cache_len)        # V slice [hd+nkv:]
+    var o = attn_cached(ctx, qkv, kc, vc, Tq, q_offset, cache_len,
+                        w.hidden, w.hq, w.hkv, w.head_dim, w.arch, W, 0)                # Q slice [0:hd]
     var h2 = mm_w_add(ctx, o, w.ow[l], dummy, h, Tq, hd, hd, 0, w.simd_ok)   # o_proj(o) + h
     var ln2 = rmsnorm(ctx, h2, w.ln2[l], Tq, hd)
     var gu = mm_w(ctx, ln2, w.gate_up[l], dummy, Tq, hd, 2 * w.inter, 0, w.simd_ok)   # [gate|up]

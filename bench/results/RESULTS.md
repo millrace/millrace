@@ -53,4 +53,21 @@ streaming so first-token latency reflects prefill, not full generation. int4
 landed the memory + matmul wins; the remaining gap is dispatch overhead, not
 arithmetic.
 
+## Decode fusion progress (3B int4)
+
+Acting on takeaway (1): three decode-only kernel fusions, each bit-identical to
+the unfused path (greedy parity holds), prefill unchanged.
+
+| step                         | decode tok/s | vs baseline |
+|------------------------------|-------------:|------------:|
+| baseline (3B int4)           |        10.5  |       1.00× |
+| + residual-add → GEMV epilogue |      11.8  |       1.12× |
+| + gate+up → one GEMV (fused silu) |   13.6  |       1.30× |
+| + QKV → one GEMV (strided rope/copy) | **~18** |   **~1.8×** |
+
+QKV gave the biggest jump: the separate k/v GEMVs were N=256 (occupancy-starved);
+fusing q|k|v into one N=2560 GEMV recovered occupancy on top of removing
+dispatches. The matched-4-bit 3B decode gap to MLX/Ollama (~50/46 tok/s) is now
+~2.7× (was ~5×). Long-prefill attention (takeaway 2) is still the open weakness.
+
 Raw JSON: `qwen3b_{millrace,mlx,ollama}.json`, `qwen05b.json`.

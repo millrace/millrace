@@ -654,6 +654,28 @@ def copy_kernel[
     dst[dst_offset + i] = rebind[dst.ElementType](src[i])
 
 
+def copy_strided_kernel[
+    LT: TensorLayout
+](
+    src: TileTensor[DType.float32, LT, MutAnyOrigin],   # row = in_stride, slice at in_off
+    dst: TileTensor[DType.float32, LT, MutAnyOrigin],
+    T: Int,
+    in_stride: Int,
+    in_off: Int,
+    dst_off: Int,
+    n: Int,                                             # slice width per row
+):
+    """Copy a [T, n] column-slice out of a strided source (e.g. the V part of a
+    fused [q|k|v] buffer) into dst[dst_off:] contiguously — V into its cache rows."""
+    comptime assert dst.flat_rank == 1
+    var idx = global_idx.x
+    if idx >= T * n:
+        return
+    var t = idx // n
+    var j = idx % n
+    dst[dst_off + t * n + j] = rebind[dst.ElementType](src[t * in_stride + in_off + j])
+
+
 def slice_row_kernel[
     LT: TensorLayout
 ](
@@ -675,15 +697,18 @@ def slice_row_kernel[
 def rope_k_kernel[
     LT: TensorLayout, HKV: Int, HEAD_DIM: Int
 ](
-    Kin: TileTensor[DType.float32, LT, MutAnyOrigin],   # [Tq, HKV, HEAD_DIM] raw K from projection
+    Kin: TileTensor[DType.float32, LT, MutAnyOrigin],   # K source (row = in_stride, K at in_off)
     Kc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM] cache (rotated)
     Tq: Int,
     q_offset: Int,
+    in_stride: Int,    # source row stride (= nkv unfused, = hd+2nkv when reading fused qkv)
+    in_off: Int,       # source column offset of K within the row (0 unfused, hd when fused)
 ):
     """Apply RoPE to freshly-projected K and write it into the cache at its
     absolute-position rows. Doing this once on write (one thread per token×kv-
     head) replaces recomputing K's RoPE for every past key on every decode step
-    inside attention (§11 #12). Same split-half rotation/θ as the Q path."""
+    inside attention (§11 #12). Same split-half rotation/θ as the Q path. Kin may
+    be a strided slice of a fused [q|k|v] buffer (in_stride/in_off)."""
     comptime assert Kin.flat_rank == 1
     comptime HALF = HEAD_DIM // 2
     var nkv = HKV * HEAD_DIM
@@ -693,7 +718,7 @@ def rope_k_kernel[
     var t = idx // HKV
     var kvh = idx % HKV
     var pos = q_offset + t
-    var inbase = t * nkv + kvh * HEAD_DIM
+    var inbase = t * in_stride + in_off + kvh * HEAD_DIM
     var outbase = (q_offset + t) * nkv + kvh * HEAD_DIM   # cache row = absolute position
     for d in range(HALF):
         var freq = exp(-(2.0 * Float32(d) / Float32(HEAD_DIM)) * log(THETA))
@@ -709,29 +734,34 @@ def rope_k_kernel[
 def rope_q_kernel[
     LT: TensorLayout, HQ: Int, HEAD_DIM: Int
 ](
-    Q: TileTensor[DType.float32, LT, MutAnyOrigin],     # [Tq, HQ, HEAD_DIM] raw
-    Qr: TileTensor[DType.float32, LT, MutAnyOrigin],    # [Tq, HQ, HEAD_DIM] rotated out
+    Q: TileTensor[DType.float32, LT, MutAnyOrigin],     # Q source (row = in_stride, Q at in_off)
+    Qr: TileTensor[DType.float32, LT, MutAnyOrigin],    # [Tq, HQ, HEAD_DIM] rotated out (contiguous)
     Tq: Int,
     q_offset: Int,
+    in_stride: Int,    # source row stride (= hd unfused, = hd+2nkv when reading fused qkv)
+    in_off: Int,       # source column offset of Q within the row (0; Q is first in [q|k|v])
 ):
     """Apply RoPE to Q (one thread per query×head) into a rotated buffer, so the
     attention kernel itself does no transcendentals — same as K is rotated on
-    write (§11 #12). Position = absolute query position q_offset+t."""
+    write (§11 #12). Position = absolute query position q_offset+t. Q may be a
+    strided slice of a fused [q|k|v] buffer (in_stride/in_off); Qr is contiguous."""
     comptime assert Q.flat_rank == 1
     comptime HALF = HEAD_DIM // 2
     var idx = Int(global_idx.x)
     if idx >= Tq * HQ:
         return
     var t = idx // HQ
+    var h = idx % HQ
     var pos = q_offset + t
+    var inb = t * in_stride + in_off + h * HEAD_DIM
     var base = idx * HEAD_DIM
     for d in range(HALF):
         var freq = exp(-(2.0 * Float32(d) / Float32(HEAD_DIM)) * log(THETA))
         var ang = Float32(pos) * freq
         var c = cos(ang)
         var s = sin(ang)
-        var x0 = rebind[Scalar[DType.float32]](Q[base + d])
-        var x1 = rebind[Scalar[DType.float32]](Q[base + d + HALF])
+        var x0 = rebind[Scalar[DType.float32]](Q[inb + d])
+        var x1 = rebind[Scalar[DType.float32]](Q[inb + d + HALF])
         Qr[base + d] = rebind[Qr.ElementType](x0 * c - x1 * s)
         Qr[base + d + HALF] = rebind[Qr.ElementType](x1 * c + x0 * s)
 
