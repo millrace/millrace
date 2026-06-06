@@ -63,6 +63,10 @@ comptime TEMPLATE = "assets/qwen2.5-chat-template.jinja"
 comptime MODEL_05B = "Qwen/Qwen2.5-0.5B-Instruct"
 comptime MODEL_3B = "Qwen/Qwen2.5-3B-Instruct"
 comptime PORT = 8000
+# Engine version, reported by GET /v1/version (used by the Millrace menu app to
+# detect a running engine and show its version). Bump on releases. Placeholder
+# scheme for now; wire to a real build/version source later.
+comptime MILLRACE_VERSION = "0.1.0"
 
 # minja2 Value tags (value.mojo)
 comptime VBOOL = 2
@@ -333,6 +337,12 @@ def models_json(model: String) -> String:
         + '","object":"model","created":0,"owned_by":"millrace"}]}'
     )
 
+def version_json(model: String) -> String:
+    return (
+        '{"engine":"millrace","version":"' + MILLRACE_VERSION
+        + '","model":"' + model + '"}'
+    )
+
 def completion_json(model: String, content: String, n_prompt: Int, n_gen: Int, finish: String) -> String:
     return (
         '{"id":"chatcmpl-millrace","object":"chat.completion","created":0,"model":"'
@@ -497,6 +507,8 @@ struct Api(Handler, Copyable, Movable):
             return ok("millrace ok")
         if path == "/v1/models":
             return ok_json(models_json(self.st[].model_id))
+        if path == "/v1/version":
+            return ok_json(version_json(self.st[].model_id))
         if is_post and path == "/v1/chat/completions":
             return self.handle_chat(req)
         if is_post and path == "/v1/responses":
@@ -724,8 +736,9 @@ def main() raises:
     sp.init_pointee_move(state^)
     var api = Api(sp)
 
-    print("millrace serving on http://127.0.0.1:", PORT, "  (flare)", sep="")
+    print("millrace serving on http://127.0.0.1:", PORT, "  (flare)  v", MILLRACE_VERSION, sep="")
     print("  GET  /v1/models")
+    print("  GET  /v1/version")
     print("  POST /v1/chat/completions  (stream + non-stream)")
     print("  POST /v1/responses         (stream + non-stream)")
     var srv = HttpServer.bind(SocketAddr.localhost(UInt16(PORT)))
