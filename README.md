@@ -1,5 +1,7 @@
 # mojo-backend
 
+> Part of [**millrace**](https://millrace.me) — local-first LLM inference on Apple Silicon.
+
 A from-scratch, **pure-Mojo** GPU inference engine for **Qwen2.5** (0.5B and 3B)
 on Apple Silicon (Metal), served over an OpenAI-compatible HTTP API. Every GPU
 kernel — matmul, attention, RMSNorm, RoPE, SwiGLU, the int4 dequant path — is
