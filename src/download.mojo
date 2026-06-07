@@ -33,7 +33,7 @@ lower-level TlsStream and is left for later if larger models are added.
 
 from std.sys import argv
 from std.os import getenv, makedirs
-from std.os.path import exists
+from std.os.path import exists, getsize
 from flare.http import HttpClient, Response
 
 
@@ -87,13 +87,39 @@ def shard_names(index_text: String) -> List[String]:
 
 
 def write_bytes(path: String, data: List[UInt8]) raises:
+    # macOS write(2) rejects a single call larger than INT_MAX (~2 GiB) with
+    # EINVAL, and the 3B shards exceed that — so write in bounded chunks.
+    var n = len(data)
+    var sp = Span(data)
     with open(path, "w") as f:
-        f.write_bytes(Span(data))
+        var off = 0
+        comptime CHUNK = 256 * 1024 * 1024
+        while off < n:
+            var end = off + CHUNK
+            if end > n:
+                end = n
+            f.write_bytes(sp[off:end])
+            off = end
 
 
 def fetch(mut client: HttpClient, url: String) raises -> Response:
     var resp = client.get(url)
     return resp^
+
+
+def remote_size(mut client: HttpClient, url: String) -> Int:
+    """Content-Length of the resolved file (HEAD, following redirects), or -1 if
+    unknown — used to tell a complete download from a truncated/empty one."""
+    try:
+        var r = client.head(url)
+        if r.status != 200:
+            return -1
+        var cl = r.headers.get("content-length")
+        if cl.byte_length() == 0:
+            return -1
+        return atol(cl)
+    except:
+        return -1
 
 
 def download_one(
@@ -108,10 +134,16 @@ def download_one(
     Returns the X-Repo-Commit header (so the caller can pin the snapshot), or ""
     if an optional file was absent (404)."""
     var dest = snap_dir + "/" + file
+    var url = resolve_url(repo, rev, file)
+    # Resume: skip only if the local file is byte-complete vs the remote. A
+    # truncated or 0-byte file (e.g. an earlier interrupted/failed write) must be
+    # re-fetched, not skipped.
     if exists(dest):
-        print("  have   ", file)
-        return ""
-    var resp = fetch(client, resolve_url(repo, rev, file))
+        var want = remote_size(client, url)
+        if want > 0 and Int(getsize(dest)) == want:
+            print("  have   ", file)
+            return ""
+    var resp = fetch(client, url)
     if resp.status == 404 and optional:
         print("  skip   ", file, "(not in repo)")
         return ""
