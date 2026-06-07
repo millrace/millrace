@@ -3,7 +3,7 @@
 A from-scratch, **pure-Mojo** GPU inference engine for **Qwen2.5** (0.5B and 3B)
 on Apple Silicon (Metal), served over an OpenAI-compatible HTTP API. Every GPU
 kernel — matmul, attention, RMSNorm, RoPE, SwiGLU, the int4 dequant path — is
-hand-written in Mojo (Apple's `simdgroup_matrix` units reached via AIR
+custom-written in Mojo (Apple's `simdgroup_matrix` units reached via AIR
 `external_call`); there are **no C++ / CUDA / Metal-shader GPU dependencies**.
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design.
 
@@ -18,7 +18,7 @@ gap is the interesting part, and it's documented honestly below.
 |                     | **millrace**                          | [MLX](https://github.com/ml-explore/mlx) ([`mlx-lm`](https://github.com/ml-explore/mlx-lm)) | [Ollama](https://github.com/ollama/ollama) ([`llama.cpp`](https://github.com/ggml-org/llama.cpp)) |
 |---------------------|---------------------------------------|------------------------------|-----------------------------|
 | Implementation      | pure Mojo                             | C++/Metal core, Python API   | C/C++, Metal backend        |
-| GPU kernels         | hand-written Mojo (Metal via AIR)     | MLX framework                | llama.cpp Metal shaders     |
+| GPU kernels         | custom-written Mojo (Metal via AIR)   | MLX framework                | llama.cpp Metal shaders     |
 | GPU dependencies    | **none**                              | MLX                          | llama.cpp                   |
 | Weights             | bf16, or group-128 **int4**           | 4-bit affine (grouped)       | GGUF (Q4_K_M, …)            |
 | Models              | Qwen2.5 0.5B / 3B (one build)         | many                         | many (GGUF)                 |
