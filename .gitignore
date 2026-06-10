@@ -31,3 +31,6 @@ tests/fixtures/generate/
 
 # Sampling fixtures; regenerate with `pixi run sample-capture`.
 tests/fixtures/sample/
+
+# Embedding oracle fixtures; regenerate with `pixi run -e oracle embed-capture`.
+tests/fixtures/embed/

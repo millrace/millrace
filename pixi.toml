@@ -161,6 +161,9 @@ kernels-capture = "python tests/manual/kernels_spike/capture.py"
 loader-capture = "python tests/manual/loader_spike/capture.py"
 # Dumps vocab/merges resolved to ids + expected encodings for the prompt corpus.
 tok-capture = "python tests/manual/tokenizer_spike/capture.py"
+# Captures the Qwen3-Embedding-0.6B oracle: exact arch config + reference
+# last-token-pooled, L2-normalized embeddings the Mojo embedder must reproduce.
+embed-capture = "python tests/manual/embed_spike/capture.py"
 # Dumps ids + per-layer hidden states + last-position logits from HF (CPU/f32).
 forward-capture = "python tests/manual/forward_spike/capture.py"
 # Dumps prompt ids + HF greedy continuation token ids.
