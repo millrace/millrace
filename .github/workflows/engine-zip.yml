@@ -18,14 +18,14 @@ jobs:
     runs-on: macos-14
     steps:
       # Lay the three repos out as siblings, matching the dev layout the pixi
-      # `flare-tls` task and the package script assume (../minja2, ../flare).
+      # `flare-tls` task and the package script assume (../jinja2.mojo, ../flare).
       - uses: actions/checkout@v6
         with:
-          path: mojo-backend
+          path: inference-server
       - uses: actions/checkout@v6
         with:
-          repository: millrace/minja2
-          path: minja2
+          repository: millrace/jinja2.mojo
+          path: jinja2.mojo
       - uses: actions/checkout@v6
         with:
           repository: millrace/flare
@@ -33,14 +33,14 @@ jobs:
 
       - uses: prefix-dev/setup-pixi@v0.9.6
         with:
-          manifest-path: mojo-backend/pixi.toml
+          manifest-path: inference-server/pixi.toml
 
       - name: Build libflare_tls.so
-        working-directory: mojo-backend
+        working-directory: inference-server
         run: pixi run flare-tls
 
       - name: Package runner.zip
-        working-directory: mojo-backend
+        working-directory: inference-server
         run: pixi run bash scripts/package_engine.sh "$GITHUB_WORKSPACE/runner.zip"
 
       - uses: actions/upload-artifact@v7
