@@ -26,8 +26,10 @@ def run(ctx: DeviceContext, dir: String) raises -> Bool:
     var cache_len = T * HKV * HEAD_DIM
     # K is now RoPE-rotated on write into the cache (§11 #12); rotate then attend.
     var kc = ctx.enqueue_create_buffer[DType.float32](cache_len)
-    rope_k(ctx, kraw, kc, T, 0, cache_len)
-    var o = attn_cached(ctx, qd, kc, vd, T, 0, cache_len)
+    # arch 0 (Qwen2.5-0.5B) has no QK-norm; pass a size-1 dummy weight (ignored).
+    var dummy = ctx.enqueue_create_buffer[DType.float32](1)
+    rope_k(ctx, kraw, kc, dummy, T, 0, cache_len)
+    var o = attn_cached(ctx, qd, kc, vd, dummy, T, 0, cache_len)
     ctx.synchronize()
     var m = max_abs(o, read_f32(dir + "/expected.bin"))
     var ok = m < TOL

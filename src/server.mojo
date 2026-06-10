@@ -36,7 +36,7 @@ from flare.http import Handler, SseChannel, SseEvent, sse_response
 from model import (
     Weights, load_weights, probe_simd_gemm, EOS1, EOS2,
     Session, new_session, sess_prefill_suffix, sess_step,
-    argmax_f, process_logits, sample,
+    argmax_f, process_logits, sample, sess_embed,
 )
 from tokenizer import Tokenizer, load_tokenizer, load_tokenizer_json
 from chat import load_chat_template, render_value, json_escape_str
@@ -74,6 +74,7 @@ comptime VBOOL = 2
 comptime VINT = 3
 comptime VFLOAT = 4
 comptime VSTR = 5
+comptime VLIST = 6
 # sampling defaults (generation_config.json) when temperature > 0
 comptime DEF_TOPK = 20
 comptime DEF_TOPP = Float32(0.8)
@@ -344,6 +345,26 @@ def version_json(model: String) -> String:
         + '","model":"' + model + '"}'
     )
 
+def embedding_item_json(index: Int, vec: List[Float32]) -> String:
+    """One OpenAI embedding object: the float vector as a JSON array. f32 stringifies
+    at full precision (~8 sig figs), enough to reconstruct the unit vector."""
+    var arr = String("[")
+    for i in range(len(vec)):
+        if i > 0:
+            arr += ","
+        arr += String(vec[i])
+    arr += "]"
+    return ('{"object":"embedding","index":' + String(index)
+            + ',"embedding":' + arr + "}")
+
+def embeddings_json(model: String, data: String, n_tok: Int) -> String:
+    """OpenAI /v1/embeddings response envelope around the pre-built `data` array."""
+    return (
+        '{"object":"list","data":' + data + ',"model":"' + model
+        + '","usage":{"prompt_tokens":' + String(n_tok)
+        + ',"total_tokens":' + String(n_tok) + "}}"
+    )
+
 def completion_json(model: String, content: String, n_prompt: Int, n_gen: Int, finish: String) -> String:
     return (
         '{"id":"chatcmpl-millrace","object":"chat.completion","created":0,"model":"'
@@ -514,7 +535,57 @@ struct Api(Handler, Copyable, Movable):
             return self.handle_chat(req)
         if is_post and path == "/v1/responses":
             return self.handle_responses(req)
+        if is_post and path == "/v1/embeddings":
+            return self.handle_embeddings(req)
         return not_found("no route for " + req.method + " " + path)
+
+    def handle_embeddings(self, req: Request) raises -> Response:
+        """OpenAI /v1/embeddings. Only the Qwen3-Embedding arch (arch==2) embeds;
+        for a chat model we 400. `input` is a string or an array of strings. Each
+        is tokenized (NO EOS append — last-token pooling uses the raw final token)
+        and run through sess_embed (last-token-pooled + L2-normalized vector)."""
+        ref s = self.st[]
+        if s.w.arch != 2:
+            return bad_request('{"error":{"message":"the served model is not an '
+                + 'embedding model (load Qwen3-Embedding-0.6B to use /v1/embeddings)"}}')
+        var bv = parse_json(req.text())
+        var inp = bv.map_get("input")
+        if not inp:
+            return bad_request('{"error":{"message":"embeddings: missing \\"input\\""}}')
+        # Collect the input strings (single string or array of strings).
+        var texts = List[String]()
+        var iv = inp.value()
+        if iv.tag == VSTR:
+            texts.append(iv.s.copy())
+        elif iv.tag == VLIST:
+            for j in range(len(iv.c[].vals)):
+                var e = iv.c[].vals[j]
+                if e.tag == VSTR:
+                    texts.append(e.s.copy())
+                else:
+                    return bad_request('{"error":{"message":"embeddings: '
+                        + '\\"input\\" array must contain strings"}}')
+        else:
+            return bad_request('{"error":{"message":"embeddings: \\"input\\" '
+                + 'must be a string or an array of strings"}}')
+        if len(texts) == 0:
+            return bad_request('{"error":{"message":"embeddings: empty input"}}')
+
+        var n_tok = 0
+        var data = String("[")
+        for i in range(len(texts)):
+            var ids = s.tok.encode(to_bytes(texts[i]))   # no EOS append
+            if len(ids) == 0:
+                return bad_request('{"error":{"message":"embeddings: input '
+                    + String(i) + ' tokenized to zero tokens"}}')
+            n_tok += len(ids)
+            var vec = sess_embed(s.ctx, s.w, ids)
+            if i > 0:
+                data += ","
+            data += embedding_item_json(i, vec)
+        data += "]"
+        print("  embeddings: ", len(texts), " input(s), ", n_tok, " tokens", sep="")
+        return ok_json(embeddings_json(s.model_id, data, n_tok))
 
     def handle_chat(self, req: Request) raises -> Response:
         ref s = self.st[]
@@ -839,5 +910,6 @@ def main() raises:
     print("  GET  /v1/version")
     print("  POST /v1/chat/completions  (stream + non-stream)")
     print("  POST /v1/responses         (stream + non-stream)")
+    print("  POST /v1/embeddings        (Qwen3-Embedding only)")
     var srv = HttpServer.bind(SocketAddr.localhost(UInt16(cfg.port)))
     srv.serve(api^)

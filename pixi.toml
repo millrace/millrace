@@ -87,6 +87,12 @@ test-blockcache = "mojo run src/test_blockcache.mojo"
 # weights + Metal GPU. Usage: pixi run simd-parity [-- "prompt"].
 simd-parity = { cmd = "mojo build tests/manual/simd_parity.mojo -I src -I ../jinja2.mojo/src -o build/simd_parity && ./build/simd_parity" }
 
+# Manual GPU gate: Qwen3-Embedding-0.6B numerical conformance. Runs sess_embed for
+# the ids in tests/fixtures/embed/ids.txt and asserts cosine >= 0.999 vs the torch
+# reference (embed-capture). Needs the Qwen3-Embedding-0.6B checkpoint ($QWEN_SAFETENSORS
+# or the HF-cache fallback) + Metal GPU. Usage: pixi run embed-check.
+embed-check = { cmd = "mkdir -p build && mojo build tests/manual/embed_check.mojo -I src -o build/embed_check && ./build/embed_check" }
+
 # int8 quantization eval (shelved investigation, kept for repro). int8-quality:
 # per-channel int8 RTN fake-quant vs bf16 — recon error, teacher-forced top-1 +
 # KL drift, greedy divergence. Needs weights + GPU. int8-gemv-bench: int8 (naive

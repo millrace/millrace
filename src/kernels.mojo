@@ -694,11 +694,29 @@ def slice_row_kernel[
     dst[i] = rebind[dst.ElementType](src[src_offset + i])
 
 
+@always_inline
+def _head_rrms[
+    LT: TensorLayout
+](
+    src: TileTensor[DType.float32, LT, MutAnyOrigin],
+    base: Int,
+    HEAD_DIM: Int,
+) -> Float32:
+    """Reciprocal RMS over one head's HEAD_DIM contiguous elements at `base`:
+    1 / sqrt(mean(x²) + EPS). Qwen3 QK-RMSNorm normalizes per head before RoPE."""
+    var ss = Float32(0.0)
+    for d in range(HEAD_DIM):
+        var v = rebind[Scalar[DType.float32]](src[base + d])
+        ss += v * v
+    return 1.0 / sqrt(ss / Float32(HEAD_DIM) + EPS)
+
+
 def rope_k_kernel[
-    LT: TensorLayout, HKV: Int, HEAD_DIM: Int
+    LT: TensorLayout, HKV: Int, HEAD_DIM: Int, QK_NORM: Bool = False
 ](
     Kin: TileTensor[DType.float32, LT, MutAnyOrigin],   # K source (row = in_stride, K at in_off)
     Kc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM] cache (rotated)
+    Kn: TileTensor[DType.float32, LT, MutAnyOrigin],    # [HEAD_DIM] k_norm weight (dummy if !QK_NORM)
     Tq: Int,
     q_offset: Int,
     in_stride: Int,    # source row stride (= nkv unfused, = hd+2nkv when reading fused qkv)
@@ -708,7 +726,10 @@ def rope_k_kernel[
     absolute-position rows. Doing this once on write (one thread per token×kv-
     head) replaces recomputing K's RoPE for every past key on every decode step
     inside attention (§11 #12). Same split-half rotation/θ as the Q path. Kin may
-    be a strided slice of a fused [q|k|v] buffer (in_stride/in_off)."""
+    be a strided slice of a fused [q|k|v] buffer (in_stride/in_off).
+
+    When QK_NORM (Qwen3), each head is first RMS-normalized over HEAD_DIM and
+    scaled by Kn[d] before the rotation (HF: q_norm/k_norm applied pre-RoPE)."""
     comptime assert Kin.flat_rank == 1
     comptime HALF = HEAD_DIM // 2
     var nkv = HKV * HEAD_DIM
@@ -720,6 +741,9 @@ def rope_k_kernel[
     var pos = q_offset + t
     var inbase = t * in_stride + in_off + kvh * HEAD_DIM
     var outbase = (q_offset + t) * nkv + kvh * HEAD_DIM   # cache row = absolute position
+    var rrms = Float32(1.0)
+    comptime if QK_NORM:
+        rrms = _head_rrms(Kin, inbase, HEAD_DIM)
     for d in range(HALF):
         var freq = exp(-(2.0 * Float32(d) / Float32(HEAD_DIM)) * log(THETA))
         var ang = Float32(pos) * freq
@@ -727,15 +751,21 @@ def rope_k_kernel[
         var s = sin(ang)
         var x0 = rebind[Scalar[DType.float32]](Kin[inbase + d])
         var x1 = rebind[Scalar[DType.float32]](Kin[inbase + d + HALF])
+        comptime if QK_NORM:
+            var g0 = rebind[Scalar[DType.float32]](Kn[d])
+            var g1 = rebind[Scalar[DType.float32]](Kn[d + HALF])
+            x0 = x0 * rrms * g0
+            x1 = x1 * rrms * g1
         Kc[outbase + d] = rebind[Kc.ElementType](x0 * c - x1 * s)
         Kc[outbase + d + HALF] = rebind[Kc.ElementType](x1 * c + x0 * s)
 
 
 def rope_q_kernel[
-    LT: TensorLayout, HQ: Int, HEAD_DIM: Int
+    LT: TensorLayout, HQ: Int, HEAD_DIM: Int, QK_NORM: Bool = False
 ](
     Q: TileTensor[DType.float32, LT, MutAnyOrigin],     # Q source (row = in_stride, Q at in_off)
     Qr: TileTensor[DType.float32, LT, MutAnyOrigin],    # [Tq, HQ, HEAD_DIM] rotated out (contiguous)
+    Qn: TileTensor[DType.float32, LT, MutAnyOrigin],    # [HEAD_DIM] q_norm weight (dummy if !QK_NORM)
     Tq: Int,
     q_offset: Int,
     in_stride: Int,    # source row stride (= hd unfused, = hd+2nkv when reading fused qkv)
@@ -744,7 +774,10 @@ def rope_q_kernel[
     """Apply RoPE to Q (one thread per query×head) into a rotated buffer, so the
     attention kernel itself does no transcendentals — same as K is rotated on
     write (§11 #12). Position = absolute query position q_offset+t. Q may be a
-    strided slice of a fused [q|k|v] buffer (in_stride/in_off); Qr is contiguous."""
+    strided slice of a fused [q|k|v] buffer (in_stride/in_off); Qr is contiguous.
+
+    When QK_NORM (Qwen3), each head is first RMS-normalized over HEAD_DIM and
+    scaled by Qn[d] before the rotation (HF: q_norm applied pre-RoPE)."""
     comptime assert Q.flat_rank == 1
     comptime HALF = HEAD_DIM // 2
     var idx = Int(global_idx.x)
@@ -755,6 +788,9 @@ def rope_q_kernel[
     var pos = q_offset + t
     var inb = t * in_stride + in_off + h * HEAD_DIM
     var base = idx * HEAD_DIM
+    var rrms = Float32(1.0)
+    comptime if QK_NORM:
+        rrms = _head_rrms(Q, inb, HEAD_DIM)
     for d in range(HALF):
         var freq = exp(-(2.0 * Float32(d) / Float32(HEAD_DIM)) * log(THETA))
         var ang = Float32(pos) * freq
@@ -762,6 +798,11 @@ def rope_q_kernel[
         var s = sin(ang)
         var x0 = rebind[Scalar[DType.float32]](Q[inb + d])
         var x1 = rebind[Scalar[DType.float32]](Q[inb + d + HALF])
+        comptime if QK_NORM:
+            var g0 = rebind[Scalar[DType.float32]](Qn[d])
+            var g1 = rebind[Scalar[DType.float32]](Qn[d + HALF])
+            x0 = x0 * rrms * g0
+            x1 = x1 * rrms * g1
         Qr[base + d] = rebind[Qr.ElementType](x0 * c - x1 * s)
         Qr[base + d + HALF] = rebind[Qr.ElementType](x1 * c + x0 * s)
 
