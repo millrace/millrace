@@ -67,10 +67,25 @@ kernel-level numbers are direct and reproducible:
   (`.scratch/mma16_test.mojo`).
 
 We still trail MLX on prefill (their ~3–4 TFLOP/s GEMM + a fully fused, larger
-threadgroup-tiled pipeline); the remaining gap is no longer ABI-bound but a
-tiling/occupancy gap (this kernel loads fragments straight from global memory
-with no threadgroup staging) plus the unchanged O(M²) attention. Details + raw
-numbers in [`bench/results/`](bench/results/).
+threadgroup-tiled pipeline). The kernel loads fragments **straight from global
+memory with no threadgroup staging** — and that is deliberate, not a missing
+optimization. We prototyped a tiled shared-memory pipeline (`.scratch/simd4_gemm.mojo`:
+cooperatively stage 64×BK tiles of X and W into threadgroup memory, `barrier()`,
+read the 8×8 fragments from shared) across BK∈{16,32}, both A/B-major shared
+layouts, and all 3B prefill shapes (M∈{64,512,1500}). It was **correct**
+(max|Δ| ≤ 1.5e-4 vs CPU incl. K%BK tails and M/N boundaries) but **consistently
+~20–35 % slower** than the global-load kernel (best staged ≈1.6–1.75 TFLOP/s vs
+2.1). On the M4's unified memory + large system-level cache, the X/W reuse is
+already served by the hardware cache, so explicit staging only adds barrier
+latency, a cooperative-load phase, and shared-read traffic without cutting the
+global traffic that matters. Modular's own reference 8×8 Apple kernel (its
+`BLOCK_K` parameter is **unused** in the K-loop) likewise loads from global — so
+staging is not the lever here. The remaining MLX gap is occupancy/scheduling
+(MLX's larger fused pipeline) plus the unchanged O(M²) attention, which a
+per-layer prefill profile (3B int4, M4) attributes as: at P=512 the projection
+GEMMs are **~80 %** of prefill (attention ~16 %), and at P=1536 GEMM is **~60 %**
+(attention ~38 %, growing O(T²)). Details + raw numbers in
+[`bench/results/`](bench/results/).
 
 ## Prerequisites
 
