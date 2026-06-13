@@ -12,7 +12,7 @@ head_dim 64, RoPE θ=1e6, RMSNorm ε=1e-6.
 from std.math import sqrt, exp, log, cos, sin, ceildiv
 from std.gpu import global_idx, thread_idx, block_idx, barrier, WARP_SIZE
 from std.gpu.memory import AddressSpace
-from std.gpu.primitives.warp import sum as warp_sum, max as warp_max
+from std.gpu.primitives.warp import sum as warp_sum, max as warp_max, shuffle_xor
 from std.memory import stack_allocation
 from std.collections import InlineArray
 from std.sys import llvm_intrinsic        # compact AIR simdgroup-matrix MMA (see matmul_simd_kernel)
@@ -280,6 +280,28 @@ def _mma8x8(
     ](a, b, c)
 
 
+@always_inline
+def _frag_row_max(v: Float32) -> Float32:
+    """Reduce a value ACROSS one fragment row (used by tensor-core attention's
+    online softmax). In `_frag8_layout` the 4 lanes sharing a row differ only in
+    lane bits 0 and 3, so two butterfly shuffles broadcast the row's max to all."""
+    var r = v
+    var a = shuffle_xor(r, UInt32(1))
+    r = a if a > r else r
+    var b = shuffle_xor(r, UInt32(8))
+    r = b if b > r else r
+    return r
+
+
+@always_inline
+def _frag_row_sum(v: Float32) -> Float32:
+    """Reduce a value across one fragment row (companion to `_frag_row_max`)."""
+    var r = v
+    r += shuffle_xor(r, UInt32(1))
+    r += shuffle_xor(r, UInt32(8))
+    return r
+
+
 def matmul_simd_kernel[
     LT: TensorLayout
 ](
@@ -319,38 +341,38 @@ def matmul_simd_kernel[
         # A (X) is f32 [M,K] row-major: lane's 2 frag elems are consecutive K
         # cols kk+fcol, kk+fcol+1. K bound only on the partial tail block.
         var afrag = InlineArray[SIMD[DType.float32, _FRAG8], _SG_NTM](uninitialized=True)
-        for mi in range(_SG_NTM):
+        comptime for mi in range(_SG_NTM):
             var grow = row_base + mi * _MMA8 + frow
             if (interior or grow < M) and not ktail:
                 afrag[mi] = (xp + grow * K + kk + fcol).load[width=_FRAG8]()
             else:
                 var af = SIMD[DType.float32, _FRAG8](0)
                 if interior or grow < M:
-                    for s in range(_FRAG8):
+                    comptime for s in range(_FRAG8):
                         if kk + fcol + s < K:
                             af[s] = xp[grow * K + kk + fcol + s]
                 afrag[mi] = af
         # B (W) is bf16 [N,K] (transpose_b): B[k_idx, j] = bf16(W[j, k_idx]).
         # frag slots differ in j (col); row is kk+frow (K bound only on the tail).
         var bfrag = InlineArray[SIMD[DType.float32, _FRAG8], _SG_NTN](uninitialized=True)
-        for ni in range(_SG_NTN):
+        comptime for ni in range(_SG_NTN):
             var bf = SIMD[DType.float32, _FRAG8](0)
             if not ktail or kk + frow < K:
-                for s in range(_FRAG8):
+                comptime for s in range(_FRAG8):
                     var gj = col_base + ni * _MMA8 + fcol + s
                     if interior or gj < N:
                         bf[s] = bf16_widen(wp[gj * K + kk + frow])
             bfrag[ni] = bf
-        for mi in range(_SG_NTM):
-            for ni in range(_SG_NTN):
+        comptime for mi in range(_SG_NTM):
+            comptime for ni in range(_SG_NTN):
                 acc[mi * _SG_NTN + ni] = _mma8x8(
                     afrag[mi], bfrag[ni], acc[mi * _SG_NTN + ni]
                 )
 
-    for mi in range(_SG_NTM):
-        for ni in range(_SG_NTN):
+    comptime for mi in range(_SG_NTM):
+        comptime for ni in range(_SG_NTN):
             var frag = acc[mi * _SG_NTN + ni]
-            for s in range(_FRAG8):
+            comptime for s in range(_FRAG8):
                 var grow = row_base + mi * _MMA8 + frow
                 var gcol = col_base + ni * _MMA8 + fcol + s
                 if grow < M and gcol < N:
@@ -372,6 +394,8 @@ def matmul_simd_kernel[
 comptime Q4_GROUP = 128
 comptime Q4_SHIFT = 7                  # log2(Q4_GROUP)
 comptime _Q4_SHIFTS = SIMD[DType.uint32, 8](0, 4, 8, 12, 16, 20, 24, 28)
+comptime _Q4_BK = 32                   # K-chunk dequantized into shared per barrier
+                                       # in matmul_simd_q4_kernel (mult of 8; 64×32 fp32 = 8 KB)
 
 
 @always_inline
@@ -428,6 +452,89 @@ def matmul_q4_kernel[
             xv[o] = rebind[Scalar[DType.float32]](X[xbase + k0 + o])
         acc += (qf * xv).reduce_add() * s
     var total = warp_sum(acc)
+    if lane == 0:
+        if use_bias != 0:
+            total += rebind[Scalar[DType.float32]](B[n])
+        Y[m * N + n] = rebind[Y.ElementType](total)
+
+
+def matmul_norm_kernel[
+    LT: TensorLayout
+](
+    X: TileTensor[DType.float32, LT, MutAnyOrigin],
+    LNW: TileTensor[DType.float32, LT, MutAnyOrigin],   # RMSNorm weight [K]
+    W: TileTensor[DType.uint16, LT, MutAnyOrigin],      # bf16 weights (raw u16 bits)
+    B: TileTensor[DType.float32, LT, MutAnyOrigin],
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],
+    M: Int, K: Int, N: Int, use_bias: Int,
+):
+    """bf16 decode GEMV with RMSNorm fused into the input row: each warp already
+    streams the full input row x[k] for its dot, so it accumulates Σx[k]² in the
+    same K-loop — `out = (Σ x[k]·lnw[k]·W[n,k]) / rms`, rms = √(mean(x²)+EPS) — and
+    the separate RMSNorm launch (and its x round-trip) disappears (decode only)."""
+    comptime assert X.flat_rank == 1
+    var out = Int(global_idx.x) // WARP_SIZE
+    var lane = Int(global_idx.x) % WARP_SIZE
+    if out >= M * N:
+        return
+    var m = out // N
+    var n = out % N
+    var acc = Float32(0.0)
+    var ss = Float32(0.0)
+    for k in range(lane, K, WARP_SIZE):
+        var xv = rebind[Scalar[DType.float32]](X[m * K + k])
+        ss += xv * xv
+        var lw = rebind[Scalar[DType.float32]](LNW[k])
+        var wv = bf16_widen(rebind[Scalar[DType.uint16]](W[n * K + k]))
+        acc += (xv * lw) * wv
+    var rms = sqrt(warp_sum(ss) / Float32(K) + EPS)
+    var total = warp_sum(acc) / rms
+    if lane == 0:
+        if use_bias != 0:
+            total += rebind[Scalar[DType.float32]](B[n])
+        Y[m * N + n] = rebind[Y.ElementType](total)
+
+
+def matmul_q4_norm_kernel[
+    LT: TensorLayout
+](
+    X: TileTensor[DType.float32, LT, MutAnyOrigin],
+    LNW: TileTensor[DType.float32, LT, MutAnyOrigin],   # RMSNorm weight [K]
+    P: TileTensor[DType.uint32, LT, MutAnyOrigin],
+    S: TileTensor[DType.float32, LT, MutAnyOrigin],
+    B: TileTensor[DType.float32, LT, MutAnyOrigin],
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],
+    M: Int, K: Int, N: Int, NG: Int, use_bias: Int,
+):
+    """int4 decode GEMV with RMSNorm fused in (see matmul_norm_kernel). Folds the
+    pre-projection RMSNorm into the qkv / gate_up GEMVs — −2 launches per layer."""
+    comptime assert X.flat_rank == 1
+    var out = Int(global_idx.x) // WARP_SIZE
+    var lane = Int(global_idx.x) % WARP_SIZE
+    if out >= M * N:
+        return
+    var m = out // N
+    var n = out % N
+    var words = K // 8
+    var rowword = n * words
+    var xbase = m * K
+    var acc = Float32(0.0)
+    var ss = Float32(0.0)
+    for w in range(lane, words, WARP_SIZE):
+        var packed = rebind[Scalar[DType.uint32]](P[rowword + w])
+        var k0 = w * 8
+        var s = rebind[Scalar[DType.float32]](S[n * NG + (k0 >> Q4_SHIFT)])
+        var nibs = (SIMD[DType.uint32, 8](packed) >> _Q4_SHIFTS) & 0xF
+        var qf = (nibs.cast[DType.int32]() - 8).cast[DType.float32]()
+        var xv = SIMD[DType.float32, 8](0.0)
+        var lw = SIMD[DType.float32, 8](0.0)
+        for o in range(8):
+            xv[o] = rebind[Scalar[DType.float32]](X[xbase + k0 + o])
+            lw[o] = rebind[Scalar[DType.float32]](LNW[k0 + o])
+        ss += (xv * xv).reduce_add()
+        acc += (qf * (xv * lw)).reduce_add() * s
+    var rms = sqrt(warp_sum(ss) / Float32(K) + EPS)
+    var total = warp_sum(acc) / rms
     if lane == 0:
         if use_bias != 0:
             total += rebind[Scalar[DType.float32]](B[n])
@@ -507,6 +614,80 @@ def matmul_resid_kernel[
         Y[m * N + n] = rebind[Y.ElementType](total)
 
 
+def matmul_q4_silu_resid_kernel[
+    LT: TensorLayout
+](
+    GU: TileTensor[DType.float32, LT, MutAnyOrigin],   # [M, 2*K]: row = gate(K) ++ up(K)
+    P: TileTensor[DType.uint32, LT, MutAnyOrigin],
+    S: TileTensor[DType.float32, LT, MutAnyOrigin],
+    R: TileTensor[DType.float32, LT, MutAnyOrigin],
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],
+    M: Int, K: Int, N: Int, NG: Int,
+):
+    """int4 down-proj decode GEMV with SwiGLU fused on the input: reads the fused
+    gate|up GEMV output and forms act[k]=silu(gate[k])·up[k] on load, so the
+    separate silu_mul_cat launch (and its `act` buffer) disappears. K = inter, so
+    up[k] is GU[k+K]. Residual fused in the epilogue (down's resid)."""
+    comptime assert GU.flat_rank == 1
+    var out = Int(global_idx.x) // WARP_SIZE
+    var lane = Int(global_idx.x) % WARP_SIZE
+    if out >= M * N:
+        return
+    var m = out // N
+    var n = out % N
+    var words = K // 8
+    var rowword = n * words
+    var gbase = m * 2 * K
+    var acc = Float32(0.0)
+    for w in range(lane, words, WARP_SIZE):
+        var packed = rebind[Scalar[DType.uint32]](P[rowword + w])
+        var k0 = w * 8
+        var s = rebind[Scalar[DType.float32]](S[n * NG + (k0 >> Q4_SHIFT)])
+        var nibs = (SIMD[DType.uint32, 8](packed) >> _Q4_SHIFTS) & 0xF
+        var qf = (nibs.cast[DType.int32]() - 8).cast[DType.float32]()
+        var xv = SIMD[DType.float32, 8](0.0)
+        for o in range(8):
+            var g = rebind[Scalar[DType.float32]](GU[gbase + k0 + o])
+            var u = rebind[Scalar[DType.float32]](GU[gbase + k0 + o + K])
+            xv[o] = (g / (1.0 + exp(-g))) * u
+        acc += (qf * xv).reduce_add() * s
+    var total = warp_sum(acc)
+    if lane == 0:
+        total += rebind[Scalar[DType.float32]](R[m * N + n])
+        Y[m * N + n] = rebind[Y.ElementType](total)
+
+
+def matmul_silu_resid_kernel[
+    LT: TensorLayout
+](
+    GU: TileTensor[DType.float32, LT, MutAnyOrigin],   # [M, 2*K]: gate ++ up
+    W: TileTensor[DType.uint16, LT, MutAnyOrigin],     # bf16 weights
+    R: TileTensor[DType.float32, LT, MutAnyOrigin],
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],
+    M: Int, K: Int, N: Int,
+):
+    """bf16 down-proj decode GEMV with SwiGLU fused on the input (see q4 variant)."""
+    comptime assert GU.flat_rank == 1
+    var out = Int(global_idx.x) // WARP_SIZE
+    var lane = Int(global_idx.x) % WARP_SIZE
+    if out >= M * N:
+        return
+    var m = out // N
+    var n = out % N
+    var gbase = m * 2 * K
+    var acc = Float32(0.0)
+    for k in range(lane, K, WARP_SIZE):
+        var g = rebind[Scalar[DType.float32]](GU[gbase + k])
+        var u = rebind[Scalar[DType.float32]](GU[gbase + k + K])
+        var act = (g / (1.0 + exp(-g))) * u
+        var wv = bf16_widen(rebind[Scalar[DType.uint16]](W[n * K + k]))
+        acc += act * wv
+    var total = warp_sum(acc)
+    if lane == 0:
+        total += rebind[Scalar[DType.float32]](R[m * N + n])
+        Y[m * N + n] = rebind[Y.ElementType](total)
+
+
 def matmul_tiled_q4_kernel[
     LT: TensorLayout, TM: Int, CN: Int
 ](
@@ -561,62 +742,101 @@ def matmul_simd_q4_kernel[
     Y: TileTensor[DType.float32, LT, MutAnyOrigin],
     M: Int, K: Int, N: Int, NG: Int, use_bias: Int,
 ):
-    """int4 prefill GEMM: matmul_simd_kernel with int4-dequant W reads. The
-    compact 8×8 simdgroup-matrix math is byte-for-byte the bf16 kernel's — only
-    the B fragment is filled from q4_deq instead of bf16_widen — so the ~2×
-    register-blocked speedup carries."""
+    """int4 prefill GEMM on the compact 8×8 simdgroup-matrix units, with the
+    weight tile **dequantized into threadgroup shared memory once per block**
+    (MLX's `QuantizedBlockLoader` pattern). The earlier version filled each B
+    fragment from `q4_deq` *every* K-step from global — unpacking+scaling in the
+    hot loop and re-dequantizing shared columns once per simdgroup — and ran at
+    ~1.0 TFLOP/s (~2.1× slower than the bf16 GEMM). Here all 128 threads
+    cooperatively unpack a 64×`_Q4_BK` tile of W (one packed u32 = 8 nibbles per
+    thread, group scale folded once), `barrier()`, then every simdgroup runs its
+    MMAs reading fp32 from shared. ~2.2× the global-load kernel — **on par with
+    bf16 (~2.1 TFLOP/s)**, since the packed int4 moved into shared is 4× smaller
+    and the dequant is amortized. Only W is staged; X stays on the cache-served
+    global path (bf16 X-staging measured negative on M4). Matmul math/output are
+    byte-for-byte the bf16 kernel's."""
     comptime assert X.flat_rank == 1
-    var lane = Int(thread_idx.x) % 32
+    var tid = Int(thread_idx.x)
+    var lane = tid % 32
     var fl = _frag8_layout(lane)
     var frow = fl[0]
     var fcol = fl[1]
-    var sg = Int(thread_idx.x) // 32
-    var row_base = Int(block_idx.y) * SG_BM + (sg // 2) * _SG_SGM
-    var col_base = Int(block_idx.x) * SG_BN + (sg % 2) * _SG_SGN
-    var interior = (row_base + _SG_SGM <= M) and (col_base + _SG_SGN <= N)
+    var sg = tid // 32
+    var blk_row = Int(block_idx.y) * SG_BM
+    var blk_col = Int(block_idx.x) * SG_BN
+    var row_base = blk_row + (sg // 2) * _SG_SGM
+    var col_base = blk_col + (sg % 2) * _SG_SGN
+
+    var Bs = stack_allocation[
+        _Q4_BK * SG_BN, Float32, address_space = AddressSpace.SHARED
+    ]()
 
     var xp = X.ptr
+    var pp = P.ptr
+    var sp = S.ptr
     var acc = InlineArray[SIMD[DType.float32, _FRAG8], _SG_NTM * _SG_NTN](
         fill=SIMD[DType.float32, _FRAG8](0)
     )
 
-    var nkt = ceildiv(K, _MMA8)
-    for ks in range(nkt):
-        var kk = ks * _MMA8
-        var ktail = (kk + _MMA8 > K)
-        var afrag = InlineArray[SIMD[DType.float32, _FRAG8], _SG_NTM](uninitialized=True)
-        for mi in range(_SG_NTM):
-            var grow = row_base + mi * _MMA8 + frow
-            if (interior or grow < M) and not ktail:
-                afrag[mi] = (xp + grow * K + kk + fcol).load[width=_FRAG8]()
+    var kc = 0
+    while kc < K:
+        # Cooperative WORD-vectorized dequant of W[blk_col..+64, kc..+_Q4_BK] → Bs
+        # (row-major [k_local][j_local]). Each thread takes one packed u32 = 8
+        # nibbles of an 8-aligned k-run of one N column, unpacks all 8 + folds the
+        # group scale once (8|128 so an 8-run never straddles a group).
+        comptime _NW = SG_BN * (_Q4_BK // 8)
+        for w in range(tid, _NW, SG_TPB):
+            var j_local = w % SG_BN
+            var krun = (w // SG_BN) * 8
+            var gj = blk_col + j_local
+            var gk0 = kc + krun
+            if gj < N and gk0 < K:
+                var word = pp[(gj * K + gk0) >> 3]
+                var scale = sp[gj * NG + (gk0 >> Q4_SHIFT)]
+                var nibs = (SIMD[DType.uint32, 8](word) >> _Q4_SHIFTS) & 0xF
+                var qf = (nibs.cast[DType.int32]() - 8).cast[DType.float32]() * scale
+                comptime for t in range(8):
+                    Bs[(krun + t) * SG_BN + j_local] = qf[t] if gk0 + t < K else 0.0
             else:
-                var af = SIMD[DType.float32, _FRAG8](0)
-                if interior or grow < M:
-                    for s in range(_FRAG8):
-                        if kk + fcol + s < K:
-                            af[s] = xp[grow * K + kk + fcol + s]
-                afrag[mi] = af
-        # B (W) is int4 [N,K] (transpose_b): B[k_idx, j] = deq(W[j, k_idx]).
-        var bfrag = InlineArray[SIMD[DType.float32, _FRAG8], _SG_NTN](uninitialized=True)
-        for ni in range(_SG_NTN):
-            var bf = SIMD[DType.float32, _FRAG8](0)
-            var krow = kk + frow
-            if not ktail or krow < K:
-                for s in range(_FRAG8):
-                    var gj = col_base + ni * _MMA8 + fcol + s
-                    if interior or gj < N:
-                        bf[s] = q4_deq(P, S, gj, krow, K, NG)
-            bfrag[ni] = bf
-        for mi in range(_SG_NTM):
-            for ni in range(_SG_NTN):
-                acc[mi * _SG_NTN + ni] = _mma8x8(
-                    afrag[mi], bfrag[ni], acc[mi * _SG_NTN + ni]
-                )
+                comptime for t in range(8):
+                    Bs[(krun + t) * SG_BN + j_local] = 0.0
+        barrier()
 
-    for mi in range(_SG_NTM):
-        for ni in range(_SG_NTN):
+        comptime _KS = _Q4_BK // _MMA8
+        for kss in range(_KS):
+            var kk = kc + kss * _MMA8
+            if kk >= K:
+                continue
+            var ktail = (kk + _MMA8 > K)
+            var afrag = InlineArray[SIMD[DType.float32, _FRAG8], _SG_NTM](uninitialized=True)
+            comptime for mi in range(_SG_NTM):
+                var grow = row_base + mi * _MMA8 + frow
+                if grow < M and not ktail:
+                    afrag[mi] = (xp + grow * K + kk + fcol).load[width=_FRAG8]()
+                else:
+                    var af = SIMD[DType.float32, _FRAG8](0)
+                    if grow < M:
+                        comptime for s in range(_FRAG8):
+                            if kk + fcol + s < K:
+                                af[s] = xp[grow * K + kk + fcol + s]
+                    afrag[mi] = af
+            # B (W) read from shared: Bs[(kk_local+frow)][(sg col half) + ni*8 + fcol]
+            var bfrag = InlineArray[SIMD[DType.float32, _FRAG8], _SG_NTN](uninitialized=True)
+            comptime for ni in range(_SG_NTN):
+                var brow = (kss * _MMA8 + frow) * SG_BN + (sg % 2) * _SG_SGN + ni * _MMA8 + fcol
+                bfrag[ni] = (Bs + brow).load[width=_FRAG8]()
+            comptime for mi in range(_SG_NTM):
+                comptime for ni in range(_SG_NTN):
+                    acc[mi * _SG_NTN + ni] = _mma8x8(
+                        afrag[mi], bfrag[ni], acc[mi * _SG_NTN + ni]
+                    )
+        barrier()
+        kc += _Q4_BK
+
+    comptime for mi in range(_SG_NTM):
+        comptime for ni in range(_SG_NTN):
             var frag = acc[mi * _SG_NTN + ni]
-            for s in range(_FRAG8):
+            comptime for s in range(_FRAG8):
                 var grow = row_base + mi * _MMA8 + frow
                 var gcol = col_base + ni * _MMA8 + fcol + s
                 if grow < M and gcol < N:
@@ -786,6 +1006,57 @@ def rope_k_kernel[
         Kc[outbase + d + HALF] = rebind[Kc.ElementType](x1 * c + x0 * s)
 
 
+def rope_kv_kernel[
+    LT: TensorLayout, HKV: Int, HEAD_DIM: Int, QK_NORM: Bool = False
+](
+    In: TileTensor[DType.float32, LT, MutAnyOrigin],    # fused [q|k|v] buffer (row = in_stride)
+    Kc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM] K cache (rotated)
+    Vc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM] V cache (copied)
+    Kn: TileTensor[DType.float32, LT, MutAnyOrigin],    # [HEAD_DIM] k_norm weight (dummy if !QK_NORM)
+    Tq: Int,
+    q_offset: Int,
+    in_stride: Int,    # source row stride (= hd + 2*nkv when reading fused qkv)
+    k_off: Int,        # column offset of K within the row
+    v_off: Int,        # column offset of V within the row
+):
+    """rope_k_kernel + the V cache-copy in ONE launch: one thread per token×kv-head
+    rotates that head's K into the cache AND copies its V into the cache. Both
+    already walked the same (token, kv-head) grid and wrote a per-head cache slice,
+    so merging halves the K/V write dispatches (rope_k + copy_strided → 1)."""
+    comptime assert In.flat_rank == 1
+    comptime HALF = HEAD_DIM // 2
+    var nkv = HKV * HEAD_DIM
+    var idx = Int(global_idx.x)
+    if idx >= Tq * HKV:
+        return
+    var t = idx // HKV
+    var kvh = idx % HKV
+    var pos = q_offset + t
+    var kin = t * in_stride + k_off + kvh * HEAD_DIM
+    var vin = t * in_stride + v_off + kvh * HEAD_DIM
+    var outbase = pos * nkv + kvh * HEAD_DIM           # cache row = absolute position
+    var rrms = Float32(1.0)
+    comptime if QK_NORM:
+        rrms = _head_rrms(In, kin, HEAD_DIM)
+    for d in range(HALF):
+        var freq = exp(-(2.0 * Float32(d) / Float32(HEAD_DIM)) * log(THETA))
+        var ang = Float32(pos) * freq
+        var c = cos(ang)
+        var s = sin(ang)
+        var x0 = rebind[Scalar[DType.float32]](In[kin + d])
+        var x1 = rebind[Scalar[DType.float32]](In[kin + d + HALF])
+        comptime if QK_NORM:
+            var g0 = rebind[Scalar[DType.float32]](Kn[d])
+            var g1 = rebind[Scalar[DType.float32]](Kn[d + HALF])
+            x0 = x0 * rrms * g0
+            x1 = x1 * rrms * g1
+        Kc[outbase + d] = rebind[Kc.ElementType](x0 * c - x1 * s)
+        Kc[outbase + d + HALF] = rebind[Kc.ElementType](x1 * c + x0 * s)
+    # V is copied unrotated (HEAD_DIM contiguous values for this head).
+    for d in range(HEAD_DIM):
+        Vc[outbase + d] = rebind[Vc.ElementType](In[vin + d])
+
+
 def rope_q_kernel[
     LT: TensorLayout, HQ: Int, HEAD_DIM: Int, QK_NORM: Bool = False
 ](
@@ -898,6 +1169,92 @@ def attn_cached_kernel[
         m = m_new
 
     # Cross-lane merge: global max, rescale each lane's partials, then sum.
+    var m_g = warp_max(m)
+    var f = exp(m - m_g)
+    var l_g = warp_sum(l * f)
+    var obase = (t * HQ + h) * HEAD_DIM
+    for c in range(NVEC):
+        for e in range(VEC):
+            var a = warp_sum(accv[c][e] * f)
+            if lane == 0:
+                O[obase + c * VEC + e] = rebind[O.ElementType](a / l_g)
+
+
+def attn_cached_rope_kernel[
+    LT: TensorLayout, HQ: Int, HKV: Int, HEAD_DIM: Int, QK_NORM: Bool = False
+](
+    Q: TileTensor[DType.float32, LT, MutAnyOrigin],     # RAW Q slice (row = q_stride, Q at q_off) — NOT pre-rotated
+    Kc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM] RoPE-rotated cache
+    Vc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM]
+    Qn: TileTensor[DType.float32, LT, MutAnyOrigin],    # [HEAD_DIM] q_norm weight (dummy if !QK_NORM)
+    O: TileTensor[DType.float32, LT, MutAnyOrigin],     # [Tq, HQ, HEAD_DIM]
+    Tq: Int,
+    q_offset: Int,
+    q_stride: Int,
+    q_off: Int,
+):
+    """attn_cached_kernel with RoPE applied to Q *on load* — folds the rope_q launch
+    (and its rotated-Q buffer) into attention at decode. With HALF=HEAD_DIM/2 the Q
+    register chunk c pairs element-wise with chunk c+NVEC/2, so qreg is rotated in
+    place with vectorized cos/sin (no extra registers). Qwen3 applies q_norm/RMS per
+    head pre-rotation. Bit-parity with rope_q + attn_cached (same split-half θ)."""
+    comptime assert Q.flat_rank == 1
+    comptime VEC = 8
+    comptime NVEC = HEAD_DIM // VEC
+    comptime HALFC = NVEC // 2                  # chunks per half (HALF = HALFC*VEC)
+    comptime GROUP = HQ // HKV
+    var qh = Int(global_idx.x) // WARP_SIZE
+    var lane = Int(global_idx.x) % WARP_SIZE
+    var h = qh % HQ
+    var t = qh // HQ
+    if t >= Tq:
+        return
+    var kvh = h // GROUP
+    var qpos = q_offset + t
+    var qbase = t * q_stride + q_off + h * HEAD_DIM
+    var scale = 1.0 / sqrt(Float32(HEAD_DIM))
+
+    # Load raw Q into registers, then rotate (RoPE) in place.
+    var qreg = InlineArray[SIMD[DType.float32, VEC], NVEC](fill=0.0)
+    for c in range(NVEC):
+        qreg[c] = Q.raw_load[VEC](qbase + c * VEC)
+    var rrms = Float32(1.0)
+    comptime if QK_NORM:
+        rrms = _head_rrms(Q, qbase, HEAD_DIM)
+    comptime HALF = HEAD_DIM // 2
+    for c in range(HALFC):
+        var lo = qreg[c]
+        var hi = qreg[c + HALFC]
+        comptime if QK_NORM:
+            lo = lo * rrms * Qn.raw_load[VEC](c * VEC)
+            hi = hi * rrms * Qn.raw_load[VEC](c * VEC + HALF)
+        var ang = SIMD[DType.float32, VEC](0.0)
+        for e in range(VEC):
+            var d = c * VEC + e
+            var freq = exp(-(2.0 * Float32(d) / Float32(HEAD_DIM)) * log(THETA))
+            ang[e] = Float32(qpos) * freq
+        var cosv = cos(ang)
+        var sinv = sin(ang)
+        qreg[c] = lo * cosv - hi * sinv
+        qreg[c + HALFC] = hi * cosv + lo * sinv
+
+    var m = Float32(-1.0e30)
+    var l = Float32(0.0)
+    var accv = InlineArray[SIMD[DType.float32, VEC], NVEC](fill=0.0)
+    for j in range(lane, qpos + 1, WARP_SIZE):
+        var kbase = (j * HKV + kvh) * HEAD_DIM
+        var s = SIMD[DType.float32, VEC](0.0)
+        for c in range(NVEC):
+            s += qreg[c] * Kc.raw_load[VEC](kbase + c * VEC)
+        var score = s.reduce_add() * scale
+        var m_new = max(m, score)
+        var corr = exp(m - m_new)
+        var p = exp(score - m_new)
+        l = l * corr + p
+        for c in range(NVEC):
+            accv[c] = accv[c] * corr + p * Vc.raw_load[VEC](kbase + c * VEC)
+        m = m_new
+
     var m_g = warp_max(m)
     var f = exp(m - m_g)
     var l_g = warp_sum(l * f)
@@ -1025,3 +1382,121 @@ def flash_attn_kernel[
                 var a = warp_sum(accv[c][e] * f)
                 if lane == 0:
                     O[obase + c * VEC + e] = rebind[O.ElementType](a / l_g)
+
+
+def tc_attn_kernel[
+    LT: TensorLayout, HQ: Int, HKV: Int, HEAD_DIM: Int
+](
+    Q: TileTensor[DType.float32, LT, MutAnyOrigin],     # [Tq, HQ, HEAD_DIM] *RoPE-rotated*
+    Kc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM] rotated, row = abs pos
+    Vc: TileTensor[DType.float32, LT, MutAnyOrigin],    # [max, HKV, HEAD_DIM]
+    O: TileTensor[DType.float32, LT, MutAnyOrigin],     # [Tq, HQ, HEAD_DIM]
+    Tq: Int,
+    q_offset: Int,
+):
+    """TENSOR-CORE causal GQA attention for *prefill* — the big long-prefill lever.
+
+    `attn_cached_kernel` gives each (query,head) one warp doing SCALAR per-key dot
+    products; attention then dominates prefill and grows ~quadratically (the 8×
+    gap to MLX at long context). This kernel instead computes S = Q·Kᵀ and O = P·V
+    on the Apple 8×8 simdgroup-matrix units (`_mma8x8`), the same intrinsic the
+    GEMM uses. One simdgroup (32 lanes, 1 warp) owns an 8-query tile of one head:
+    Q lives in ND=HEAD_DIM/8 A-fragments, O in ND C-fragments, and K/V stream in
+    8-key tiles. The online softmax reduces the S fragment ALONG keys with
+    `_frag_row_max`/`_frag_row_sum` (butterfly shuffles over the 4 lanes that share
+    a fragment row). Measured ~27× (P=512) … ~32× (P=1536) over attn_cached on the
+    M4, bit-exact vs the scalar kernel (max|Δ|≈1e-7).
+
+    Causal masking zeros P past the diagonal, so a masked key's V contribution is
+    killed in the MMA regardless — V is read with a branchless clamped row index
+    (a per-lane divergent guard around the unrolled MMA accumulate miscompiles on
+    this toolchain, silently corrupting the first output d-tile)."""
+    comptime assert Q.flat_rank == 1
+    comptime ND = HEAD_DIM // _MMA8                # d-tiles
+    comptime GROUP = HQ // HKV
+    var lane = Int(thread_idx.x) % 32
+    var fl = _frag8_layout(lane)
+    var frow = fl[0]
+    var fcol = fl[1]
+
+    var bx = Int(block_idx.x)
+    var qt = bx // HQ
+    var h = bx % HQ
+    var q0 = qt * _MMA8
+    var kvh = h // GROUP
+    var scale = 1.0 / sqrt(Float32(HEAD_DIM))
+
+    var row = q0 + frow
+    var qpos = q_offset + row                      # this lane's row abs position
+    # max abs position any active query in this tile attends to (block-uniform)
+    var last_row = q0 + _MMA8 - 1
+    if last_row > Tq - 1:
+        last_row = Tq - 1
+    var kmax = q_offset + last_row
+
+    var qp = Q.ptr
+    var kp = Kc.ptr
+    var vp = Vc.ptr
+
+    # Q resident in A-fragments: afrag[dt][s] = Q[row, h, dt*8 + fcol + s]
+    var afrag = InlineArray[SIMD[DType.float32, _FRAG8], ND](uninitialized=True)
+    comptime for dt in range(ND):
+        var af = SIMD[DType.float32, _FRAG8](0)
+        if row < Tq:
+            af = (qp + (row * HQ + h) * HEAD_DIM + dt * _MMA8 + fcol).load[width=_FRAG8]()
+        afrag[dt] = af
+
+    var ofrag = InlineArray[SIMD[DType.float32, _FRAG8], ND](
+        fill=SIMD[DType.float32, _FRAG8](0)
+    )
+    var m = Float32(-1.0e30)
+    var l = Float32(0.0)
+
+    var kt = 0
+    while kt <= kmax:
+        # S[8q × 8k] = Q · Kᵀ over HEAD_DIM, accumulated on the MMA.
+        var sfrag = SIMD[DType.float32, _FRAG8](0)
+        comptime for dt in range(ND):
+            var bk = SIMD[DType.float32, _FRAG8](0)
+            var kd = dt * _MMA8 + frow             # d index for the B (Kᵀ) operand
+            comptime for s in range(_FRAG8):
+                var key = kt + fcol + s
+                if key <= kmax:
+                    bk[s] = kp[(key * HKV + kvh) * HEAD_DIM + kd]
+            sfrag = _mma8x8(afrag[dt], bk, sfrag)
+
+        sfrag *= scale
+        # causal mask: key (col) past this row's abs position → −inf
+        comptime for s in range(_FRAG8):
+            if kt + fcol + s > qpos:
+                sfrag[s] = Float32(-1.0e30)
+
+        var rmax = _frag_row_max(max(sfrag[0], sfrag[1]))
+        var m_new = max(m, rmax)
+        var corr = exp(m - m_new)
+        var p0 = exp(sfrag[0] - m_new)
+        var p1 = exp(sfrag[1] - m_new)
+        var pfrag = SIMD[DType.float32, _FRAG8](p0, p1)
+        l = l * corr + _frag_row_sum(p0 + p1)
+
+        # O = O*corr + P·V (V non-transposed: bv[s]=V[key=kt+frow, d=col]). Masked
+        # keys carry P=0, so clamp the row index (no divergent branch — see above).
+        var key_a = kt + frow
+        if key_a > kmax:
+            key_a = kmax
+        comptime for dt in range(ND):
+            ofrag[dt] = ofrag[dt] * corr
+        comptime for dt in range(ND):
+            var bv = SIMD[DType.float32, _FRAG8](0)
+            comptime for s in range(_FRAG8):
+                bv[s] = vp[(key_a * HKV + kvh) * HEAD_DIM + dt * _MMA8 + fcol + s]
+            ofrag[dt] = _mma8x8(pfrag, bv, ofrag[dt])
+
+        m = m_new
+        kt += _MMA8
+
+    if row < Tq:
+        var ob = (row * HQ + h) * HEAD_DIM
+        comptime for dt in range(ND):
+            comptime for s in range(_FRAG8):
+                O[ob + dt * _MMA8 + fcol + s] = rebind[O.ElementType](ofrag[dt][s] / l)

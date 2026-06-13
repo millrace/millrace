@@ -45,7 +45,7 @@ def main() raises:
         prompt.append(Int(ids32[i]))
     var ids_dev = upload_ids(ctx, prompt)
 
-    var h = embed_tokens(ctx, ids_dev, w.embed, T)
+    var h = embed_tokens(ctx, ids_dev, w.embed, T, w.hidden, w.vocab)
     ctx.synchronize()
     var all_ok = True
     var worst = max_abs(h, read_f32(dir + "embed.bin"))

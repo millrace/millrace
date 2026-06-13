@@ -34,19 +34,32 @@ higher-is-better for decode.
 | metric (3B, 4-bit)            | **millrace** (int4) | MLX (4-bit) | Ollama (4-bit) |
 |-------------------------------|--------------------:|------------:|---------------:|
 | decode (tok/s)                |               ~18   |        52   |          47    |
-| prefill, ~70-tok prompt (ms)  |       ~400 (was 540) |       220   |         165    |
-| prefill, ~1.5K-tok prompt (s) |        ~13 (was 22) |       2.8   |         2.9    |
+| prefill, ~70-tok prompt (ms)  |      ~390 (was 540) |       220   |         165    |
+| prefill, ~1.5K-tok prompt (s) |       ~8 (was 22) |       2.8   |         2.9    |
 
 We're ~3× slower on decode and several× on prefill. The decode gap is **per-token
-Metal dispatch overhead** (closed from ~5× to ~3× by the kernel fusions in this
-repo). The prefill gap **used to be a fragment-ABI ceiling**; that ceiling is now
-**lifted** — Modular shipped the compact 8×8 op as an LLVM intrinsic, so the
-prefill GEMM is the **register-blocked compact-fragment kernel** that the old ABI
-blocked. The prefill numbers above are the projected end-to-end effect of the
-**measured ~1.95× GEMM speedup** below (GEMM-bound long prefill ≈ halves;
-short-prompt prefill improves less, being more attention/dispatch-bound). A full
-re-measure via `pixi run bench` (cross-engine, servers up) is pending; the
-kernel-level numbers are direct and reproducible:
+Metal dispatch overhead**: a profiler (`.scratch/decode_prof.mojo`) shows decode is
+**CPU-encode bound, not GPU bound** — enqueue-only time ≈ total-with-GPU-drain, so
+the GPU finishes in the drain while the CPU spends the whole token encoding
+dispatches (`enqueue_function` ≈ 33 µs/call for 1 arg, ~110 µs for the multi-arg
+matmuls; `enqueue_create_buffer` is ~1 µs, negligible). The only lever is **dispatch
+count**, so the per-layer chain was fused from **11 → 6 kernels**: RMSNorm folded
+into the following GEMV (each decode warp already streams the row, so it accumulates
+Σx² in the same K-loop), SwiGLU folded onto the down-proj input, `rope_k`+V-copy
+merged into one launch, and `rope_q` folded into the attention kernel (Q rotated on
+load). Measured **36.5 → 51.6 tok/s on 0.5B bf16** (+41 %), greedy output
+byte-identical. The decode-fusion kernels (`matmul_norm`/`matmul_q4_norm`,
+`matmul_silu_resid`/`matmul_q4_silu_resid`, `rope_kv`, `attn_cached_rope`) are
+decode-only (M=1); prefill keeps the separate kernels (it's GEMM-bound, not
+dispatch-bound). The prefill gap **used to be a fragment-ABI ceiling**; that ceiling is now
+**lifted** — Modular shipped the compact 8×8 op as an LLVM intrinsic, so both the
+prefill GEMM **and** prefill attention are now **register-blocked
+compact-fragment** kernels that the old ABI blocked. The prefill numbers above are
+the projected end-to-end effect of two measured kernel wins below: the **~1.95×
+GEMM speedup** (GEMM-bound short prefill) and the **~27–32× tensor-core attention
+speedup** (which dominates the long-prefill improvement, where attention had grown
+to ~38 % of the work). A full re-measure via `pixi run bench` (cross-engine,
+servers up) is pending; the kernel-level numbers are direct and reproducible:
 
 - The prefill GEMM now uses the **compact** 8×8 fragment — `SIMD[f32,2]`
   (2 floats/lane), the same representation MLX register-blocks. Each simdgroup
@@ -55,7 +68,26 @@ kernel-level numbers are direct and reproducible:
   external_call kernel's ~1.1** on the 3B prefill shapes (`.scratch/simd3_gemm.mojo`,
   M4, latest nightly `1.0.0b3.dev2026061206`) — **~1.95×, and it does NOT spill**
   (the prior full-`SIMD[f32,64]` register-blocking attempt spilled to 0.14
-  TFLOP/s; `.scratch/simd2_gemm.mojo`).
+  TFLOP/s; `.scratch/simd2_gemm.mojo`). The fragment-grid loops (`_SG_NTM`×`_SG_NTN`
+  MMA chain + the A/B loads) are `comptime for`-**unrolled**; without that the
+  in-tree kernel ran at only ~1.0 TFLOP/s (the 16 accumulators went to memory
+  instead of registers) — a free ~2× that had been left on the table vs the
+  microbench (`.scratch/simdq4_gemm.mojo` cross-checks both kernels).
+- **int4 prefill GEMM** (`matmul_simd_q4_kernel`) now **dequantizes the weight
+  tile into threadgroup shared memory once per block** (MLX's `QuantizedBlockLoader`
+  pattern) and runs the MMAs from shared — **~2.2 TFLOP/s, up from ~1.0, on par
+  with the bf16 GEMM** (vs MLX int4 ~3.1). The previous version called `q4_deq`
+  per B-fragment element *every* K-step from global (unpack+scale in the hot loop,
+  each shared column re-dequantized once per simdgroup); the fix amortizes the
+  dequant (once/block) and the global traffic it stages is the 4×-smaller *packed*
+  int4. The cooperative loader is **word-vectorized** — one packed u32 = 8 nibbles
+  per thread, group scale folded once — which is what flips staging from a loss
+  (a per-element loader re-read each word 8× and ran at ~0.65× the global kernel)
+  to the 2.2× win. This is the same staging that measured **negative for bf16**
+  (~20–35% slower; no dequant to amortize, X/W reuse already cache-served): the
+  cost/benefit flips precisely because int4 has a dequant to hoist and 4× less
+  weight traffic. Bit-identical to the global-load kernel end-to-end
+  (`.scratch/simdq4_staged.mojo` validates vs CPU + sweeps `BLOCK_K`).
 - We reach it via `llvm_intrinsic["llvm.air.simdgroup_matrix_8x8_multiply_accumulate"]`
   — Modular's pattern from
   [`max/kernels/.../gpu/apple/matmul_8x8.mojo`](https://github.com/modular/modular/blob/cc40bcd8e77fa1133b5a5419f6c895809828a298/max/kernels/src/linalg/matmul/gpu/apple/matmul_8x8.mojo).
@@ -80,12 +112,33 @@ already served by the hardware cache, so explicit staging only adds barrier
 latency, a cooperative-load phase, and shared-read traffic without cutting the
 global traffic that matters. Modular's own reference 8×8 Apple kernel (its
 `BLOCK_K` parameter is **unused** in the K-loop) likewise loads from global — so
-staging is not the lever here. The remaining MLX gap is occupancy/scheduling
-(MLX's larger fused pipeline) plus the unchanged O(M²) attention, which a
-per-layer prefill profile (3B int4, M4) attributes as: at P=512 the projection
-GEMMs are **~80 %** of prefill (attention ~16 %), and at P=1536 GEMM is **~60 %**
-(attention ~38 %, growing O(T²)). Details + raw numbers in
-[`bench/results/`](bench/results/).
+staging is not the lever here.
+
+**Prefill attention is now tensor-core too.** A per-layer profile (3B int4, M4)
+had attention growing O(T²) — ~16 % of prefill at P=512, ~38 % at P=1536 — because
+`attn_cached_kernel` gives each (query,head) one warp doing *scalar* per-key dot
+products. The new `tc_attn_kernel` computes both S = Q·Kᵀ and O = P·V on the same
+8×8 simdgroup-matrix units as the GEMM: one simdgroup owns an 8-query tile, keeps
+Q in `HEAD_DIM/8` A-fragments and O in as many C-fragments, streams K/V in 8-key
+tiles, and runs the online softmax by reducing the S fragment **along keys** with
+butterfly shuffles (`_frag_row_max`/`_frag_row_sum` — the 4 lanes sharing a
+fragment row differ only in lane bits 0 and 3). Measured **~27× (P=512) … ~32×
+(P=1536)** over the scalar kernel, **bit-exact** vs it (max|Δ|≈1e-7 across q_offset
+alignments; `.scratch/tc_attn.mojo`). It is wired for all prefill (Tq>1); decode
+(Tq=1) stays on the warp-per-head scalar kernel, which parallelizes keys across
+lanes for a single query. So at P=1536 the ~38 % attention slice collapses to
+~1 %. With prefill attention now tensor-core and the int4 GEMM shared-staged to
+bf16 parity, the remaining MLX prefill gap is GEMM occupancy/scheduling — MLX's
+larger fused threadgroup pipeline (bigger tiles, async copy, a tighter
+epilogue) — not any single missing kernel.
+
+> A toolchain wrinkle worth recording: a **per-lane divergent branch wrapping an
+> unrolled simdgroup-MMA accumulate miscompiles** on `1.0.0b3.dev2026061206` —
+> it silently corrupts the first output d-tile. `tc_attn_kernel` avoids it by
+> relying on `P=0` causal masking (which already kills a masked key's V
+> contribution in the MMA) and a **branchless clamped row index** for the V read.
+
+Details + raw numbers in [`bench/results/`](bench/results/).
 
 ## Prerequisites
 
