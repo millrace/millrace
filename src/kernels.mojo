@@ -424,12 +424,16 @@ def matmul_q4_kernel[
     Y: TileTensor[DType.float32, LT, MutAnyOrigin],
     M: Int, K: Int, N: Int, NG: Int, use_bias: Int,
 ):
-    """Decode GEMV for int4 weights (M=1). Like matmul_kernel, but each lane
-    consumes one u32 (8 weights) per step → coalesced 128-byte loads, and the 8
-    nibbles are unpacked with vector ops (a scalar unpack loop is ~2.5× slower —
-    it makes the kernel ALU-bound, wasting the 4× lower weight traffic). The
-    group scale is folded once per word (a 128-group is a multiple of 8, so an
-    8-aligned word never straddles two groups). ~2× the bf16 GEMV on the M4."""
+    """Decode GEMV for int4 weights (M=1). One warp per output; the warp's lanes
+    split K. Each lane consumes **eight** packed u32 per step via a single 256-bit
+    load (`P.load[width=8]` = 64 nibbles), so adjacent lanes touch 256 contiguous
+    bytes — the load count is 8× lower than a per-word load and the kernel goes
+    from load-issue bound toward bandwidth bound (microbench: ~1.3–1.5× the
+    per-word kernel across decode shapes, e.g. 11008×2048 ~54→~80 GB/s on the M4).
+    The 8 nibbles of each word unpack with vector ops (a scalar unpack is ~2.5×
+    slower — ALU-bound). One 256-bit oct = 64 elements = half a 128-group, so a
+    single group scale per oct is exact (K, hence words=K/8, is a multiple of 16
+    → words divisible by 8, no tail). ~2× the bf16 GEMV on the M4."""
     comptime assert X.flat_rank == 1
     var out = Int(global_idx.x) // WARP_SIZE
     var lane = Int(global_idx.x) % WARP_SIZE
@@ -440,17 +444,20 @@ def matmul_q4_kernel[
     var words = K // 8
     var rowword = n * words
     var xbase = m * K
+    var pp = P.ptr
+    var xp = X.ptr
+    var sp = S.ptr
     var acc = Float32(0.0)
-    for w in range(lane, words, WARP_SIZE):
-        var packed = rebind[Scalar[DType.uint32]](P[rowword + w])
-        var k0 = w * 8
-        var s = rebind[Scalar[DType.float32]](S[n * NG + (k0 >> Q4_SHIFT)])
-        var nibs = (SIMD[DType.uint32, 8](packed) >> _Q4_SHIFTS) & 0xF
-        var qf = (nibs.cast[DType.int32]() - 8).cast[DType.float32]()
-        var xv = SIMD[DType.float32, 8](0.0)
-        for o in range(8):
-            xv[o] = rebind[Scalar[DType.float32]](X[xbase + k0 + o])
-        acc += (qf * xv).reduce_add() * s
+    var octs = words // 8                 # 8 packed u32 = 64 weights per lane/step
+    for q in range(lane, octs, WARP_SIZE):
+        var word8 = (pp + rowword + q * 8).load[width=8]()
+        var k0 = q * 64
+        var s = sp[n * NG + (k0 >> Q4_SHIFT)]
+        comptime for j in range(8):
+            var nibs = (SIMD[DType.uint32, 8](word8[j]) >> _Q4_SHIFTS) & 0xF
+            var qf = (nibs.cast[DType.int32]() - 8).cast[DType.float32]()
+            var xv = (xp + xbase + k0 + j * 8).load[width=8]()
+            acc += (qf * xv).reduce_add() * s
     var total = warp_sum(acc)
     if lane == 0:
         if use_bias != 0:
@@ -518,21 +525,24 @@ def matmul_q4_norm_kernel[
     var words = K // 8
     var rowword = n * words
     var xbase = m * K
+    var pp = P.ptr
+    var xp = X.ptr
+    var lwp = LNW.ptr
+    var sp = S.ptr
     var acc = Float32(0.0)
     var ss = Float32(0.0)
-    for w in range(lane, words, WARP_SIZE):
-        var packed = rebind[Scalar[DType.uint32]](P[rowword + w])
-        var k0 = w * 8
-        var s = rebind[Scalar[DType.float32]](S[n * NG + (k0 >> Q4_SHIFT)])
-        var nibs = (SIMD[DType.uint32, 8](packed) >> _Q4_SHIFTS) & 0xF
-        var qf = (nibs.cast[DType.int32]() - 8).cast[DType.float32]()
-        var xv = SIMD[DType.float32, 8](0.0)
-        var lw = SIMD[DType.float32, 8](0.0)
-        for o in range(8):
-            xv[o] = rebind[Scalar[DType.float32]](X[xbase + k0 + o])
-            lw[o] = rebind[Scalar[DType.float32]](LNW[k0 + o])
-        ss += (xv * xv).reduce_add()
-        acc += (qf * (xv * lw)).reduce_add() * s
+    var octs = words // 8                 # 256-bit weight loads, see matmul_q4_kernel
+    for q in range(lane, octs, WARP_SIZE):
+        var word8 = (pp + rowword + q * 8).load[width=8]()
+        var k0 = q * 64
+        var s = sp[n * NG + (k0 >> Q4_SHIFT)]
+        comptime for j in range(8):
+            var nibs = (SIMD[DType.uint32, 8](word8[j]) >> _Q4_SHIFTS) & 0xF
+            var qf = (nibs.cast[DType.int32]() - 8).cast[DType.float32]()
+            var xv = (xp + xbase + k0 + j * 8).load[width=8]()
+            var lw = (lwp + k0 + j * 8).load[width=8]()
+            ss += (xv * xv).reduce_add()
+            acc += (qf * (xv * lw)).reduce_add() * s
     var rms = sqrt(warp_sum(ss) / Float32(K) + EPS)
     var total = warp_sum(acc) / rms
     if lane == 0:
@@ -564,17 +574,20 @@ def matmul_q4_resid_kernel[
     var words = K // 8
     var rowword = n * words
     var xbase = m * K
+    var pp = P.ptr
+    var xp = X.ptr
+    var sp = S.ptr
     var acc = Float32(0.0)
-    for w in range(lane, words, WARP_SIZE):
-        var packed = rebind[Scalar[DType.uint32]](P[rowword + w])
-        var k0 = w * 8
-        var s = rebind[Scalar[DType.float32]](S[n * NG + (k0 >> Q4_SHIFT)])
-        var nibs = (SIMD[DType.uint32, 8](packed) >> _Q4_SHIFTS) & 0xF
-        var qf = (nibs.cast[DType.int32]() - 8).cast[DType.float32]()
-        var xv = SIMD[DType.float32, 8](0.0)
-        for o in range(8):
-            xv[o] = rebind[Scalar[DType.float32]](X[xbase + k0 + o])
-        acc += (qf * xv).reduce_add() * s
+    var octs = words // 8                 # 256-bit weight loads, see matmul_q4_kernel
+    for q in range(lane, octs, WARP_SIZE):
+        var word8 = (pp + rowword + q * 8).load[width=8]()
+        var k0 = q * 64
+        var s = sp[n * NG + (k0 >> Q4_SHIFT)]
+        comptime for j in range(8):
+            var nibs = (SIMD[DType.uint32, 8](word8[j]) >> _Q4_SHIFTS) & 0xF
+            var qf = (nibs.cast[DType.int32]() - 8).cast[DType.float32]()
+            var xv = (xp + xbase + k0 + j * 8).load[width=8]()
+            acc += (qf * xv).reduce_add() * s
     var total = warp_sum(acc)
     if lane == 0:
         if use_bias != 0:
@@ -638,19 +651,22 @@ def matmul_q4_silu_resid_kernel[
     var words = K // 8
     var rowword = n * words
     var gbase = m * 2 * K
+    var pp = P.ptr
+    var gp = GU.ptr
+    var sp = S.ptr
     var acc = Float32(0.0)
-    for w in range(lane, words, WARP_SIZE):
-        var packed = rebind[Scalar[DType.uint32]](P[rowword + w])
-        var k0 = w * 8
-        var s = rebind[Scalar[DType.float32]](S[n * NG + (k0 >> Q4_SHIFT)])
-        var nibs = (SIMD[DType.uint32, 8](packed) >> _Q4_SHIFTS) & 0xF
-        var qf = (nibs.cast[DType.int32]() - 8).cast[DType.float32]()
-        var xv = SIMD[DType.float32, 8](0.0)
-        for o in range(8):
-            var g = rebind[Scalar[DType.float32]](GU[gbase + k0 + o])
-            var u = rebind[Scalar[DType.float32]](GU[gbase + k0 + o + K])
-            xv[o] = (g / (1.0 + exp(-g))) * u
-        acc += (qf * xv).reduce_add() * s
+    var octs = words // 8                 # 256-bit weight loads, see matmul_q4_kernel
+    for q in range(lane, octs, WARP_SIZE):
+        var word8 = (pp + rowword + q * 8).load[width=8]()
+        var k0 = q * 64
+        var s = sp[n * NG + (k0 >> Q4_SHIFT)]
+        comptime for j in range(8):
+            var nibs = (SIMD[DType.uint32, 8](word8[j]) >> _Q4_SHIFTS) & 0xF
+            var qf = (nibs.cast[DType.int32]() - 8).cast[DType.float32]()
+            var g = (gp + gbase + k0 + j * 8).load[width=8]()
+            var u = (gp + gbase + k0 + j * 8 + K).load[width=8]()
+            var xv = (g / (1.0 + exp(-g))) * u
+            acc += (qf * xv).reduce_add() * s
     var total = warp_sum(acc)
     if lane == 0:
         total += rebind[Scalar[DType.float32]](R[m * N + n])
