@@ -116,11 +116,13 @@ struct GemmaWeights(Movable, ModelWeights):
         return out^
 
 
-def load_gemma_weights(ctx: DeviceContext, path: String, layers: List[Int]) raises -> GemmaWeights:
+def load_gemma_weights(ctx: DeviceContext, path: String, layers: List[Int], q4: Bool = False) raises -> GemmaWeights:
     """Load the Gemma text decoder. `layers` selects which decoder layers to
     actually load (the rest get size-1 placeholders) so the per-layer validation
     stays tiny in memory; pass range(48) for the full model. embed/final_norm are
-    always loaded. Skips vision/audio embedder tensors."""
+    always loaded (embed stays bf16). With q4=True the projection weights are
+    group-128 int4 (the full bf16 model is ~24 GB and won't fit a 24 GB GPU; int4
+    is ~7 GB). Skips vision/audio embedder tensors."""
     var gathered = gather_tensors(path)
     var entries = gathered[0].copy()
     var paths = gathered[1].copy()
@@ -179,23 +181,23 @@ def load_gemma_weights(ctx: DeviceContext, path: String, layers: List[Int]) rais
         ln_post_ff.append(load_named(ctx, paths, entries, name2idx, p + "post_feedforward_layernorm.weight"))
 
         # q|k|v projections. Sliding: fuse q|k|v. Full: only q|k (V reuses k_proj).
-        var qpw = load_proj(ctx, paths, entries, name2idx, p + "self_attn.q_proj.weight", G_HIDDEN, False)
-        var kpw = load_proj(ctx, paths, entries, name2idx, p + "self_attn.k_proj.weight", G_HIDDEN, False)
+        var qpw = load_proj(ctx, paths, entries, name2idx, p + "self_attn.q_proj.weight", G_HIDDEN, q4)
+        var kpw = load_proj(ctx, paths, entries, name2idx, p + "self_attn.k_proj.weight", G_HIDDEN, q4)
         if full:
-            qkv.append(fuse_pair(ctx, qpw^, kpw^, q_dim, nkv, G_HIDDEN, False))   # [q|k]
+            qkv.append(fuse_pair(ctx, qpw^, kpw^, q_dim, nkv, G_HIDDEN, q4))   # [q|k]
         else:
-            var vpw = load_proj(ctx, paths, entries, name2idx, p + "self_attn.v_proj.weight", G_HIDDEN, False)
-            var qk = fuse_pair(ctx, qpw^, kpw^, q_dim, nkv, G_HIDDEN, False)
-            qkv.append(fuse_pair(ctx, qk^, vpw^, q_dim + nkv, nkv, G_HIDDEN, False))  # [q|k|v]
+            var vpw = load_proj(ctx, paths, entries, name2idx, p + "self_attn.v_proj.weight", G_HIDDEN, q4)
+            var qk = fuse_pair(ctx, qpw^, kpw^, q_dim, nkv, G_HIDDEN, q4)
+            qkv.append(fuse_pair(ctx, qk^, vpw^, q_dim + nkv, nkv, G_HIDDEN, q4))  # [q|k|v]
 
-        ow.append(load_proj(ctx, paths, entries, name2idx, p + "self_attn.o_proj.weight", q_dim, False))
+        ow.append(load_proj(ctx, paths, entries, name2idx, p + "self_attn.o_proj.weight", q_dim, q4))
         qnorm.append(load_named(ctx, paths, entries, name2idx, p + "self_attn.q_norm.weight"))
         knorm.append(load_named(ctx, paths, entries, name2idx, p + "self_attn.k_norm.weight"))
 
-        var gp = load_proj(ctx, paths, entries, name2idx, p + "mlp.gate_proj.weight", G_HIDDEN, False)
-        var upj = load_proj(ctx, paths, entries, name2idx, p + "mlp.up_proj.weight", G_HIDDEN, False)
-        gate_up.append(fuse_pair(ctx, gp^, upj^, G_INTER, G_INTER, G_HIDDEN, False))
-        down.append(load_proj(ctx, paths, entries, name2idx, p + "mlp.down_proj.weight", G_INTER, False))
+        var gp = load_proj(ctx, paths, entries, name2idx, p + "mlp.gate_proj.weight", G_HIDDEN, q4)
+        var upj = load_proj(ctx, paths, entries, name2idx, p + "mlp.up_proj.weight", G_HIDDEN, q4)
+        gate_up.append(fuse_pair(ctx, gp^, upj^, G_INTER, G_INTER, G_HIDDEN, q4))
+        down.append(load_proj(ctx, paths, entries, name2idx, p + "mlp.down_proj.weight", G_INTER, q4))
         layer_scalar.append(_load_scalar(ctx, paths, entries, name2idx, p + "layer_scalar"))
 
     # nkv for the engine's cache sizing: use the MAX of the two layer types
