@@ -16,9 +16,11 @@ Two loaders build the same `Tokenizer`:
 
 from json import parse_json
 
-comptime MUL = 200000          # pair key = left*MUL + right (ids < 151936)
+comptime MUL = 1 << 20         # pair key = left*MUL + right (ids < 262144 for Gemma,
+                               # < 151936 for Qwen; 1<<20 == 1048576 exceeds both)
 comptime APOS = 39
 comptime SPACE = 32
+comptime USCORE = 0x2581       # U+2581 "▁" — Gemma's normalized-space marker
 
 
 def is_letter(b: Int) -> Bool:
@@ -51,6 +53,8 @@ struct Tokenizer(Movable):
     var id_to_bytes: Dict[Int, List[UInt8]]
     var sp_text: List[List[UInt8]]         # special token texts
     var sp_id: List[Int]                   # parallel ids
+    var cp_to_id: Dict[Int, Int]           # codepoint -> id (Gemma single-char symbols)
+    var gemma: Bool                        # True -> SentencePiece-style path (no GPT2 regex)
 
     def bpe(self, mut ids: List[Int]) raises:
         while len(ids) >= 2:
@@ -155,6 +159,43 @@ struct Tokenizer(Movable):
                 out.append(x)
             p = e
 
+    def encode_gemma_gap(self, buf: List[UInt8], start: Int, stop: Int, mut out: List[Int]) raises:
+        """SentencePiece-style symbolization for a non-special gap, then BPE.
+
+        Walk the gap codepoint-by-codepoint (UTF-8). Replace literal space (0x20)
+        with U+2581 ("▁"). For each resulting codepoint: if it is a single-codepoint
+        vocab symbol, emit its id; else byte-fallback — emit `byte_id[b]` for each
+        UTF-8 byte of the original codepoint. Then rank-greedy BPE over the gap."""
+        var ids = List[Int]()
+        var p = start
+        while p < stop:
+            var b0 = Int(buf[p])
+            # decode one UTF-8 codepoint -> (cp, byte-length)
+            var cp: Int
+            var nb: Int
+            if b0 < 0x80:
+                cp = b0; nb = 1
+            elif b0 >> 5 == 0b110:
+                cp = (b0 & 0x1F) << 6 | (Int(buf[p + 1]) & 0x3F); nb = 2
+            elif b0 >> 4 == 0b1110:
+                cp = (b0 & 0x0F) << 12 | (Int(buf[p + 1]) & 0x3F) << 6 | (Int(buf[p + 2]) & 0x3F); nb = 3
+            else:
+                cp = (b0 & 0x07) << 18 | (Int(buf[p + 1]) & 0x3F) << 12 | (Int(buf[p + 2]) & 0x3F) << 6 | (Int(buf[p + 3]) & 0x3F); nb = 4
+
+            var sym = USCORE if cp == SPACE else cp   # normalizer: space -> ▁
+            if sym in self.cp_to_id:
+                ids.append(self.cp_to_id[sym])
+            else:
+                # byte_fallback: emit the <0xNN> id for each UTF-8 byte. The space
+                # was replaced by ▁ which is always a vocab symbol, so byte-fallback
+                # only ever sees the original (non-space) bytes here.
+                for j in range(nb):
+                    ids.append(self.byte_id[Int(buf[p + j])])
+            p += nb
+        self.bpe(ids)
+        for x in ids:
+            out.append(x)
+
     def match_special(self, buf: List[UInt8], pos: Int) raises -> SpMatch:
         var best_id = -1
         var best_len = 0
@@ -180,13 +221,19 @@ struct Tokenizer(Movable):
         while pos < n:
             var m = self.match_special(buf, pos)
             if m.id >= 0:
-                self.encode_normal(buf, seg, pos, out)
+                if self.gemma:
+                    self.encode_gemma_gap(buf, seg, pos, out)
+                else:
+                    self.encode_normal(buf, seg, pos, out)
                 out.append(m.id)
                 pos += m.length
                 seg = pos
             else:
                 pos += 1
-        self.encode_normal(buf, seg, n, out)
+        if self.gemma:
+            self.encode_gemma_gap(buf, seg, n, out)
+        else:
+            self.encode_normal(buf, seg, n, out)
         return out^
 
     def decode(self, ids: List[Int]) raises -> List[UInt8]:
@@ -314,7 +361,130 @@ def load_tokenizer_json(path: String) raises -> Tokenizer:
             tb.append(cb[i])
         sp_text.append(tb^)
 
-    return Tokenizer(byte_id^, merge_rank^, merge_id^, id_to_bytes^, sp_text^, sp_id^)
+    return Tokenizer(byte_id^, merge_rank^, merge_id^, id_to_bytes^, sp_text^,
+                     sp_id^, Dict[Int, Int](), False)
+
+
+def _is_byte_token(t: String) -> Bool:
+    """True if `t` is a literal byte-fallback token of the form `<0xNN>`."""
+    var b = t.as_bytes()
+    if len(b) != 6:
+        return False
+    return (Int(b[0]) == ord("<") and Int(b[1]) == ord("0")
+            and Int(b[2]) == ord("x") and Int(b[5]) == ord(">"))
+
+
+def _gemma_token_bytes(t: String) -> List[UInt8]:
+    """Raw decode bytes of a Gemma vocab token: literal UTF-8 with every U+2581
+    ("▁") turned back into a real space, so `decode` emits genuine spaces."""
+    var out = List[UInt8]()
+    for cp in t.codepoints():
+        if Int(cp) == USCORE:
+            out.append(UInt8(SPACE))
+        else:
+            _utf8_emit(Int(cp), out)
+    return out^
+
+
+def _utf8_emit(cp: Int, mut out: List[UInt8]):
+    if cp < 0x80:
+        out.append(UInt8(cp))
+    elif cp < 0x800:
+        out.append(UInt8(0xC0 | (cp >> 6)))
+        out.append(UInt8(0x80 | (cp & 0x3F)))
+    elif cp < 0x10000:
+        out.append(UInt8(0xE0 | (cp >> 12)))
+        out.append(UInt8(0x80 | ((cp >> 6) & 0x3F)))
+        out.append(UInt8(0x80 | (cp & 0x3F)))
+    else:
+        out.append(UInt8(0xF0 | (cp >> 18)))
+        out.append(UInt8(0x80 | ((cp >> 12) & 0x3F)))
+        out.append(UInt8(0x80 | ((cp >> 6) & 0x3F)))
+        out.append(UInt8(0x80 | (cp & 0x3F)))
+
+
+def load_gemma_tokenizer_json(path: String) raises -> Tokenizer:
+    """Build a `Tokenizer` for Gemma's SentencePiece-style BPE straight from its
+    HuggingFace `tokenizer.json` (`model.type == "BPE"`, `byte_fallback == true`).
+
+    Vocab keys are RAW UTF-8 (with "▁" for space), NOT GPT2-byte-encoded. Tables:
+      - `<0xNN>` token  -> `byte_id[NN] = id`, `id_to_bytes[id] = [NN]`.
+      - any other token -> `id_to_bytes[id] = utf8(replace ▁ with space)`, and if it
+        is exactly one codepoint, `cp_to_id[codepoint] = id` (keyed on the ORIGINAL
+        codepoint incl. U+2581, since symbolization sees ▁).
+      - merges are 2-element arrays `[A, B]`; resolve to `(id_A,id_B)->id_AB`.
+      - `added_tokens` -> `sp_text`/`sp_id` (matched before normalization)."""
+    var root = parse_json(_read(path))
+    var model = root.map_get("model").value()
+    var vocab = model.map_get("vocab").value()
+    var merges = model.map_get("merges").value()
+    var added = root.map_get("added_tokens").value()
+
+    var byte_id = List[Int]()
+    for _ in range(256):
+        byte_id.append(-1)
+    var id_to_bytes = Dict[Int, List[UInt8]]()
+    var cp_to_id = Dict[Int, Int]()
+    var vocab_map = Dict[String, Int]()       # token string -> id (merge resolution)
+
+    ref vkeys = vocab.c[].keys
+    ref vvals = vocab.c[].vals
+    for k in range(len(vkeys)):
+        var tok = vkeys[k]
+        var id = vvals[k].i
+        vocab_map[tok] = id
+        if _is_byte_token(tok):
+            var b = tok.as_bytes()
+            var nn = (hex_val(lower(Int(b[3]))) << 4) | hex_val(lower(Int(b[4])))
+            byte_id[nn] = id
+            var bl = List[UInt8]()
+            bl.append(UInt8(nn))
+            id_to_bytes[id] = bl^
+        else:
+            id_to_bytes[id] = _gemma_token_bytes(tok)
+            # single-codepoint symbol -> cp_to_id (keyed on the ORIGINAL codepoint).
+            var ncp = 0
+            var first = 0
+            for cp in tok.codepoints():
+                if ncp == 0:
+                    first = Int(cp)
+                ncp += 1
+                if ncp > 1:
+                    break
+            if ncp == 1:
+                cp_to_id[first] = id
+
+    var merge_rank = Dict[Int, Int]()
+    var merge_id = Dict[Int, Int]()
+    ref mvals = merges.c[].vals
+    for r in range(len(mvals)):
+        # Gemma merges are 2-element arrays [A, B]; merged token = A concatenated B.
+        ref pair = mvals[r].c[].vals
+        if len(pair) != 2:
+            continue
+        var a = pair[0].s
+        var b = pair[1].s
+        var merged = a + b
+        if a not in vocab_map or b not in vocab_map or merged not in vocab_map:
+            continue
+        var key = vocab_map[a] * MUL + vocab_map[b]
+        merge_rank[key] = r
+        merge_id[key] = vocab_map[merged]
+
+    var sp_text = List[List[UInt8]]()
+    var sp_id = List[Int]()
+    ref avals = added.c[].vals
+    for a in range(len(avals)):
+        ref obj = avals[a]
+        sp_id.append(obj.map_get("id").value().i)
+        var tb = List[UInt8]()
+        var cb = String(obj.map_get("content").value().s).as_bytes()
+        for i in range(len(cb)):
+            tb.append(cb[i])
+        sp_text.append(tb^)
+
+    return Tokenizer(byte_id^, merge_rank^, merge_id^, id_to_bytes^, sp_text^,
+                     sp_id^, cp_to_id^, True)
 
 
 def load_tokenizer(dir: String) raises -> Tokenizer:
@@ -370,4 +540,5 @@ def load_tokenizer(dir: String) raises -> Tokenizer:
             tb.append(txt[i])
         sp_text.append(tb^)
 
-    return Tokenizer(byte_id^, merge_rank^, merge_id^, id_to_bytes^, sp_text^, sp_id^)
+    return Tokenizer(byte_id^, merge_rank^, merge_id^, id_to_bytes^, sp_text^,
+                     sp_id^, Dict[Int, Int](), False)
