@@ -944,6 +944,69 @@ def softcap_kernel[
     X[i] = rebind[X.ElementType](cap * tanh(v / cap))
 
 
+def add_scalar_kernel[
+    LT: TensorLayout
+](
+    X: TileTensor[DType.float32, LT, MutAnyOrigin],   # in-place: X ← X + c
+    n: Int,
+    c: Float32,
+):
+    """In-place add a scalar to every element. Gemma bakes (1+w) into every
+    RMSNorm weight at load (c=1.0) so the existing `x/rms*w` kernels are exact for
+    Gemma's (1+w) RMSNorm without touching the hot norm kernels."""
+    comptime assert X.flat_rank == 1
+    var i = global_idx.x
+    if i >= n:
+        return
+    X[i] = rebind[X.ElementType](rebind[Scalar[DType.float32]](X[i]) + c)
+
+
+def mul_scalar_kernel[
+    LT: TensorLayout
+](
+    X: TileTensor[DType.float32, LT, MutAnyOrigin],
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],
+    n: Int,
+    c: Float32,
+):
+    """Y = X * c (elementwise). Gemma scales embeddings by √hidden (input path) and
+    applies the per-layer learned scalar to the layer output."""
+    comptime assert X.flat_rank == 1
+    var i = global_idx.x
+    if i >= n:
+        return
+    Y[i] = rebind[Y.ElementType](rebind[Scalar[DType.float32]](X[i]) * c)
+
+
+def vnorm_kernel[
+    LT: TensorLayout, HKV: Int, HEAD_DIM: Int
+](
+    In: TileTensor[DType.float32, LT, MutAnyOrigin],   # V source (row = in_stride, V at in_off)
+    Vc: TileTensor[DType.float32, LT, MutAnyOrigin],   # [max, HKV, HEAD_DIM] V cache
+    Tq: Int,
+    q_offset: Int,
+    in_stride: Int,
+    in_off: Int,
+):
+    """Gemma per-head SCALE-FREE RMSNorm over V (v_norm has no weight): one thread
+    per (token, kv-head) normalizes that head's HEAD_DIM values by 1/sqrt(mean(x²)+
+    eps) and writes them into the V cache at the absolute-position row (like
+    rope_k writes K). Used by Gemma's full-attention layers where V = v_norm(k_proj)."""
+    comptime assert In.flat_rank == 1
+    var nkv = HKV * HEAD_DIM
+    var idx = Int(global_idx.x)
+    if idx >= Tq * HKV:
+        return
+    var t = idx // HKV
+    var kvh = idx % HKV
+    var inbase = t * in_stride + in_off + kvh * HEAD_DIM
+    var outbase = (q_offset + t) * nkv + kvh * HEAD_DIM
+    var rrms = _head_rrms(In, inbase, HEAD_DIM)
+    for d in range(HEAD_DIM):
+        var v = rebind[Scalar[DType.float32]](In[inbase + d])
+        Vc[outbase + d] = rebind[Vc.ElementType](v * rrms)
+
+
 def copy_kernel[
     LT: TensorLayout
 ](
@@ -1026,6 +1089,8 @@ def rope_k_kernel[
     q_offset: Int,
     in_stride: Int,    # source row stride (= nkv unfused, = hd+2nkv when reading fused qkv)
     in_off: Int,       # source column offset of K within the row (0 unfused, hd when fused)
+    theta: Float32 = THETA,   # RoPE base (Qwen passes THETA; Gemma per-layer 1e4/1e6)
+    rot_pairs: Int = -1,      # # of d-pairs rotated (<0 = HALF = full rotary; Gemma partial = 64)
 ):
     """Apply RoPE to freshly-projected K and write it into the cache at its
     absolute-position rows. Doing this once on write (one thread per token×kv-
@@ -1049,11 +1114,9 @@ def rope_k_kernel[
     var rrms = Float32(1.0)
     comptime if QK_NORM:
         rrms = _head_rrms(Kin, inbase, HEAD_DIM)
+    var lt = log(theta)
+    var npair = rot_pairs if rot_pairs >= 0 else HALF
     for d in range(HALF):
-        var freq = exp(-(2.0 * Float32(d) / Float32(HEAD_DIM)) * log(THETA))
-        var ang = Float32(pos) * freq
-        var c = cos(ang)
-        var s = sin(ang)
         var x0 = rebind[Scalar[DType.float32]](Kin[inbase + d])
         var x1 = rebind[Scalar[DType.float32]](Kin[inbase + d + HALF])
         comptime if QK_NORM:
@@ -1061,8 +1124,16 @@ def rope_k_kernel[
             var g1 = rebind[Scalar[DType.float32]](Kn[d + HALF])
             x0 = x0 * rrms * g0
             x1 = x1 * rrms * g1
-        Kc[outbase + d] = rebind[Kc.ElementType](x0 * c - x1 * s)
-        Kc[outbase + d + HALF] = rebind[Kc.ElementType](x1 * c + x0 * s)
+        if d < npair:        # partial rotary: only the first npair pairs rotate
+            var freq = exp(-(2.0 * Float32(d) / Float32(HEAD_DIM)) * lt)
+            var ang = Float32(pos) * freq
+            var c = cos(ang)
+            var s = sin(ang)
+            Kc[outbase + d] = rebind[Kc.ElementType](x0 * c - x1 * s)
+            Kc[outbase + d + HALF] = rebind[Kc.ElementType](x1 * c + x0 * s)
+        else:
+            Kc[outbase + d] = rebind[Kc.ElementType](x0)
+            Kc[outbase + d + HALF] = rebind[Kc.ElementType](x1)
 
 
 def rope_kv_kernel[
@@ -1077,6 +1148,8 @@ def rope_kv_kernel[
     in_stride: Int,    # source row stride (= hd + 2*nkv when reading fused qkv)
     k_off: Int,        # column offset of K within the row
     v_off: Int,        # column offset of V within the row
+    theta: Float32 = THETA,
+    rot_pairs: Int = -1,
 ):
     """rope_k_kernel + the V cache-copy in ONE launch: one thread per token×kv-head
     rotates that head's K into the cache AND copies its V into the cache. Both
@@ -1097,11 +1170,9 @@ def rope_kv_kernel[
     var rrms = Float32(1.0)
     comptime if QK_NORM:
         rrms = _head_rrms(In, kin, HEAD_DIM)
+    var lt = log(theta)
+    var npair = rot_pairs if rot_pairs >= 0 else HALF
     for d in range(HALF):
-        var freq = exp(-(2.0 * Float32(d) / Float32(HEAD_DIM)) * log(THETA))
-        var ang = Float32(pos) * freq
-        var c = cos(ang)
-        var s = sin(ang)
         var x0 = rebind[Scalar[DType.float32]](In[kin + d])
         var x1 = rebind[Scalar[DType.float32]](In[kin + d + HALF])
         comptime if QK_NORM:
@@ -1109,8 +1180,16 @@ def rope_kv_kernel[
             var g1 = rebind[Scalar[DType.float32]](Kn[d + HALF])
             x0 = x0 * rrms * g0
             x1 = x1 * rrms * g1
-        Kc[outbase + d] = rebind[Kc.ElementType](x0 * c - x1 * s)
-        Kc[outbase + d + HALF] = rebind[Kc.ElementType](x1 * c + x0 * s)
+        if d < npair:
+            var freq = exp(-(2.0 * Float32(d) / Float32(HEAD_DIM)) * lt)
+            var ang = Float32(pos) * freq
+            var c = cos(ang)
+            var s = sin(ang)
+            Kc[outbase + d] = rebind[Kc.ElementType](x0 * c - x1 * s)
+            Kc[outbase + d + HALF] = rebind[Kc.ElementType](x1 * c + x0 * s)
+        else:
+            Kc[outbase + d] = rebind[Kc.ElementType](x0)
+            Kc[outbase + d + HALF] = rebind[Kc.ElementType](x1)
     # V is copied unrotated (HEAD_DIM contiguous values for this head).
     for d in range(HEAD_DIM):
         Vc[outbase + d] = rebind[Vc.ElementType](In[vin + d])
@@ -1126,6 +1205,8 @@ def rope_q_kernel[
     q_offset: Int,
     in_stride: Int,    # source row stride (= hd unfused, = hd+2nkv when reading fused qkv)
     in_off: Int,       # source column offset of Q within the row (0; Q is first in [q|k|v])
+    theta: Float32 = THETA,
+    rot_pairs: Int = -1,
 ):
     """Apply RoPE to Q (one thread per query×head) into a rotated buffer, so the
     attention kernel itself does no transcendentals — same as K is rotated on
@@ -1147,11 +1228,9 @@ def rope_q_kernel[
     var rrms = Float32(1.0)
     comptime if QK_NORM:
         rrms = _head_rrms(Q, inb, HEAD_DIM)
+    var lt = log(theta)
+    var npair = rot_pairs if rot_pairs >= 0 else HALF
     for d in range(HALF):
-        var freq = exp(-(2.0 * Float32(d) / Float32(HEAD_DIM)) * log(THETA))
-        var ang = Float32(pos) * freq
-        var c = cos(ang)
-        var s = sin(ang)
         var x0 = rebind[Scalar[DType.float32]](Q[inb + d])
         var x1 = rebind[Scalar[DType.float32]](Q[inb + d + HALF])
         comptime if QK_NORM:
@@ -1159,8 +1238,16 @@ def rope_q_kernel[
             var g1 = rebind[Scalar[DType.float32]](Qn[d + HALF])
             x0 = x0 * rrms * g0
             x1 = x1 * rrms * g1
-        Qr[base + d] = rebind[Qr.ElementType](x0 * c - x1 * s)
-        Qr[base + d + HALF] = rebind[Qr.ElementType](x1 * c + x0 * s)
+        if d < npair:
+            var freq = exp(-(2.0 * Float32(d) / Float32(HEAD_DIM)) * lt)
+            var ang = Float32(pos) * freq
+            var c = cos(ang)
+            var s = sin(ang)
+            Qr[base + d] = rebind[Qr.ElementType](x0 * c - x1 * s)
+            Qr[base + d + HALF] = rebind[Qr.ElementType](x1 * c + x0 * s)
+        else:
+            Qr[base + d] = rebind[Qr.ElementType](x0)
+            Qr[base + d + HALF] = rebind[Qr.ElementType](x1)
 
 
 def attn_cached_kernel[
@@ -1452,6 +1539,7 @@ def tc_attn_kernel[
     O: TileTensor[DType.float32, LT, MutAnyOrigin],     # [Tq, HQ, HEAD_DIM]
     Tq: Int,
     q_offset: Int,
+    scale_in: Float32 = -1.0,    # softmax scale; <0 = 1/sqrt(HEAD_DIM) (Qwen), Gemma passes 1.0
 ):
     """TENSOR-CORE causal GQA attention for *prefill* — the big long-prefill lever.
 
@@ -1483,7 +1571,7 @@ def tc_attn_kernel[
     var h = bx % HQ
     var q0 = qt * _MMA8
     var kvh = h // GROUP
-    var scale = 1.0 / sqrt(Float32(HEAD_DIM))
+    var scale = scale_in if scale_in >= 0.0 else 1.0 / sqrt(Float32(HEAD_DIM))
 
     var row = q0 + frow
     var qpos = q_offset + row                      # this lane's row abs position
