@@ -40,6 +40,7 @@ from model import (
     FAMILY_QWEN, FAMILY_GEMMA,
 )
 from tokenizer import Tokenizer, load_tokenizer, load_tokenizer_json, load_gemma_tokenizer_json
+from gemma import GemmaWeights, load_gemma_weights, G_NLAYERS
 from chat import load_chat_template, render_value, json_escape_str
 from toolcall import parse_tool_calls, ToolCall
 from blockcache import BlockCache
@@ -53,6 +54,13 @@ from json import parse_json, bytes_to_string
 # context; the cache is ~MAX_SEQ * 24 KiB ≈ 805 MB resident on the GPU.
 comptime MAX_SEQ = 32768
 
+# Gemma's KV cache is uniform at nkv=2048 (the max of its sliding/full layer
+# types) across all 48 layers → ~768 KiB/token, so a 32k context would be ~26 GB
+# on top of the ~7 GB int4 weights. Cap Gemma's persistent cache so weights +
+# cache + the secondary embed model fit a 24 GB unified GPU: 4096 * 768 KiB ≈
+# 3.2 GB (raise on a larger machine).
+comptime GEMMA_MAX_SEQ = 4096
+
 # Disk-backed prefix cache: K/V persisted in BLOCK_TOK-token blocks so prefills
 # survive restarts and are shared across conversations (blockcache.mojo).
 comptime BLOCK_TOK = 256
@@ -65,6 +73,7 @@ comptime GEMMA_TEMPLATE = "assets/gemma4-chat-template.jinja"
 # and is what /v1/models and every response report.
 comptime MODEL_05B = "Qwen/Qwen2.5-0.5B-Instruct"
 comptime MODEL_3B = "Qwen/Qwen2.5-3B-Instruct"
+comptime MODEL_GEMMA = "google/gemma-4-12b-it"
 # Default SECONDARY embedding model (arch==2). Resolved from the HF cache when no
 # $EMBED_SAFETENSORS / config `embed_model` is given; if it isn't cached either,
 # the embedding endpoint stays unloaded (/v1/embeddings → 503).
@@ -107,7 +116,16 @@ struct ServerState(Movable):
     fields stay unset and /v1/embeddings falls back to the primary w/tok."""
 
     var ctx: DeviceContext
-    var w: Weights
+    # The primary (chat) model is one of two weight structs (both conform to the
+    # ModelWeights trait): Qwen in `w` or Gemma in `gw`, selected by `family`.
+    # Generation dispatches on `family`; the engine calls are already parametric.
+    var family: Int                 # FAMILY_QWEN | FAMILY_GEMMA
+    var w: Optional[Weights]        # primary when family == FAMILY_QWEN
+    var gw: Optional[GemmaWeights]  # primary when family == FAMILY_GEMMA
+    var primary_arch: Int           # Qwen arch (0/1/2) for the embed gate; -1 for Gemma
+    var eos1: Int                   # primary stop tokens (from its ModelConfig)
+    var eos2: Int
+    var max_seq: Int                # primary KV-cache context cap
     var tok: Tokenizer
     var tmpl: Template
     var sess: Session      # one long-lived KV cache, reused across requests
@@ -115,18 +133,26 @@ struct ServerState(Movable):
     var model_id: String   # id reported by /v1/models + every response
     var bcache: BlockCache # disk-backed prefix cache (survives restarts)
     # Secondary embedding model (None when the primary is itself arch==2, or when
-    # no embedding checkpoint could be resolved at startup).
+    # no embedding checkpoint could be resolved at startup). Always Qwen.
     var embed_w: Optional[Weights]
     var embed_tok: Optional[Tokenizer]
     var embed_id: String   # id reported for the embedding model ("" if unset)
 
-    def __init__(out self, var ctx: DeviceContext, var w: Weights,
+    def __init__(out self, var ctx: DeviceContext, family: Int,
+                 var w: Optional[Weights], var gw: Optional[GemmaWeights],
+                 primary_arch: Int, eos1: Int, eos2: Int, max_seq: Int,
                  var tok: Tokenizer, var tmpl: Template, var sess: Session,
                  var model_id: String, var bcache: BlockCache,
                  var embed_w: Optional[Weights], var embed_tok: Optional[Tokenizer],
                  var embed_id: String):
         self.ctx = ctx^
+        self.family = family
         self.w = w^
+        self.gw = gw^
+        self.primary_arch = primary_arch
+        self.eos1 = eos1
+        self.eos2 = eos2
+        self.max_seq = max_seq
         self.tok = tok^
         self.tmpl = tmpl^
         self.sess = sess^
@@ -277,6 +303,21 @@ struct Reply(Movable):
         self.tps = tps
 
 
+def _prefill_suffix(mut s: ServerState, suffix: List[Int], reuse: Int) raises -> List[Float32]:
+    """Prefill `suffix` into the persistent session, dispatching to the primary's
+    weight struct (the engine call is parametric over ModelWeights)."""
+    if s.family == FAMILY_GEMMA:
+        return sess_prefill_suffix(s.ctx, s.gw.value(), s.sess, suffix, reuse, True)
+    return sess_prefill_suffix(s.ctx, s.w.value(), s.sess, suffix, reuse, True)
+
+
+def _step(mut s: ServerState, token: Int) raises -> List[Float32]:
+    """Decode one token, dispatching to the primary's weight struct."""
+    if s.family == FAMILY_GEMMA:
+        return sess_step(s.ctx, s.gw.value(), s.sess, token)
+    return sess_step(s.ctx, s.w.value(), s.sess, token)
+
+
 def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
              temp: Float32, top_k: Int, top_p: Float32) raises -> Reply:
     """Run the GPU decode loop to completion for `ids`, honoring OpenAI knobs.
@@ -287,10 +328,10 @@ def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
     separately — each `sess_*` call ends in a device→host logits copy, so the GPU
     is synced at the boundary — and logs a terse per-request line."""
     # Clamp generation so prefill + decode never overrun the cache.
-    var room = MAX_SEQ - len(ids) - 1
+    var room = s.max_seq - len(ids) - 1
     if room < 1:
         raise Error("prompt of " + String(len(ids)) + " tokens exceeds context "
-                    + String(MAX_SEQ))
+                    + String(s.max_seq))
     var cap = max_new if max_new < room else room
 
     # Reuse = longest prefix already valid in GPU (in-memory, free), extended by
@@ -322,7 +363,7 @@ def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
         suffix.append(ids[i])
 
     var t0 = perf_counter_ns()
-    var logits = sess_prefill_suffix(s.ctx, s.w, s.sess, suffix, reuse, True)
+    var logits = _prefill_suffix(s, suffix, reuse)
     var t_pf = perf_counter_ns()
     s.cached = ids.copy()  # prompt is now resident; generated tokens are not cached
 
@@ -343,14 +384,14 @@ def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
             sample(process_logits(logits, context, temp, top_k, top_p, DEF_REP), rng)
             if temp > 0.0 else argmax_f(logits)
         )
-        if nxt == EOS1 or nxt == EOS2:
+        if nxt == s.eos1 or nxt == s.eos2:
             stopped = True
             break
         gen.append(nxt)
         context.append(nxt)
         if len(gen) >= cap:
             break
-        logits = sess_step(s.ctx, s.w, s.sess, nxt)
+        logits = _step(s, nxt)
         # sess_step already synced (host logits copy), so this is real wall-clock.
         var now = perf_counter_ns()
         if Float64(now - last_beat) >= 5.0e9:
@@ -683,7 +724,7 @@ struct Api(Handler, Copyable, Movable):
         # Which weights+tokenizer serve embeddings: the secondary embed model if
         # loaded, else the primary iff it is itself arch==2, else none → 503.
         var use_secondary = Bool(s.embed_w)
-        if not use_secondary and s.w.arch != 2:
+        if not use_secondary and s.primary_arch != 2:
             return service_unavailable('{"error":{"message":"no embedding model '
                 + 'loaded (set EMBED_SAFETENSORS or cache Qwen/Qwen3-Embedding-0.6B, '
                 + 'or serve an arch==2 model)"}}')
@@ -734,7 +775,9 @@ struct Api(Handler, Copyable, Movable):
             if use_secondary:
                 vec = sess_embed(s.ctx, s.embed_w.value(), id_lists[i])
             else:
-                vec = sess_embed(s.ctx, s.w, id_lists[i])
+                # Reached only when the PRIMARY is itself an embedding model
+                # (arch==2, always Qwen); Gemma never takes this branch.
+                vec = sess_embed(s.ctx, s.w.value(), id_lists[i])
             if i > 0:
                 data += ","
             data += embedding_item_json(i, vec^)
@@ -1061,28 +1104,67 @@ def main() raises:
         tok = load_tokenizer("tests/fixtures/tokenizer/")
     var tmpl = load_chat_template(GEMMA_TEMPLATE if family == FAMILY_GEMMA else TEMPLATE)
     var ctx = DeviceContext()
-    var w = load_weights(ctx, ckpt, q4)
-    # Probe the simdgroup-matrix GEMM once; on success prefill GEMMs take the
-    # ~4.5× faster path, else fall back to the scalar tiled kernel (see mm()).
-    w.simd_ok = probe_simd_gemm(ctx)
-    if model_id.byte_length() == 0:   # default id from detected arch (+quant tag)
-        model_id = String(MODEL_3B) if w.arch == 1 else String(MODEL_05B)
-        if w.quant:
-            model_id += "-int4"       # distinct id + KV-cache dir from the bf16 build
-    # One persistent KV cache for the process, sized to the detected arch.
-    var sess = new_session(ctx, MAX_SEQ, w.nlayers, w.nkv)
-    print("  serving ", model_id, "  (hidden=", w.hidden, ", layers=", w.nlayers,
-          ", heads=", w.hq, "/", w.hkv, ", head_dim=", w.head_dim, ")", sep="")
+
+    # Primary (chat) model, loaded by family. Qwen and Gemma have different weight
+    # structs (both ModelWeights); ServerState carries one in an Optional and the
+    # generation path dispatches on `family`. Capture every scalar the rest of
+    # main() + the banner need here, so the weights can move into the Optional.
+    var w_opt = Optional[Weights](None)
+    var gw_opt = Optional[GemmaWeights](None)
+    var p_nlayers: Int
+    var p_nkv: Int
+    var p_arch: Int
+    var p_quant: Bool
+    var p_simd_ok: Bool
+    var p_eos1: Int
+    var p_eos2: Int
+    var p_maxseq: Int
     var gemm_path = String("simdgroup-matrix (~4.5x)")
-    if not w.simd_ok:
-        gemm_path = String("scalar tiled (simd probe failed)")
+    if family == FAMILY_GEMMA:
+        # The 12B bf16 model is ~24 GB and won't fit a 24 GB GPU, so int4 is forced.
+        var alllayers = List[Int]()
+        for i in range(G_NLAYERS):
+            alllayers.append(i)
+        var gw = load_gemma_weights(ctx, ckpt, alllayers, True)
+        gw.simd_ok = probe_simd_gemm(ctx)
+        var gc = gw.config()
+        p_nlayers = gc.nlayers; p_nkv = gc.nkv
+        p_arch = -1; p_quant = True; p_simd_ok = gw.simd_ok
+        p_eos1 = gc.eos1; p_eos2 = gc.eos2; p_maxseq = GEMMA_MAX_SEQ
+        if not gw.simd_ok:
+            gemm_path = String("scalar tiled (simd probe failed)")
+        if model_id.byte_length() == 0:
+            model_id = String(MODEL_GEMMA) + "-int4"
+        print("  serving ", model_id, "  (hidden=", gw.hidden, ", layers=", gw.nlayers,
+              ", q-heads=", gw.hq, ", kv=8/1, head_dim=256/512, max_seq=", p_maxseq, ")", sep="")
+        gw_opt = Optional[GemmaWeights](gw^)
+    else:
+        var w = load_weights(ctx, ckpt, q4)
+        # Probe the simdgroup-matrix GEMM once; on success prefill GEMMs take the
+        # ~4.5× faster path, else fall back to the scalar tiled kernel (see mm()).
+        w.simd_ok = probe_simd_gemm(ctx)
+        p_nlayers = w.nlayers; p_nkv = w.nkv
+        p_arch = w.arch; p_quant = w.quant; p_simd_ok = w.simd_ok
+        p_eos1 = EOS1; p_eos2 = EOS2; p_maxseq = MAX_SEQ
+        if not w.simd_ok:
+            gemm_path = String("scalar tiled (simd probe failed)")
+        if model_id.byte_length() == 0:   # default id from detected arch (+quant tag)
+            model_id = String(MODEL_3B) if w.arch == 1 else String(MODEL_05B)
+            if w.quant:
+                model_id += "-int4"       # distinct id + KV-cache dir from the bf16 build
+        print("  serving ", model_id, "  (hidden=", w.hidden, ", layers=", w.nlayers,
+              ", heads=", w.hq, "/", w.hkv, ", head_dim=", w.head_dim, ")", sep="")
+        w_opt = Optional[Weights](w^)
     print("  prefill GEMM: ", gemm_path, sep="")
-    var wprec = String("group-128 int4 (proj) + bf16 (embed)") if w.quant else String("bf16")
+    var wprec = String("group-128 int4 (proj) + bf16 (embed)") if p_quant else String("bf16")
     print("  weights: ", wprec, sep="")
+
+    # One persistent KV cache for the process, sized to the model.
+    var sess = new_session(ctx, p_maxseq, p_nlayers, p_nkv)
 
     # Disk-backed prefix cache (per model), survives restarts.
     var kvdir = String(getenv("HOME")) + "/.cache/millrace/kv/" + _slug(model_id)
-    var bcache = BlockCache(kvdir, BLOCK_TOK, w.nkv, w.nlayers, cfg.kv_budget_mb * 1024 * 1024, model_id)  # MiB -> bytes
+    var bcache = BlockCache(kvdir, BLOCK_TOK, p_nkv, p_nlayers, cfg.kv_budget_mb * 1024 * 1024, model_id)  # MiB -> bytes
     if bcache.enabled:
         print("  kv-cache: ", kvdir, " (", len(bcache.order), " blocks cached, cap ",
               bcache.max_blocks, " blocks)", sep="")
@@ -1098,7 +1180,7 @@ def main() raises:
     var embed_w = Optional[Weights](None)
     var embed_tok = Optional[Tokenizer](None)
     var embed_id = String("")
-    if w.arch == 2:
+    if p_arch == 2:
         print("  embeddings: served by the primary model (arch==2)")
     else:
         var eckpt = String("")
@@ -1130,7 +1212,7 @@ def main() raises:
                 else:
                     et = load_tokenizer("tests/fixtures/tokenizer/")
                 var ew = load_weights(ctx, eckpt, False)   # embed weights stay bf16
-                ew.simd_ok = w.simd_ok
+                ew.simd_ok = p_simd_ok
                 if eid.byte_length() == 0:
                     eid = String(MODEL_EMBED)
                 embed_id = eid.copy()
@@ -1148,9 +1230,10 @@ def main() raises:
     # Capture the banner values before the (moving) ServerState construction.
     var banner_embed_id = embed_id.copy()
     var banner_model_id = model_id.copy()
-    var primary_is_embed = w.arch == 2
+    var primary_is_embed = p_arch == 2
 
-    var state = ServerState(ctx^, w^, tok^, tmpl^, sess^, model_id^, bcache^,
+    var state = ServerState(ctx^, family, w_opt^, gw_opt^, p_arch, p_eos1, p_eos2,
+                            p_maxseq, tok^, tmpl^, sess^, model_id^, bcache^,
                             embed_w^, embed_tok^, embed_id^)
     var sp = alloc[ServerState](1)
     sp.init_pointee_move(state^)

@@ -107,6 +107,10 @@ int8-gemv-bench = { cmd = "mkdir -p build && mojo build tests/manual/int8_gemv_b
 q4-kernels = { cmd = "mkdir -p build && mojo build tests/manual/q4_kernels.mojo -I src -o build/q4_kernels && ./build/q4_kernels" }
 q4-validate = { cmd = "mkdir -p build && mojo build tests/manual/q4_validate.mojo -I src -I ../jinja2.mojo/src -o build/q4_validate && ./build/q4_validate" }
 int4-quality = { cmd = "mkdir -p build && mojo build tests/manual/int4_quality.mojo -I src -I ../jinja2.mojo/src -o build/int4_quality && ./build/int4_quality" }
+# End-to-end Gemma serving-path smoke test (template -> tokenizer -> persistent
+# KV session -> prefill/decode -> detokenize), the exact stack server.gen_full
+# drives. Loads the ~7 GB int4 model (needs the gemma-4-12B checkpoint cached).
+gemma-serve-smoke = { cmd = "mkdir -p build && mojo build tests/manual/gemma_serve_smoke.mojo -I src -I ../jinja2.mojo/src -I ../flare -o build/gemma_serve_smoke && ./build/gemma_serve_smoke" }
 
 # Cross-engine benchmark (millrace vs mlx_lm.server vs Ollama): TTFT, decode
 # tok/s, cold/warm prefix. Stdlib python, no GPU build. Start the servers first
