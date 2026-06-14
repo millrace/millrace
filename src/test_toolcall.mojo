@@ -130,11 +130,13 @@ def main() raises:
     expect(g7.content == "The weather in Paris is 22\xc2\xb0C and sunny.",
            "g7: cleaned=[" + g7.content + "]", all_ok)
 
-    # G8. thinking-channel reasoning dropped, answer kept
+    # G8. thinking-channel reasoning surfaced separately, answer kept
     var g8 = parse_gemma_tool_calls(
         String("<|channel>thought\nlet me work it out<channel|>The answer is 4.")
     )
-    expect(g8.content == "The answer is 4.", "g8: cleaned=[" + g8.content + "]", all_ok)
+    expect(g8.content == "The answer is 4.", "g8: content=[" + g8.content + "]", all_ok)
+    expect(g8.reasoning == "let me work it out", "g8: reasoning=[" + g8.reasoning + "]", all_ok)
+    expect(g7.reasoning == "", "g7: empty reasoning=[" + g7.reasoning + "]", all_ok)
 
     if all_ok:
         print("toolcall gate: PASS")

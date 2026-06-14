@@ -113,3 +113,24 @@ def main() raises:
     var mclean = parse_gemma_tool_calls(mtext)
     print("MULTITURN prompt_toks=", len(mids), " raw=", repr(mtext), sep="")
     print("  served content=", repr(mclean.content), sep="")
+
+    # Thinking mode: enable_thinking -> model reasons in the thought channel; the
+    # parser splits reasoning from the answer.
+    sess.pos = 0
+    var thbody = String('{"messages":[{"role":"user","content":"If a train travels 60 km in 1.5 hours, what is its average speed? Think step by step."}],"enable_thinking":true}')
+    var threnders = render_value(tmpl, parse_json(thbody), FAMILY_GEMMA)
+    var thids = tok.encode(_bytes(threnders))
+    var thlogits = sess_prefill_suffix(ctx, gw, sess, thids, 0, True)
+    var thgen = List[Int]()
+    var thnxt = argmax_f(thlogits)
+    var thsteps = 0
+    while thsteps < 250 and thnxt != cfg.eos1 and thnxt != cfg.eos2:
+        thgen.append(thnxt)
+        thlogits = sess_step(ctx, gw, sess, thnxt)
+        thnxt = argmax_f(thlogits)
+        thsteps += 1
+    var thtext = String(StringSlice(unsafe_from_utf8=Span(tok.decode(thgen))))
+    var thparsed = parse_gemma_tool_calls(thtext)
+    print("THINKING gen_toks=", len(thgen), " raw=", repr(thtext), sep="")
+    print("  reasoning=", repr(thparsed.reasoning), sep="")
+    print("  content=", repr(thparsed.content), sep="")

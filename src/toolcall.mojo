@@ -37,11 +37,14 @@ struct ToolCall(Movable, Copyable):
 
 
 struct ParsedReply(Movable):
-    var content: String        # text outside any <tool_call> block (trimmed)
+    var content: String        # text outside any tool block (trimmed)
+    var reasoning: String      # thinking-channel content ("" for Qwen / no channel)
     var calls: List[ToolCall]  # tool calls in emission order
 
-    def __init__(out self, var content: String, var calls: List[ToolCall]):
+    def __init__(out self, var content: String, var reasoning: String,
+                 var calls: List[ToolCall]):
         self.content = content^
+        self.reasoning = reasoning^
         self.calls = calls^
 
     def has_calls(self) -> Bool:
@@ -231,7 +234,7 @@ def parse_tool_calls(text: String) raises -> ParsedReply:
             content += _slice(b, o, advanced)  # beyond repair — keep verbatim
         pos = advanced
 
-    return ParsedReply(String(bytes_to_string(content).strip()), calls^)
+    return ParsedReply(String(bytes_to_string(content).strip()), String(""), calls^)
 
 
 # ── Gemma tool-call parsing (format differs from Qwen's JSON blocks) ──────────
@@ -373,28 +376,41 @@ def _extract_gemma_call(inner: List[UInt8], mut calls: List[ToolCall]) -> Bool:
         return False
 
 
-def _strip_gemma_channels(b: List[UInt8]) raises -> String:
-    """Remove Gemma's `<|channel>thought…<channel|>` spans (the model's hidden
-    reasoning / the empty thought channel it emits in non-thinking mode) plus any
-    stray channel markers, leaving just the answer text. (Reasoning is dropped,
-    not yet surfaced as a separate field.)"""
+def _split_gemma_channels(b: List[UInt8]) raises -> Tuple[String, String]:
+    """Split Gemma output into (answer, reasoning). The model wraps its chain of
+    thought in `<|channel>thought\\n…<channel|>` (empty in non-thinking mode); the
+    text inside the channel(s) is the reasoning, everything outside is the answer.
+    Stray channel markers are dropped. Both are trimmed."""
     var OPEN = string_to_bytes(String("<|channel>"))
     var CLOSE = string_to_bytes(String("<channel|>"))
     var out = List[UInt8]()
+    var reason = List[UInt8]()
     var i = 0
     var n = len(b)
     while i < n:
         if _at(b, i, OPEN):
+            # channel body runs to the matching close, or to end-of-text when the
+            # thought was cut off mid-stream (still captured as reasoning).
             var j = _find(b, CLOSE, i + len(OPEN))
+            var body_end = j if j >= 0 else n
+            var cs = i + len(OPEN)
+            var nl = cs
+            while nl < body_end and b[nl] != 10:   # first newline ends the channel label
+                nl += 1
+            var rstart = nl + 1 if nl < body_end else cs
+            if len(reason) > 0:
+                reason.append(10)           # separate multiple channels with \n
+            for k in range(rstart, body_end):
+                reason.append(b[k])
             if j < 0:
-                break                       # unterminated channel → drop the rest
+                break                       # unterminated → rest was all reasoning
             i = j + len(CLOSE)
         elif _at(b, i, CLOSE):
             i += len(CLOSE)                 # stray close marker
         else:
             out.append(b[i])
             i += 1
-    return String(bytes_to_string(out).strip())
+    return (String(bytes_to_string(out).strip()), String(bytes_to_string(reason).strip()))
 
 
 def parse_gemma_tool_calls(text: String) raises -> ParsedReply:
@@ -431,4 +447,5 @@ def parse_gemma_tool_calls(text: String) raises -> ParsedReply:
             var keep_end = (c + len(CLOSE)) if c >= 0 else n
             content += _slice(b, o, keep_end)
         pos = (c + len(CLOSE)) if c >= 0 else n
-    return ParsedReply(_strip_gemma_channels(content), calls^)
+    var split = _split_gemma_channels(content)
+    return ParsedReply(split[0], split[1], calls^)

@@ -535,16 +535,33 @@ def millrace_stats(r: Reply) -> String:
         + ',"gen_tokens":' + String(len(r.ids)) + "}"
     )
 
+def _reasoning_field(reasoning: String) -> String:
+    """`,"reasoning_content":"…"` (the DeepSeek-R1 field clients read), or '' when
+    there's no reasoning. `reasoning` must already be JSON-escaped."""
+    if reasoning.byte_length() > 0:
+        return ',"reasoning_content":"' + reasoning + '"'
+    return String("")
+
 def completion_json(model: String, content: String, n_prompt: Int, n_gen: Int,
-                    finish: String, millrace: String = String("")) -> String:
+                    finish: String, millrace: String = String(""),
+                    reasoning: String = String("")) -> String:
     var extra = (',"millrace":' + millrace) if millrace.byte_length() > 0 else String("")
     return (
         '{"id":"chatcmpl-millrace","object":"chat.completion","created":0,"model":"'
         + model + '","choices":[{"index":0,"message":{"role":"assistant","content":"'
-        + content + '"},"finish_reason":"' + finish + '"}],'
+        + content + '"' + _reasoning_field(reasoning) + '},"finish_reason":"' + finish + '"}],'
         + '"usage":{"prompt_tokens":' + String(n_prompt)
         + ',"completion_tokens":' + String(n_gen)
         + ',"total_tokens":' + String(n_prompt + n_gen) + "}" + extra + "}"
+    )
+
+def chunk_reasoning_json(model: String, reasoning: String) -> String:
+    """A streaming chunk carrying reasoning as a `reasoning_content` delta
+    (`reasoning` must already be JSON-escaped)."""
+    return (
+        '{"id":"chatcmpl-millrace","object":"chat.completion.chunk","created":0,"model":"'
+        + model + '","choices":[{"index":0,"delta":{"reasoning_content":"' + reasoning
+        + '"},"finish_reason":null}]}'
     )
 
 def chunk_json(model: String, delta: String, finish: Bool, fin: String,
@@ -582,14 +599,15 @@ def tool_calls_array_json(calls: List[ToolCall]) -> String:
     return s + "]"
 
 def completion_tools_json(model: String, content: String, calls: List[ToolCall],
-                          n_prompt: Int, n_gen: Int) -> String:
+                          n_prompt: Int, n_gen: Int,
+                          reasoning: String = String("")) -> String:
     var content_field = String("null")
     if content.byte_length() > 0:
         content_field = '"' + esc(content) + '"'
     return (
         '{"id":"chatcmpl-millrace","object":"chat.completion","created":0,"model":"'
         + model + '","choices":[{"index":0,"message":{"role":"assistant","content":'
-        + content_field + ',"tool_calls":' + tool_calls_array_json(calls)
+        + content_field + _reasoning_field(esc(reasoning)) + ',"tool_calls":' + tool_calls_array_json(calls)
         + '},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":' + String(n_prompt)
         + ',"completion_tokens":' + String(n_gen)
         + ',"total_tokens":' + String(n_prompt + n_gen) + "}}"
@@ -641,6 +659,13 @@ def output_message_json(content: String, status: String) -> String:
         + content + '","annotations":[]}]}'
     )
 
+def output_reasoning_json(reasoning: String, status: String) -> String:
+    """A Responses-API `reasoning` output item (`reasoning` pre-escaped)."""
+    return (
+        '{"type":"reasoning","id":"rs_millrace","status":"' + status
+        + '","summary":[{"type":"summary_text","text":"' + reasoning + '"}]}'
+    )
+
 def response_object_raw(model: String, output: String, status: String,
                         n_prompt: Int, n_gen: Int) -> String:
     """Responses-API `response` object with a pre-built `output` array (a list
@@ -652,13 +677,6 @@ def response_object_raw(model: String, output: String, status: String,
         + ',"output_tokens":' + String(n_gen)
         + ',"total_tokens":' + String(n_prompt + n_gen) + "}}"
     )
-
-def response_object_json(model: String, content: String, status: String, with_output: Bool,
-                         n_prompt: Int, n_gen: Int) -> String:
-    var output = String("[]")
-    if with_output:
-        output = "[" + output_message_json(content, "completed") + "]"
-    return response_object_raw(model, output, status, n_prompt, n_gen)
 
 def resp_event(type: String, payload: String) -> SseEvent:
     # Named SSE frame: an `event:` line plus a matching `"type"` in the JSON
@@ -803,12 +821,45 @@ struct Api(Handler, Copyable, Movable):
         var r = gen_full(s, ids, max_new, temp, top_k, top_p)
         var fin = String("stop") if r.stopped else String("length")
         print("  chat: ", len(r.ids), " tokens [", fin, "]", sep="")
+        var stats = millrace_stats(r)
+        var has_tools = req_has_tools(bv)
 
-        # Tool calls: only when the request advertised tools. Lift the model's
-        # <tool_call> blocks into OpenAI `tool_calls` rather than leaking the XML.
-        if req_has_tools(bv):
+        # Gemma: always post-process — split off the thinking channel (surfaced as
+        # `reasoning_content`) and lift any <|tool_call> blocks into `tool_calls`.
+        if s.family == FAMILY_GEMMA:
+            var pr = parse_gemma_tool_calls(bytes_to_string(s.tok.decode(r.ids)))
+            var content_e = esc(pr.content)
+            var reasoning_e = esc(pr.reasoning)
+            var emit_tools = has_tools and pr.has_calls()
+            if emit_tools:
+                print("    -> ", len(pr.calls), " tool call(s)", sep="")
+            if want_stream:
+                var ch = SseChannel()
+                ch.push(SseEvent.message(chunk_role_json(s.model_id)))
+                if pr.reasoning.byte_length() > 0:
+                    ch.push(SseEvent.message(chunk_reasoning_json(s.model_id, reasoning_e)))
+                if pr.content.byte_length() > 0:
+                    ch.push(SseEvent.message(chunk_json(s.model_id, content_e, False, fin)))
+                if emit_tools:
+                    for i in range(len(pr.calls)):
+                        ch.push(SseEvent.message(chunk_toolcall_json(s.model_id, i, pr.calls[i])))
+                    ch.push(SseEvent.message(chunk_json(s.model_id, "", True, "tool_calls")))
+                else:
+                    ch.push(SseEvent.message(chunk_json(s.model_id, "", True, fin, stats)))
+                ch.push(SseEvent.message("[DONE]"))
+                ch.close()
+                return sse_response(ch)
+            if emit_tools:
+                return ok_json(completion_tools_json(s.model_id, pr.content, pr.calls,
+                                                     len(ids), len(r.ids), pr.reasoning))
+            return ok_json(completion_json(s.model_id, content_e, len(ids), len(r.ids),
+                                           fin, stats, reasoning_e))
+
+        # Qwen: lift <tool_call> blocks only when the request advertised tools (a
+        # tools-less request that happens to emit the literal text stays content).
+        if has_tools:
             var _completion = bytes_to_string(s.tok.decode(r.ids))
-            var tc = parse_gemma_tool_calls(_completion) if s.family == FAMILY_GEMMA else parse_tool_calls(_completion)
+            var tc = parse_tool_calls(_completion)
             if tc.has_calls():
                 print("    -> ", len(tc.calls), " tool call(s)", sep="")
                 if want_stream:
@@ -824,7 +875,6 @@ struct Api(Handler, Copyable, Movable):
                     return sse_response(ch)
                 return ok_json(completion_tools_json(s.model_id, tc.content, tc.calls, len(ids), len(r.ids)))
 
-        var stats = millrace_stats(r)
         if want_stream:
             var ch = SseChannel()
             var deltas = stream_deltas(s, r.ids)
@@ -859,7 +909,16 @@ struct Api(Handler, Copyable, Movable):
         var want_stream = get_bool(bv0, "stream", False)
 
         var r = gen_full(s, ids, max_new, temp, top_k, top_p)
-        var full = json_escape_str(s.tok.decode(r.ids))
+        # Gemma: clean the thinking channel out of the message text and surface it
+        # as a reasoning item. Qwen: the decoded text is the message verbatim.
+        var reasoning_e = String("")
+        var full: String
+        if s.family == FAMILY_GEMMA:
+            var prg = parse_gemma_tool_calls(bytes_to_string(s.tok.decode(r.ids)))
+            full = esc(prg.content)
+            reasoning_e = esc(prg.reasoning)
+        else:
+            full = json_escape_str(s.tok.decode(r.ids))
         print("  responses: ", len(r.ids), " tokens", sep="")
 
         # Tool calls -> Responses `function_call` output items (only if requested).
@@ -894,33 +953,54 @@ struct Api(Handler, Copyable, Movable):
                 tch.close()
                 return sse_response(tch)
 
+        # Output array (a reasoning item first, when present, then the message).
+        var out_arr = String("[")
+        if reasoning_e.byte_length() > 0:
+            out_arr += output_reasoning_json(reasoning_e, "completed") + ","
+        out_arr += output_message_json(full, "completed") + "]"
+
         if not want_stream:
-            return ok_json(response_object_json(s.model_id, full, "completed", True, len(ids), len(r.ids)))
+            return ok_json(response_object_raw(s.model_id, out_arr, "completed", len(ids), len(r.ids)))
 
         var ch = SseChannel()
         ch.push(resp_event("response.created",
-            '"response":' + response_object_json(s.model_id, "", "in_progress", False, len(ids), 0)))
+            '"response":' + response_object_raw(s.model_id, "[]", "in_progress", len(ids), 0)))
+        var oidx = 0
+        if reasoning_e.byte_length() > 0:
+            ch.push(resp_event("response.output_item.added",
+                '"output_index":' + String(oidx) + ',"item":' + output_reasoning_json("", "in_progress")))
+            ch.push(resp_event("response.output_item.done",
+                '"output_index":' + String(oidx) + ',"item":' + output_reasoning_json(reasoning_e, "completed")))
+            oidx += 1
         ch.push(resp_event("response.output_item.added",
-            '"output_index":0,"item":{"type":"message","id":"' + MSG_ID
+            '"output_index":' + String(oidx) + ',"item":{"type":"message","id":"' + MSG_ID
             + '","status":"in_progress","role":"assistant","content":[]}'))
         ch.push(resp_event("response.content_part.added",
-            '"item_id":"' + MSG_ID
-            + '","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}'))
-        var deltas = stream_deltas(s, r.ids)
-        for i in range(len(deltas)):
-            ch.push(resp_event("response.output_text.delta",
-                '"item_id":"' + MSG_ID
-                + '","output_index":0,"content_index":0,"delta":"' + deltas[i] + '"'))
+            '"item_id":"' + MSG_ID + '","output_index":' + String(oidx)
+            + ',"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}'))
+        # Gemma's text is cleaned post-hoc, so it can't be streamed token-incrementally
+        # (the raw ids carry channel markers); send it as one delta. Qwen streams live.
+        if s.family == FAMILY_GEMMA:
+            if full.byte_length() > 0:
+                ch.push(resp_event("response.output_text.delta",
+                    '"item_id":"' + MSG_ID + '","output_index":' + String(oidx)
+                    + ',"content_index":0,"delta":"' + full + '"'))
+        else:
+            var deltas = stream_deltas(s, r.ids)
+            for i in range(len(deltas)):
+                ch.push(resp_event("response.output_text.delta",
+                    '"item_id":"' + MSG_ID + '","output_index":' + String(oidx)
+                    + ',"content_index":0,"delta":"' + deltas[i] + '"'))
         ch.push(resp_event("response.output_text.done",
-            '"item_id":"' + MSG_ID + '","output_index":0,"content_index":0,"text":"' + full + '"'))
+            '"item_id":"' + MSG_ID + '","output_index":' + String(oidx)
+            + ',"content_index":0,"text":"' + full + '"'))
         ch.push(resp_event("response.content_part.done",
-            '"item_id":"' + MSG_ID
-            + '","output_index":0,"content_index":0,"part":{"type":"output_text","text":"'
-            + full + '","annotations":[]}'))
+            '"item_id":"' + MSG_ID + '","output_index":' + String(oidx)
+            + ',"content_index":0,"part":{"type":"output_text","text":"' + full + '","annotations":[]}'))
         ch.push(resp_event("response.output_item.done",
-            '"output_index":0,"item":' + output_message_json(full, "completed")))
+            '"output_index":' + String(oidx) + ',"item":' + output_message_json(full, "completed")))
         ch.push(resp_event("response.completed",
-            '"response":' + response_object_json(s.model_id, full, "completed", True, len(ids), len(r.ids))))
+            '"response":' + response_object_raw(s.model_id, out_arr, "completed", len(ids), len(r.ids))))
         ch.close()
         return sse_response(ch)
 
