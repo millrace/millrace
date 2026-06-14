@@ -19,7 +19,7 @@ from toolcall import parse_gemma_tool_calls
 from json import parse_json
 
 comptime GEMMA_MAX_SEQ = 4096   # mirror server.GEMMA_MAX_SEQ
-comptime TMPL = "assets/gemma4-chat-template.jinja"
+comptime TMPL = "assets/qwen2.5-chat-template.jinja"   # placeholder; render_value(FAMILY_GEMMA) renders in Mojo
 comptime SNAP = "/Users/mseritan/.cache/huggingface/hub/models--mlx-community--gemma-4-12B-it-bf16/snapshots/afb7b215e9fe3b3eaef462b27d5c9d9b1ba0565b"
 
 
@@ -94,3 +94,22 @@ def main() raises:
     print("  parsed calls=", len(parsed.calls), " content=", repr(parsed.content), sep="")
     for ci in range(len(parsed.calls)):
         print("  call ", ci, ": ", parsed.calls[ci].name, " args=", parsed.calls[ci].arguments, sep="")
+
+    # Multi-turn: feed the tool result back; the model should answer in NL.
+    sess.pos = 0
+    var mbody = String('{"messages":[{"role":"user","content":"What is the weather in Paris? Use the tool."},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\": \\"Paris\\"}"}}]},{"role":"tool","tool_call_id":"c1","content":"22C and sunny"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get the weather for a city.","parameters":{"type":"object","properties":{"city":{"type":"string","description":"City name"}},"required":["city"]}}}]}')
+    var mrender = render_value(tmpl, parse_json(mbody), FAMILY_GEMMA)
+    var mids = tok.encode(_bytes(mrender))
+    var mlogits = sess_prefill_suffix(ctx, gw, sess, mids, 0, True)
+    var mgen = List[Int]()
+    var mnxt = argmax_f(mlogits)
+    var msteps = 0
+    while msteps < 40 and mnxt != cfg.eos1 and mnxt != cfg.eos2:
+        mgen.append(mnxt)
+        mlogits = sess_step(ctx, gw, sess, mnxt)
+        mnxt = argmax_f(mlogits)
+        msteps += 1
+    var mtext = String(StringSlice(unsafe_from_utf8=Span(tok.decode(mgen))))
+    var mclean = parse_gemma_tool_calls(mtext)
+    print("MULTITURN prompt_toks=", len(mids), " raw=", repr(mtext), sep="")
+    print("  served content=", repr(mclean.content), sep="")

@@ -373,6 +373,30 @@ def _extract_gemma_call(inner: List[UInt8], mut calls: List[ToolCall]) -> Bool:
         return False
 
 
+def _strip_gemma_channels(b: List[UInt8]) raises -> String:
+    """Remove Gemma's `<|channel>thought…<channel|>` spans (the model's hidden
+    reasoning / the empty thought channel it emits in non-thinking mode) plus any
+    stray channel markers, leaving just the answer text. (Reasoning is dropped,
+    not yet surfaced as a separate field.)"""
+    var OPEN = string_to_bytes(String("<|channel>"))
+    var CLOSE = string_to_bytes(String("<channel|>"))
+    var out = List[UInt8]()
+    var i = 0
+    var n = len(b)
+    while i < n:
+        if _at(b, i, OPEN):
+            var j = _find(b, CLOSE, i + len(OPEN))
+            if j < 0:
+                break                       # unterminated channel → drop the rest
+            i = j + len(CLOSE)
+        elif _at(b, i, CLOSE):
+            i += len(CLOSE)                 # stray close marker
+        else:
+            out.append(b[i])
+            i += 1
+    return String(bytes_to_string(out).strip())
+
+
 def parse_gemma_tool_calls(text: String) raises -> ParsedReply:
     """Split a Gemma completion into surrounding text + structured tool calls.
 
@@ -407,4 +431,4 @@ def parse_gemma_tool_calls(text: String) raises -> ParsedReply:
             var keep_end = (c + len(CLOSE)) if c >= 0 else n
             content += _slice(b, o, keep_end)
         pos = (c + len(CLOSE)) if c >= 0 else n
-    return ParsedReply(String(bytes_to_string(content).strip()), calls^)
+    return ParsedReply(_strip_gemma_channels(content), calls^)

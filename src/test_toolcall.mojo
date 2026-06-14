@@ -122,6 +122,20 @@ def main() raises:
     expect(g6.has_calls() and g6.calls[0].name == "get_weather", "g6: truncated recovered", all_ok)
     expect(g6.calls[0].arguments.find("Cluj") >= 0, "g6: args=" + g6.calls[0].arguments, all_ok)
 
+    # G7. empty thought channel (non-thinking mode) stripped from content
+    var g7 = parse_gemma_tool_calls(
+        String("<|channel>thought\n<channel|>The weather in Paris is 22\xc2\xb0C and sunny.")
+    )
+    expect(not g7.has_calls(), "g7: no calls", all_ok)
+    expect(g7.content == "The weather in Paris is 22\xc2\xb0C and sunny.",
+           "g7: cleaned=[" + g7.content + "]", all_ok)
+
+    # G8. thinking-channel reasoning dropped, answer kept
+    var g8 = parse_gemma_tool_calls(
+        String("<|channel>thought\nlet me work it out<channel|>The answer is 4.")
+    )
+    expect(g8.content == "The answer is 4.", "g8: cleaned=[" + g8.content + "]", all_ok)
+
     if all_ok:
         print("toolcall gate: PASS")
     else:

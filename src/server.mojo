@@ -71,7 +71,6 @@ comptime BLOCK_TOK = 256
 comptime KV_BUDGET_BYTES = 8 * 1024 * 1024 * 1024   # 8 GB LRU cap
 
 comptime TEMPLATE = "assets/qwen2.5-chat-template.jinja"
-comptime GEMMA_TEMPLATE = "assets/gemma4-chat-template.jinja"
 # Default served model ids by detected arch (used when no explicit id is given on
 # the CLI). The served id is otherwise whatever `serve <hf-id>` was launched with,
 # and is what /v1/models and every response report.
@@ -1108,7 +1107,10 @@ def main() raises:
             tok = load_tokenizer_json(tok_json)
     else:
         tok = load_tokenizer("tests/fixtures/tokenizer/")
-    var tmpl = load_chat_template(GEMMA_TEMPLATE if family == FAMILY_GEMMA else TEMPLATE)
+    # The Qwen template drives render_value for Qwen; Gemma renders in pure Mojo
+    # (render_gemma) and ignores tmpl, but ServerState still needs a Template, so
+    # this is loaded as a placeholder for the Gemma path.
+    var tmpl = load_chat_template(TEMPLATE)
     var ctx = DeviceContext()
 
     # Primary (chat) model, loaded by family. Qwen and Gemma have different weight

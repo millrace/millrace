@@ -10,10 +10,10 @@ under the same 1.0.0b2 nightly the GPU engine needs — unlike flare, §11 #11).
 """
 
 from template import Template
-from value import Value, VBOOL
+from value import Value
 from json import parse_json, bytes_to_string, string_to_bytes
 from model_iface import FAMILY_QWEN, FAMILY_GEMMA
-from gemma_tools import format_gemma_tools
+from gemma_chat import render_gemma
 
 
 def _hex_nibble(n: Int) -> UInt8:
@@ -69,12 +69,14 @@ def render_value(tmpl: Template, req: Value, family: Int = FAMILY_QWEN) raises -
     inputs transformers' apply_chat_template takes — so we pass them straight
     through, adding `add_generation_prompt`.
 
-    For Gemma (`family == FAMILY_GEMMA`) two extra context vars are set, which its
-    template requires (jinja2.mojo raises on undefined): `enable_thinking` (opt-in
-    via the request's `enable_thinking` bool) and `gemma_tools_block` — the tool
-    definitions pre-rendered into Gemma's <|tool>…<tool|> declaration format here,
-    because jinja2.mojo has no macros to build it in-template.
+    Gemma (`family == FAMILY_GEMMA`) does not go through Jinja at all — its prompt
+    format (model-turn folding of tool messages, tool-call/result formatting, the
+    thinking channel) is beyond jinja2.mojo, so it's rendered in Mojo by
+    `render_gemma`; `tmpl` is ignored for Gemma.
     """
+    if family == FAMILY_GEMMA:
+        return render_gemma(req)
+
     var msgs = req.map_get("messages")
     if not msgs:
         raise Error("request has no 'messages' array")
@@ -84,20 +86,10 @@ def render_value(tmpl: Template, req: Value, family: Int = FAMILY_QWEN) raises -
     ctx.map_set("add_generation_prompt", Value.bool(True))
 
     var tools = req.map_get("tools")
-    var have_tools = tools and not tools.value().is_none()
-    if have_tools:
+    if tools and not tools.value().is_none():
         ctx.map_set("tools", tools.value())
     else:
         ctx.map_set("tools", Value.none())
-
-    if family == FAMILY_GEMMA:
-        var et = req.map_get("enable_thinking")
-        var think = Bool(et) and et.value().tag == VBOOL and et.value().b
-        ctx.map_set("enable_thinking", Value.bool(think))
-        var block = String("")
-        if have_tools:
-            block = format_gemma_tools(tools.value())
-        ctx.map_set("gemma_tools_block", Value.string(block))
 
     return tmpl.render(ctx^, 0)
 

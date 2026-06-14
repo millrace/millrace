@@ -40,7 +40,7 @@ def _less(a: String, b: String) -> Bool:
     return len(ab) < len(bb)
 
 
-def _dictsort(v: Value) -> List[Int]:
+def dictsort(v: Value) -> List[Int]:
     """Indices into v's parallel keys/vals, sorted alphabetically by key."""
     var idx = List[Int]()
     for i in range(len(v.c[].keys)):
@@ -110,7 +110,7 @@ def format_argument(arg: Value, escape_keys: Bool) raises -> String:
     if arg.tag == VMAP:
         var out = String("{")
         var first = True
-        var idx = _dictsort(arg)
+        var idx = dictsort(arg)
         for ii in range(len(idx)):
             if not first:
                 out += ","
@@ -143,7 +143,7 @@ def _format_items(items: Value) raises -> String:
     """The ARRAY `items:{…}` body (dictsort over item keys, type-special)."""
     var out = String("")
     var first = True
-    var idx = _dictsort(items)
+    var idx = dictsort(items)
     for ii in range(len(idx)):
         var key = items.c[].keys[idx[ii]]
         var val = items.c[].vals[idx[ii]]
@@ -229,7 +229,7 @@ def _property_body(value: Value) raises -> String:
 def format_parameters(properties: Value, filter_keys: Bool) raises -> String:
     var out = String("")
     var found_first = False
-    var idx = _dictsort(properties)
+    var idx = dictsort(properties)
     for ii in range(len(idx)):
         var key = properties.c[].keys[idx[ii]]
         if filter_keys and _is_standard(key):

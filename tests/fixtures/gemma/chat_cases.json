@@ -38,5 +38,25 @@
   "name": "tools+thinking",
   "body": "{\"messages\": [{\"role\": \"user\", \"content\": \"go\"}], \"tools\": [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"units\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"], \"description\": \"Temperature units\"}}, \"required\": [\"city\"]}}}], \"enable_thinking\": true}",
   "want": "<bos><|turn>system\n<|think|>\n<|tool>declaration:get_weather{description:<|\"|>Get weather for a city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name<|\"|>,type:<|\"|>STRING<|\"|>},units:{description:<|\"|>Temperature units<|\"|>,enum:[<|\"|>c<|\"|>,<|\"|>f<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\ngo<turn|>\n<|turn>model\n"
+ },
+ {
+  "name": "tc string-args",
+  "body": "{\"messages\": [{\"role\": \"user\", \"content\": \"weather in Paris?\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_1\", \"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"arguments\": \"{\\\"city\\\": \\\"Paris\\\"}\"}}]}, {\"role\": \"tool\", \"tool_call_id\": \"call_1\", \"content\": \"15C clear\"}]}",
+  "want": "<bos><|turn>user\nweather in Paris?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{{\"city\": \"Paris\"}}<tool_call|><|tool_response>response:get_weather{value:<|\"|>15C clear<|\"|>}<tool_response|>"
+ },
+ {
+  "name": "tc dict-args",
+  "body": "{\"messages\": [{\"role\": \"user\", \"content\": \"weather?\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"c1\", \"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"units\": \"c\"}}}]}, {\"role\": \"tool\", \"tool_call_id\": \"c1\", \"content\": \"15C\"}]}",
+  "want": "<bos><|turn>user\nweather?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,units:<|\"|>c<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>15C<|\"|>}<tool_response|>"
+ },
+ {
+  "name": "tc full+newuser",
+  "body": "{\"messages\": [{\"role\": \"user\", \"content\": \"weather in Paris?\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_1\", \"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"arguments\": \"{\\\"city\\\": \\\"Paris\\\"}\"}}]}, {\"role\": \"tool\", \"tool_call_id\": \"call_1\", \"content\": \"15C clear\"}, {\"role\": \"assistant\", \"content\": \"It's 15C and clear in Paris.\"}, {\"role\": \"user\", \"content\": \"and tomorrow?\"}]}",
+  "want": "<bos><|turn>user\nweather in Paris?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{{\"city\": \"Paris\"}}<tool_call|><|tool_response>response:get_weather{value:<|\"|>15C clear<|\"|>}<tool_response|>It's 15C and clear in Paris.<turn|>\n<|turn>user\nand tomorrow?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+ },
+ {
+  "name": "tc multi-call",
+  "body": "{\"messages\": [{\"role\": \"user\", \"content\": \"two cities?\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"a\", \"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}}, {\"id\": \"b\", \"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Lyon\"}}}]}, {\"role\": \"tool\", \"tool_call_id\": \"a\", \"content\": \"15C\"}, {\"role\": \"tool\", \"tool_call_id\": \"b\", \"content\": \"18C\"}]}",
+  "want": "<bos><|turn>user\ntwo cities?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|><|tool_call>call:get_weather{city:<|\"|>Lyon<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>15C<|\"|>}<tool_response|><|tool_response>response:get_weather{value:<|\"|>18C<|\"|>}<tool_response|>"
  }
 ]
