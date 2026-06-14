@@ -1,0 +1,83 @@
+{
+  "config": {
+    "repeats": 5,
+    "warmup": 1,
+    "max_tokens": 128,
+    "temperature": 0.0,
+    "timeout": 600,
+    "cooldown": 5,
+    "targets": [
+      {
+        "label": "mlx",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "model": "mlx-community/Qwen2.5-3B-Instruct-4bit"
+      }
+    ]
+  },
+  "results": {
+    "mlx": {
+      "model": "mlx-community/Qwen2.5-3B-Instruct-4bit",
+      "prompts": {
+        "short": {
+          "prefill_ms": {
+            "median": 221.11170797143131,
+            "min": 219.8549589375034,
+            "max": 240.56412500794977,
+            "n": 5
+          },
+          "decode_tps": {
+            "median": 51.732815946618096,
+            "min": 48.649173789385394,
+            "max": 51.969740107370015,
+            "n": 5
+          },
+          "prompt_tokens": 71
+        },
+        "medium": {
+          "prefill_ms": {
+            "median": 273.69095804169774,
+            "min": 271.6660830192268,
+            "max": 275.05691698752344,
+            "n": 5
+          },
+          "decode_tps": {
+            "median": 51.686990100031174,
+            "min": 51.604804442675224,
+            "max": 51.75244160502827,
+            "n": 5
+          },
+          "prompt_tokens": 104
+        },
+        "long-code": {
+          "prefill_ms": {
+            "median": 2798.0237499577925,
+            "min": 2795.8747500088066,
+            "max": 2827.5048750219867,
+            "n": 5
+          },
+          "decode_tps": {
+            "median": 47.75476760111989,
+            "min": 47.5298771129125,
+            "max": 48.71679279323687,
+            "n": 5
+          },
+          "prompt_tokens": 1570
+        },
+        "_cold_warm": {
+          "cold_ms": {
+            "median": 2889.2049581045285,
+            "min": 2877.532207989134,
+            "max": 2913.4926249971613,
+            "n": 5
+          },
+          "warm_ms": {
+            "median": 192.17791606206447,
+            "min": 190.90299995150417,
+            "max": 193.86825000401586,
+            "n": 5
+          }
+        }
+      }
+    }
+  }
+}

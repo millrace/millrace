@@ -1,0 +1,98 @@
+{
+  "config": {
+    "repeats": 5,
+    "warmup": 1,
+    "max_tokens": 128,
+    "temperature": 0.0,
+    "timeout": 600,
+    "cooldown": 5,
+    "targets": [
+      {
+        "label": "millrace",
+        "base_url": "http://127.0.0.1:8000/v1",
+        "model": "auto"
+      },
+      {
+        "label": "mlx",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "model": "auto"
+      },
+      {
+        "label": "ollama-0.5b",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "model": "qwen2.5:0.5b"
+      },
+      {
+        "label": "ollama-3b",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "model": "qwen2.5:3b"
+      }
+    ]
+  },
+  "results": {
+    "millrace": {
+      "model": "google/gemma-4-12b-it-int4",
+      "prompts": {
+        "short": {
+          "prefill_ms": {
+            "median": 703.1921250745654,
+            "min": 699.5123330270872,
+            "max": 716.8098749825731,
+            "n": 5
+          },
+          "decode_tps": {
+            "median": 6.155448819763213,
+            "min": 5.854125371155718,
+            "max": 6.375353118912552,
+            "n": 5
+          },
+          "prompt_tokens": 55
+        },
+        "medium": {
+          "prefill_ms": {
+            "median": 1403.73358305078,
+            "min": 1350.0301250023767,
+            "max": 1410.7387920375913,
+            "n": 5
+          },
+          "decode_tps": {
+            "median": 5.846508785212248,
+            "min": 5.832593944917698,
+            "max": 5.8832279657296125,
+            "n": 5
+          },
+          "prompt_tokens": 90
+        },
+        "long-code": {
+          "prefill_ms": {
+            "median": 25782.870916067623,
+            "min": 25722.67358296085,
+            "max": 26018.991915974766,
+            "n": 5
+          },
+          "decode_tps": {
+            "median": 3.7462756774501558,
+            "min": 3.719617239194375,
+            "max": 3.7568287618850675,
+            "n": 5
+          },
+          "prompt_tokens": 1794
+        },
+        "_cold_warm": {
+          "cold_ms": {
+            "median": 25822.43708393071,
+            "min": 25804.867666913196,
+            "max": 26595.602666959167,
+            "n": 5
+          },
+          "warm_ms": {
+            "median": 2502.7082500746474,
+            "min": 2499.917250010185,
+            "max": 2521.0368329426274,
+            "n": 5
+          }
+        }
+      }
+    }
+  }
+}
