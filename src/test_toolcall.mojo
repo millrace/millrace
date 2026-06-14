@@ -5,7 +5,7 @@ multiple calls, a call wrapped in prose, no call at all, and a malformed block �
 and checks the extracted name/arguments and leftover content.
 """
 
-from toolcall import parse_tool_calls, ParsedReply
+from toolcall import parse_tool_calls, parse_gemma_tool_calls, ParsedReply
 
 
 def expect(cond: Bool, msg: String, mut ok: Bool):
@@ -74,6 +74,53 @@ def main() raises:
     var r9 = parse_tool_calls(String("<tool_call>\n{{{ junk\n</tool_call>"))
     expect(not r9.has_calls(), "9: garbage should yield no call", all_ok)
     expect(r9.content.find("junk") >= 0, "9: garbage kept in content", all_ok)
+
+    # ── Gemma generated tool-call format: <|tool_call>call:NAME{…}<tool_call|> ──
+    # Args use Gemma's serialization (bare keys, <|"|>-quoted strings, bare
+    # numbers/bools, nested {}/[]) → re-serialized to OpenAI JSON (sorted keys).
+
+    # G1. single call, mixed arg types (dictsort order: city,days,detailed,units)
+    var g1 = parse_gemma_tool_calls(
+        String('<|tool_call>call:get_weather{city:<|"|>Paris<|"|>,days:3,detailed:true,units:<|"|>c<|"|>}<tool_call|>')
+    )
+    expect(g1.has_calls() and len(g1.calls) == 1, "g1: one call", all_ok)
+    expect(g1.calls[0].name == "get_weather", "g1: name=" + g1.calls[0].name, all_ok)
+    expect(g1.calls[0].arguments == '{"city": "Paris", "days": 3, "detailed": true, "units": "c"}',
+           "g1: args=" + g1.calls[0].arguments, all_ok)
+    expect(g1.content == "", "g1: content=[" + g1.content + "]", all_ok)
+
+    # G2. multiple calls; the second has empty args
+    var g2 = parse_gemma_tool_calls(
+        String('<|tool_call>call:a{x:1}<tool_call|><|tool_call>call:noargs{}<tool_call|>')
+    )
+    expect(len(g2.calls) == 2, "g2: two calls", all_ok)
+    expect(g2.calls[0].name == "a" and g2.calls[1].name == "noargs", "g2: names", all_ok)
+    expect(g2.calls[0].arguments == '{"x": 1}', "g2: args0=" + g2.calls[0].arguments, all_ok)
+    expect(g2.calls[1].arguments == "{}", "g2: empty=" + g2.calls[1].arguments, all_ok)
+
+    # G3. nested object + array of strings
+    var g3 = parse_gemma_tool_calls(
+        String('<|tool_call>call:nested{filter:{min:1,tags:[<|"|>a<|"|>,<|"|>b<|"|>]},q:<|"|>hi<|"|>}<tool_call|>')
+    )
+    expect(len(g3.calls) == 1 and g3.calls[0].name == "nested", "g3: name", all_ok)
+    expect(g3.calls[0].arguments == '{"filter": {"min": 1, "tags": ["a", "b"]}, "q": "hi"}',
+           "g3: args=" + g3.calls[0].arguments, all_ok)
+
+    # G4. prose before the call -> content; call still extracted
+    var g4 = parse_gemma_tool_calls(
+        String('let me check<|tool_call>call:search{q:<|"|>x<|"|>}<tool_call|>')
+    )
+    expect(len(g4.calls) == 1 and g4.content == "let me check", "g4: content=[" + g4.content + "]", all_ok)
+
+    # G5. plain answer (no tool call) passes through as content
+    var g5 = parse_gemma_tool_calls(String("Paris is the capital of France."))
+    expect(not g5.has_calls(), "g5: no calls", all_ok)
+    expect(g5.content == "Paris is the capital of France.", "g5: content", all_ok)
+
+    # G6. truncated: no closing <tool_call|> -> parse what's there
+    var g6 = parse_gemma_tool_calls(String('<|tool_call>call:get_weather{city:<|"|>Cluj<|"|>'))
+    expect(g6.has_calls() and g6.calls[0].name == "get_weather", "g6: truncated recovered", all_ok)
+    expect(g6.calls[0].arguments.find("Cluj") >= 0, "g6: args=" + g6.calls[0].arguments, all_ok)
 
     if all_ok:
         print("toolcall gate: PASS")

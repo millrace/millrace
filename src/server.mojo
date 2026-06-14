@@ -42,7 +42,7 @@ from model import (
 from tokenizer import Tokenizer, load_tokenizer, load_tokenizer_json, load_gemma_tokenizer_json
 from gemma import GemmaWeights, load_gemma_weights, G_NLAYERS
 from chat import load_chat_template, render_value, json_escape_str
-from toolcall import parse_tool_calls, ToolCall
+from toolcall import parse_tool_calls, parse_gemma_tool_calls, ParsedReply, ToolCall
 from blockcache import BlockCache
 from template import Template
 from value import Value
@@ -60,6 +60,10 @@ comptime MAX_SEQ = 32768
 # cache + the secondary embed model fit a 24 GB unified GPU: 4096 * 768 KiB ≈
 # 3.2 GB (raise on a larger machine).
 comptime GEMMA_MAX_SEQ = 4096
+# Gemma emits this after finishing its tool call(s); it marks the model's
+# turn boundary (the tool result goes next). Stop decoding there so we don't
+# greedily hallucinate a fake tool result past the call.
+comptime GEMMA_TOOL_RESPONSE = 50
 
 # Disk-backed prefix cache: K/V persisted in BLOCK_TOK-token blocks so prefills
 # survive restarts and are shared across conversations (blockcache.mojo).
@@ -384,7 +388,7 @@ def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
             sample(process_logits(logits, context, temp, top_k, top_p, DEF_REP), rng)
             if temp > 0.0 else argmax_f(logits)
         )
-        if nxt == s.eos1 or nxt == s.eos2:
+        if nxt == s.eos1 or nxt == s.eos2 or (s.family == FAMILY_GEMMA and nxt == GEMMA_TOOL_RESPONSE):
             stopped = True
             break
         gen.append(nxt)
@@ -804,7 +808,8 @@ struct Api(Handler, Copyable, Movable):
         # Tool calls: only when the request advertised tools. Lift the model's
         # <tool_call> blocks into OpenAI `tool_calls` rather than leaking the XML.
         if req_has_tools(bv):
-            var tc = parse_tool_calls(bytes_to_string(s.tok.decode(r.ids)))
+            var _completion = bytes_to_string(s.tok.decode(r.ids))
+            var tc = parse_gemma_tool_calls(_completion) if s.family == FAMILY_GEMMA else parse_tool_calls(_completion)
             if tc.has_calls():
                 print("    -> ", len(tc.calls), " tool call(s)", sep="")
                 if want_stream:
@@ -860,7 +865,8 @@ struct Api(Handler, Copyable, Movable):
 
         # Tool calls -> Responses `function_call` output items (only if requested).
         if req_has_tools(bv0):
-            var tc = parse_tool_calls(bytes_to_string(s.tok.decode(r.ids)))
+            var _completion = bytes_to_string(s.tok.decode(r.ids))
+            var tc = parse_gemma_tool_calls(_completion) if s.family == FAMILY_GEMMA else parse_tool_calls(_completion)
             if tc.has_calls():
                 print("    -> ", len(tc.calls), " tool call(s)", sep="")
                 var out_arr = function_calls_output_json(tc.calls)

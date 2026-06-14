@@ -19,6 +19,13 @@ Pure CPU + JSON only (no GPU) — unit-tested via `pixi run test-toolcall`.
 from json import parse_json, to_json, string_to_bytes, bytes_to_string
 from value import Value, VSTR
 
+# Gemma 4 generated tool-call markers (single control tokens; decode to this
+# literal text). Args use Gemma's serialization (NOT JSON): bare keys, strings
+# quoted with the <|"|> token, bare numbers/true/false, nested {}/[].
+comptime _G_QUOTE = "<|\"|>"
+comptime _G_OPEN = "<|tool_call>"
+comptime _G_CLOSE = "<tool_call|>"
+
 
 struct ToolCall(Movable, Copyable):
     var name: String       # function name
@@ -224,4 +231,180 @@ def parse_tool_calls(text: String) raises -> ParsedReply:
             content += _slice(b, o, advanced)  # beyond repair — keep verbatim
         pos = advanced
 
+    return ParsedReply(String(bytes_to_string(content).strip()), calls^)
+
+
+# ── Gemma tool-call parsing (format differs from Qwen's JSON blocks) ──────────
+
+
+def _is_ws(c: UInt8) -> Bool:
+    return c == 32 or c == 9 or c == 10 or c == 13
+
+
+def _at(b: List[UInt8], i: Int, needle: List[UInt8]) -> Bool:
+    """Whether `needle` occurs at index `i` in `b`."""
+    if i < 0 or i + len(needle) > len(b):
+        return False
+    for j in range(len(needle)):
+        if b[i + j] != needle[j]:
+            return False
+    return True
+
+
+def _g_string(b: List[UInt8], mut i: Int, quote: List[UInt8]) raises -> Value:
+    """Parse `<|"|>…<|"|>`; `i` is at the opening quote token."""
+    i += len(quote)
+    var start = i
+    while i < len(b) and not _at(b, i, quote):
+        i += 1
+    var s = String(bytes_to_string(_slice(b, start, i)))
+    if i < len(b):
+        i += len(quote)
+    return Value.string(s^)
+
+
+def _g_number(b: List[UInt8], mut i: Int) raises -> Value:
+    var start = i
+    var is_float = False
+    while i < len(b):
+        var c = b[i]
+        if (c >= 48 and c <= 57) or c == 45 or c == 43:        # digit - +
+            i += 1
+        elif c == 46 or c == 101 or c == 69:                   # . e E
+            is_float = True
+            i += 1
+        else:
+            break
+    var s = String(bytes_to_string(_slice(b, start, i)))
+    if is_float:
+        return Value.float(atof(s))
+    return Value.int(Int(atol(s)))
+
+
+def _g_value(b: List[UInt8], mut i: Int, quote: List[UInt8]) raises -> Value:
+    while i < len(b) and _is_ws(b[i]):
+        i += 1
+    if _at(b, i, quote):
+        return _g_string(b, i, quote)
+    if i < len(b) and b[i] == 123:                             # {
+        return _g_object(b, i, quote)
+    if i < len(b) and b[i] == 91:                              # [
+        return _g_array(b, i, quote)
+    if _at(b, i, string_to_bytes(String("true"))):
+        i += 4
+        return Value.bool(True)
+    if _at(b, i, string_to_bytes(String("false"))):
+        i += 5
+        return Value.bool(False)
+    if _at(b, i, string_to_bytes(String("null"))):
+        i += 4
+        return Value.none()
+    return _g_number(b, i)
+
+
+def _g_object(b: List[UInt8], mut i: Int, quote: List[UInt8]) raises -> Value:
+    i += 1                                                     # consume {
+    var v = Value.mapping()
+    while True:
+        while i < len(b) and _is_ws(b[i]):
+            i += 1
+        if i >= len(b) or b[i] == 125:                         # }
+            break
+        var ks = i
+        while i < len(b) and b[i] != 58 and b[i] != 125:       # key until ':' / '}'
+            i += 1
+        var key = String(bytes_to_string(_slice(b, ks, i)).strip())
+        if i < len(b) and b[i] == 58:                          # consume ':'
+            i += 1
+        var val = _g_value(b, i, quote)
+        v.map_set(key, val^)
+        while i < len(b) and _is_ws(b[i]):
+            i += 1
+        if i < len(b) and b[i] == 44:                          # consume ','
+            i += 1
+    if i < len(b) and b[i] == 125:                             # consume }
+        i += 1
+    return v
+
+
+def _g_array(b: List[UInt8], mut i: Int, quote: List[UInt8]) raises -> Value:
+    i += 1                                                     # consume [
+    var items = List[Value]()
+    while True:
+        while i < len(b) and _is_ws(b[i]):
+            i += 1
+        if i >= len(b) or b[i] == 93:                          # ]
+            break
+        items.append(_g_value(b, i, quote))
+        while i < len(b) and _is_ws(b[i]):
+            i += 1
+        if i < len(b) and b[i] == 44:
+            i += 1
+    if i < len(b) and b[i] == 93:                              # consume ]
+        i += 1
+    return Value.list_of(items^)
+
+
+def _extract_gemma_call(inner: List[UInt8], mut calls: List[ToolCall]) -> Bool:
+    """Parse one `call:NAME{…}` body; append a ToolCall (args → JSON string).
+    Defensive — any malformed body returns False so it's kept verbatim."""
+    try:
+        var quote = string_to_bytes(String(_G_QUOTE))
+        var i = 0
+        var n = len(inner)
+        while i < n and _is_ws(inner[i]):
+            i += 1
+        if not _at(inner, i, string_to_bytes(String("call:"))):
+            return False
+        i += 5
+        var ns = i
+        while i < n and inner[i] != 123:                       # name until '{'
+            i += 1
+        var name = String(bytes_to_string(_slice(inner, ns, i)).strip())
+        if name.byte_length() == 0:
+            return False
+        var args_json = String("{}")
+        if i < n and inner[i] == 123:
+            var obj = _g_object(inner, i, quote)
+            args_json = to_json(obj, 0)
+        calls.append(ToolCall(name^, args_json^))
+        return True
+    except:
+        return False
+
+
+def parse_gemma_tool_calls(text: String) raises -> ParsedReply:
+    """Split a Gemma completion into surrounding text + structured tool calls.
+
+    Scans for `<|tool_call>call:NAME{…}<tool_call|>` spans (Gemma's emitted
+    format), parses NAME + the Gemma-serialized args into OpenAI `arguments`
+    (a JSON string). Text outside spans is `content`; an unparseable span is
+    kept verbatim. A trailing span with no closing token (truncated) is parsed
+    from what's there."""
+    var b = string_to_bytes(text)
+    var OPEN = string_to_bytes(String(_G_OPEN))
+    var CLOSE = string_to_bytes(String(_G_CLOSE))
+    var content = List[UInt8]()
+    var calls = List[ToolCall]()
+    var pos = 0
+    var n = len(b)
+    # `<|tool_response>` is the model's turn boundary after emitting tool calls;
+    # greedy decode often runs past it and hallucinates a tool result. Anything
+    # from that marker on is not the model's real content, so cut it off.
+    var tr = _find(b, string_to_bytes(String("<|tool_response>")), 0)
+    if tr >= 0:
+        n = tr
+    while pos < n:
+        var o = _find(b, OPEN, pos)
+        if o < 0:
+            content += _slice(b, pos, n)
+            break
+        content += _slice(b, pos, o)
+        var inner_start = o + len(OPEN)
+        var c = _find(b, CLOSE, inner_start)
+        var end = c if c >= 0 else n
+        if not _extract_gemma_call(_slice(b, inner_start, end), calls):
+            var keep_end = (c + len(CLOSE)) if c >= 0 else n
+            content += _slice(b, o, keep_end)
+        pos = (c + len(CLOSE)) if c >= 0 else n
     return ParsedReply(String(bytes_to_string(content).strip()), calls^)

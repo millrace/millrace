@@ -10,10 +10,13 @@ server drives, minus flare. Loads the ~7 GB int4 model, so it's a manual test.
 from std.gpu.host import DeviceContext
 from gemma import load_gemma_weights, GemmaWeights, G_NLAYERS
 from engine import new_session, sess_prefill_suffix, sess_step, argmax_f, Session
-from chat import load_chat_template, render_request
+from chat import load_chat_template, render_value
 from tokenizer import load_gemma_tokenizer_json, Tokenizer
 from tensor_ops import probe_simd_gemm
 from template import Template
+from model_iface import FAMILY_GEMMA
+from toolcall import parse_gemma_tool_calls
+from json import parse_json
 
 comptime GEMMA_MAX_SEQ = 4096   # mirror server.GEMMA_MAX_SEQ
 comptime TMPL = "assets/gemma4-chat-template.jinja"
@@ -31,7 +34,7 @@ def run_prompt(ctx: DeviceContext, mut gw: GemmaWeights, mut sess: Session,
                tok: Tokenizer, tmpl: Template, eos1: Int, eos2: Int,
                idx: Int, body: String) raises:
     sess.pos = 0
-    var rendered = render_request(tmpl, body)
+    var rendered = render_value(tmpl, parse_json(body), FAMILY_GEMMA)
     var ids = tok.encode(_bytes(rendered))
     var logits = sess_prefill_suffix(ctx, gw, sess, ids, 0, True)
     var gen = List[Int]()
@@ -70,3 +73,24 @@ def main() raises:
         '{"messages":[{"role":"user","content":"What is the capital of France? Answer in one word."}]}')
     run_prompt(ctx, gw, sess, tok, tmpl, cfg.eos1, cfg.eos2, 1,
         '{"messages":[{"role":"user","content":"Name the first four planets from the Sun."}]}')
+
+    # Tool-call round trip: render a tool definition, generate, parse the call.
+    sess.pos = 0
+    var tbody = String('{"messages":[{"role":"user","content":"What is the weather in Paris? Use the tool."}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get the weather for a city.","parameters":{"type":"object","properties":{"city":{"type":"string","description":"City name"}},"required":["city"]}}}]}')
+    var trender = render_value(tmpl, parse_json(tbody), FAMILY_GEMMA)
+    var tids = tok.encode(_bytes(trender))
+    var tlogits = sess_prefill_suffix(ctx, gw, sess, tids, 0, True)
+    var tgen = List[Int]()
+    var tnxt = argmax_f(tlogits)
+    var tsteps = 0
+    while tsteps < 60 and tnxt != cfg.eos1 and tnxt != cfg.eos2:
+        tgen.append(tnxt)
+        tlogits = sess_step(ctx, gw, sess, tnxt)
+        tnxt = argmax_f(tlogits)
+        tsteps += 1
+    var ttext = String(StringSlice(unsafe_from_utf8=Span(tok.decode(tgen))))
+    print("TOOL prompt_toks=", len(tids), " raw=", repr(ttext), sep="")
+    var parsed = parse_gemma_tool_calls(ttext)
+    print("  parsed calls=", len(parsed.calls), " content=", repr(parsed.content), sep="")
+    for ci in range(len(parsed.calls)):
+        print("  call ", ci, ": ", parsed.calls[ci].name, " args=", parsed.calls[ci].arguments, sep="")
