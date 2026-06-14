@@ -37,8 +37,9 @@ from model import (
     Weights, load_weights, probe_simd_gemm, EOS1, EOS2,
     Session, new_session, sess_prefill_suffix, sess_step,
     argmax_f, process_logits, sample, sess_embed,
+    FAMILY_QWEN, FAMILY_GEMMA,
 )
-from tokenizer import Tokenizer, load_tokenizer, load_tokenizer_json
+from tokenizer import Tokenizer, load_tokenizer, load_tokenizer_json, load_gemma_tokenizer_json
 from chat import load_chat_template, render_value, json_escape_str
 from toolcall import parse_tool_calls, ToolCall
 from blockcache import BlockCache
@@ -58,6 +59,7 @@ comptime BLOCK_TOK = 256
 comptime KV_BUDGET_BYTES = 8 * 1024 * 1024 * 1024   # 8 GB LRU cap
 
 comptime TEMPLATE = "assets/qwen2.5-chat-template.jinja"
+comptime GEMMA_TEMPLATE = "assets/gemma4-chat-template.jinja"
 # Default served model ids by detected arch (used when no explicit id is given on
 # the CLI). The served id is otherwise whatever `serve <hf-id>` was launched with,
 # and is what /v1/models and every response report.
@@ -880,6 +882,19 @@ def read_text(path: String) raises -> String:
         return f.read()
 
 
+def _detect_family(ckpt_dir: String) raises -> Int:
+    """Model family from the checkpoint's config.json `model_type` (FAMILY_GEMMA
+    for any gemma* type, else FAMILY_QWEN). Drives tokenizer + chat-template
+    selection so a Gemma checkpoint serves with Gemma's SentencePiece-style BPE
+    and turn-format template instead of Qwen's byte-level BPE + ChatML."""
+    var cfg = ckpt_dir + "/config.json"
+    if not exists(cfg):
+        return FAMILY_QWEN
+    if read_text(cfg).find("gemma") >= 0:   # model_type "gemma4_unified*"
+        return FAMILY_GEMMA
+    return FAMILY_QWEN
+
+
 def _dirname(path: String) -> String:
     """Directory component of `path` (everything before the last '/'), or '.'."""
     var b = path.as_bytes()
@@ -1029,14 +1044,22 @@ def main() raises:
     # fall back to the tok-capture .tsv fixtures (dev/tests). ckpt is the snapshot
     # dir (sharded/HF cache) or a single .safetensors path — look beside either.
     var ckpt_dir = ckpt if isdir(ckpt) else _dirname(ckpt)
+    # Family (from config.json model_type) selects both the tokenizer flavour and
+    # the chat template: Gemma uses SentencePiece-style BPE + the turn-format
+    # template; Qwen uses byte-level BPE + ChatML. Defaults to Qwen so the
+    # existing path is unchanged when no/Qwen config is present.
+    var family = _detect_family(ckpt_dir)
     var tok_json = ckpt_dir + "/tokenizer.json"
     var tok: Tokenizer
     if exists(tok_json):
-        print("  tokenizer: ", tok_json, sep="")
-        tok = load_tokenizer_json(tok_json)
+        print("  tokenizer: ", tok_json, " (", "gemma" if family == FAMILY_GEMMA else "qwen", ")", sep="")
+        if family == FAMILY_GEMMA:
+            tok = load_gemma_tokenizer_json(tok_json)
+        else:
+            tok = load_tokenizer_json(tok_json)
     else:
         tok = load_tokenizer("tests/fixtures/tokenizer/")
-    var tmpl = load_chat_template(TEMPLATE)
+    var tmpl = load_chat_template(GEMMA_TEMPLATE if family == FAMILY_GEMMA else TEMPLATE)
     var ctx = DeviceContext()
     var w = load_weights(ctx, ckpt, q4)
     # Probe the simdgroup-matrix GEMM once; on success prefill GEMMs take the

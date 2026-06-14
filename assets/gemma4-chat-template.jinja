@@ -1,0 +1,22 @@
+{#- Gemma 4 chat template — core text-chat path (millrace).
+
+    A faithful subset of the upstream gemma4_unified chat_template.jinja, covering
+    the text-only chat path: system/developer + user/assistant turns and the
+    non-thinking generation prompt. Byte-identical to transformers'
+    apply_chat_template for these messages. Tools, the thinking channel, and
+    multimodal parts are intentionally omitted (not served yet); add them here when
+    the engine grows those paths. `<bos>` is hardcoded (Gemma-specific) so no
+    bos_token needs threading through the render context. -#}
+{{- '<bos>' -}}
+{%- for message in messages -%}
+    {%- if message['role'] == 'assistant' -%}
+        {{- '<|turn>model\n' + (message['content'] | trim) + '<turn|>\n' -}}
+    {%- elif message['role'] == 'system' or message['role'] == 'developer' -%}
+        {{- '<|turn>system\n' + (message['content'] | trim) + '<turn|>\n' -}}
+    {%- else -%}
+        {{- '<|turn>' + message['role'] + '\n' + (message['content'] | trim) + '<turn|>\n' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|turn>model\n<|channel>thought\n<channel|>' -}}
+{%- endif -%}
