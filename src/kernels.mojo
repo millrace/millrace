@@ -1540,6 +1540,8 @@ def tc_attn_kernel[
     Tq: Int,
     q_offset: Int,
     scale_in: Float32 = -1.0,    # softmax scale; <0 = 1/sqrt(HEAD_DIM) (Qwen), Gemma passes 1.0
+    window: Int = 0,             # >0 = sliding window: attend only to the last `window`
+                                 #   keys (Gemma's sliding layers, 1024); 0 = full causal.
 ):
     """TENSOR-CORE causal GQA attention for *prefill* — the big long-prefill lever.
 
@@ -1599,7 +1601,16 @@ def tc_attn_kernel[
     var m = Float32(-1.0e30)
     var l = Float32(0.0)
 
+    # Sliding window: every active query in this 8-tile attends back at most
+    # `window` keys, so skip whole key-tiles older than the earliest in-window key
+    # of the first query (block-uniform start, floored to an 8-key tile). The
+    # per-key mask below still trims the partial boundary tile per query.
     var kt = 0
+    if window > 0:
+        var kfloor = q_offset + q0 - window + 1
+        if kfloor < 0:
+            kfloor = 0
+        kt = (kfloor // _MMA8) * _MMA8
     while kt <= kmax:
         # S[8q × 8k] = Q · Kᵀ over HEAD_DIM, accumulated on the MMA.
         var sfrag = SIMD[DType.float32, _FRAG8](0)
@@ -1613,9 +1624,11 @@ def tc_attn_kernel[
             sfrag = _mma8x8(afrag[dt], bk, sfrag)
 
         sfrag *= scale
-        # causal mask: key (col) past this row's abs position → −inf
+        # causal mask: key past this row's abs position → −inf; with a sliding
+        # window, also mask keys older than `qpos − window + 1`.
         comptime for s in range(_FRAG8):
-            if kt + fcol + s > qpos:
+            var keyp = kt + fcol + s
+            if keyp > qpos or (window > 0 and qpos - keyp >= window):
                 sfrag[s] = Float32(-1.0e30)
 
         var rmax = _frag_row_max(max(sfrag[0], sfrag[1]))

@@ -57,6 +57,7 @@ comptime SL_HKV = 8
 comptime SL_NKV = SL_HKV * SL_HEAD_DIM        # 2048
 comptime SL_THETA = Float32(10000.0)
 comptime SL_ROT_PAIRS = SL_HEAD_DIM // 2      # 128 (full)
+comptime G_SLIDING_WINDOW = 1024              # sliding layers attend only the last 1024 keys
 # full (proportional rope): head_dim 512 (global), 1 kv head, θ=1e6, partial 64 pairs.
 comptime FU_HEAD_DIM = 512
 comptime FU_HKV = 1
@@ -295,11 +296,12 @@ def gemma_attn(ctx: DeviceContext, mut qkv: DevBuf, mut kc: DevBuf, mut vc: DevB
     if l_full:
         comptime ka = tc_attn_kernel[type_of(olay), G_HQ, FU_HKV, FU_HEAD_DIM]
         ctx.enqueue_function[ka](TileTensor(qr, qrlay), TileTensor(kc, clay), TileTensor(vc, clay),
-            TileTensor(o, olay), Tq, q_offset, Float32(1.0), grid_dim=grid, block_dim=WARP_SIZE)
+            TileTensor(o, olay), Tq, q_offset, Float32(1.0), 0, grid_dim=grid, block_dim=WARP_SIZE)
     else:
         comptime ka = tc_attn_kernel[type_of(olay), G_HQ, SL_HKV, SL_HEAD_DIM]
         ctx.enqueue_function[ka](TileTensor(qr, qrlay), TileTensor(kc, clay), TileTensor(vc, clay),
-            TileTensor(o, olay), Tq, q_offset, Float32(1.0), grid_dim=grid, block_dim=WARP_SIZE)
+            TileTensor(o, olay), Tq, q_offset, Float32(1.0), G_SLIDING_WINDOW,
+            grid_dim=grid, block_dim=WARP_SIZE)
     return o^
 
 

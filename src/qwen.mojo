@@ -369,21 +369,21 @@ def attn_cached(ctx: DeviceContext, mut q: DevBuf, mut kc: DevBuf, mut vc: DevBu
             comptime k = tc_attn_kernel[type_of(lay), 16, 8, 128]
             ctx.enqueue_function[k](
                 TileTensor(qr, row_major(Tq * q_dim)), TileTensor(kc, row_major(cache_len)),
-                TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset, Float32(-1.0),
+                TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset, Float32(-1.0), 0,
                 grid_dim=grid, block_dim=WARP_SIZE,
             )
         elif arch == 1:
             comptime k = tc_attn_kernel[type_of(lay), 16, 2, 128]
             ctx.enqueue_function[k](
                 TileTensor(qr, row_major(Tq * q_dim)), TileTensor(kc, row_major(cache_len)),
-                TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset, Float32(-1.0),
+                TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset, Float32(-1.0), 0,
                 grid_dim=grid, block_dim=WARP_SIZE,
             )
         else:
             comptime k = tc_attn_kernel[type_of(lay), 14, 2, 64]
             ctx.enqueue_function[k](
                 TileTensor(qr, row_major(Tq * q_dim)), TileTensor(kc, row_major(cache_len)),
-                TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset, Float32(-1.0),
+                TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset, Float32(-1.0), 0,
                 grid_dim=grid, block_dim=WARP_SIZE,
             )
     elif arch == 2:
