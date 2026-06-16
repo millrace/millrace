@@ -35,7 +35,8 @@ from flare.http import Handler, SseChannel, SseEvent, sse_response
 
 from model import (
     Weights, load_weights, probe_simd_gemm, EOS1, EOS2,
-    Session, new_session, sess_prefill_suffix, sess_step,
+    Session, new_session, sess_prefill_suffix, sess_step, sess_verify,
+    _ngram_draft, _argmax_row,
     argmax_f, process_logits, sample, sess_embed,
     FAMILY_QWEN, FAMILY_GEMMA,
 )
@@ -99,6 +100,20 @@ comptime DEF_TOPP = Float32(0.8)
 comptime DEF_REP = Float32(1.1)
 comptime DEF_MAXNEW = 256
 comptime SEED = UInt64(0x9E3779B97F4A7C15)
+
+# Speculative decoding (greedy/temp==0 only, where it is bit-exact). Prompt-lookup
+# (n-gram) drafts K tokens from the context's own history and verifies them in one
+# batched forward (mm_w's batched int4 GEMV at small M). A win when output echoes
+# the context (code edits, tool results, quoting) — the agentic-coding common case.
+# K=7 → a Q=8 verify, which the dedicated 1-tile MMA int4 GEMM runs flat (~425 ms
+# vs ~125 ms single-step), so ~6/8 accepted beats single-stepping; the echo-heavy
+# agentic-coding case clears that easily (~80% accept → ~1.36×). An adaptive guard
+# pauses drafting after SPEC_COLD_LIMIT consecutive zero-accept verifies and
+# re-probes after SPEC_COOLDOWN tokens, bounding non-echo text to ~baseline.
+comptime SPEC_K = 7
+comptime SPEC_NGRAM = 3
+comptime SPEC_COLD_LIMIT = 2
+comptime SPEC_COOLDOWN = 32
 
 # Responses-API ids (opencode / Vercel AI SDK)
 comptime RESP_ID = "resp_millrace"
@@ -321,6 +336,19 @@ def _step(mut s: ServerState, token: Int) raises -> List[Float32]:
     return sess_step(s.ctx, s.w.value(), s.sess, token)
 
 
+def _verify(mut s: ServerState, batch: List[Int]) raises -> List[Float32]:
+    """Speculative batch forward: logits for ALL positions in `batch` at the
+    session's current pos (does NOT advance pos), dispatching by family."""
+    if s.family == FAMILY_GEMMA:
+        return sess_verify(s.ctx, s.gw.value(), s.sess, batch)
+    return sess_verify(s.ctx, s.w.value(), s.sess, batch)
+
+
+def _is_stop(s: ServerState, tok: Int) -> Bool:
+    """The server's stop set: model EOS pair + Gemma's tool-response marker."""
+    return tok == s.eos1 or tok == s.eos2 or (s.family == FAMILY_GEMMA and tok == GEMMA_TOOL_RESPONSE)
+
+
 def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
              temp: Float32, top_k: Int, top_p: Float32) raises -> Reply:
     """Run the GPU decode loop to completion for `ids`, honoring OpenAI knobs.
@@ -382,25 +410,105 @@ def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
     var gen = List[Int]()
     var stopped = False
     var last_beat = t_pf   # throttle for the ~5s decode heartbeat
-    while len(gen) < cap:
-        var nxt = (
-            sample(process_logits(logits, context, temp, top_k, top_p, DEF_REP), rng)
-            if temp > 0.0 else argmax_f(logits)
-        )
-        if nxt == s.eos1 or nxt == s.eos2 or (s.family == FAMILY_GEMMA and nxt == GEMMA_TOOL_RESPONSE):
-            stopped = True
-            break
-        gen.append(nxt)
-        context.append(nxt)
-        if len(gen) >= cap:
-            break
-        logits = _step(s, nxt)
-        # sess_step already synced (host logits copy), so this is real wall-clock.
-        var now = perf_counter_ns()
-        if Float64(now - last_beat) >= 5.0e9:
-            var rate = Float64(len(gen)) * 1.0e9 / Float64(now - t_pf)
-            print("  decoding: ", len(gen), " tokens (", Int(rate + 0.5), " tok/s)", sep="")
-            last_beat = now
+    var spec_acc = 0       # accepted draft tokens (greedy spec path; for the log line)
+    var spec_draft = 0     # drafted tokens proposed
+
+    if temp > 0.0:
+        # Sampling: per-token decode (speculative decode is only bit-exact for
+        # greedy, so it's restricted to temp==0 below).
+        while len(gen) < cap:
+            var nxt = sample(process_logits(logits, context, temp, top_k, top_p, DEF_REP), rng)
+            if _is_stop(s, nxt):
+                stopped = True
+                break
+            gen.append(nxt)
+            context.append(nxt)
+            if len(gen) >= cap:
+                break
+            logits = _step(s, nxt)
+            # sess_step already synced (host logits copy), so this is real wall-clock.
+            var now = perf_counter_ns()
+            if Float64(now - last_beat) >= 5.0e9:
+                var rate = Float64(len(gen)) * 1.0e9 / Float64(now - t_pf)
+                print("  decoding: ", len(gen), " tokens (", Int(rate + 0.5), " tok/s)", sep="")
+                last_beat = now
+    else:
+        # Greedy: prompt-lookup speculative decode against the persistent session.
+        # Bit-identical to single-step argmax (every committed token is the
+        # target's own argmax). An adaptive guard pauses drafting when acceptance
+        # collapses (non-echoing text) and re-probes later, bounding worst case.
+        var c0 = argmax_f(logits)
+        var draft_on = True
+        var cold = 0          # consecutive zero-accept verifies
+        var cooldown = 0      # tokens left before re-probing after a pause
+        while True:
+            if _is_stop(s, c0):
+                stopped = True
+                break
+            gen.append(c0)
+            context.append(c0)
+            if len(gen) >= cap:
+                break
+
+            var drafts = _ngram_draft(context, SPEC_K, SPEC_NGRAM) if draft_on else List[Int]()
+            if len(drafts) == 0:
+                # No draft match (or paused) → single-token step, commits c0's KV.
+                logits = _step(s, c0)
+                c0 = argmax_f(logits)
+                if cooldown > 0:
+                    cooldown -= 1
+                    if cooldown == 0:
+                        draft_on = True
+                        cold = 0
+            else:
+                var batch = List[Int]()
+                batch.append(c0)
+                for d in drafts:
+                    batch.append(d)
+                var G = _verify(s, batch)            # Q×vocab; session pos unchanged
+                var vocab = len(G) // len(batch)
+                spec_draft += len(drafts)
+                var accepted = 0
+                var carry = -1
+                for i in range(len(drafts)):
+                    var pred = _argmax_row(G, i, vocab)
+                    if drafts[i] == pred:
+                        accepted += 1
+                    else:
+                        carry = pred
+                        break
+                if carry == -1:                       # all drafts accepted
+                    carry = _argmax_row(G, len(drafts), vocab)
+                # Commit c0 (row at old pos) + accepted drafts; rejected tail is
+                # overwritten by the next forward (linear KV).
+                s.sess.pos = s.sess.pos + 1 + accepted
+                spec_acc += accepted
+                var brk = False
+                for i in range(accepted):
+                    if _is_stop(s, drafts[i]):
+                        stopped = True
+                        brk = True
+                        break
+                    gen.append(drafts[i])
+                    context.append(drafts[i])
+                    if len(gen) >= cap:
+                        brk = True
+                        break
+                if brk:
+                    break
+                c0 = carry
+                if accepted == 0:
+                    cold += 1
+                    if cold >= SPEC_COLD_LIMIT:
+                        draft_on = False
+                        cooldown = SPEC_COOLDOWN
+                else:
+                    cold = 0
+            var now = perf_counter_ns()
+            if Float64(now - last_beat) >= 5.0e9:
+                var rate = Float64(len(gen)) * 1.0e9 / Float64(now - t_pf)
+                print("  decoding: ", len(gen), " tokens (", Int(rate + 0.5), " tok/s)", sep="")
+                last_beat = now
     var t_dec = perf_counter_ns()
 
     var pf_ms = Float64(t_pf - t0) / 1.0e6
@@ -409,6 +517,9 @@ def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
     print("  gen: prompt=", len(ids), "tok (reused ", reuse, ", prefilled ",
           len(suffix), ")  prefill=", Int(pf_ms + 0.5), "ms  decode=", len(gen),
           "tok ", Int(dec_ms + 0.5), "ms (", Int(tps + 0.5), " tok/s)", sep="")
+    if spec_draft > 0:
+        print("    spec: ", spec_acc, "/", spec_draft, " drafts accepted (",
+              Int(Float64(spec_acc) / Float64(spec_draft) * 100.0 + 0.5), "%)", sep="")
     return Reply(gen^, stopped, len(ids), reuse, len(suffix), pf_ms, dec_ms, tps)
 
 

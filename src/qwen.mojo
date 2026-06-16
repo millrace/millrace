@@ -99,9 +99,10 @@ struct Weights(Movable, ModelWeights):
     def embed_prompt(mut self, ctx: DeviceContext, mut ids: DeviceBuffer[DType.int32], T: Int) raises -> DevBuf:
         return embed_tokens(ctx, ids, self.embed, T, self.hidden, self.vocab)   # Qwen: no embed scale
 
-    def run_layer(mut self, ctx: DeviceContext, l: Int, mut h: DevBuf, mut kc: DevBuf, mut vc: DevBuf,
+    def run_layer(mut self, ctx: DeviceContext, l: Int, mut h: DevBuf,
+                 mut kcs: List[DevBuf], mut vcs: List[DevBuf],
                  Tq: Int, q_offset: Int, cache_len: Int, mut dummy: DevBuf) raises -> DevBuf:
-        return qwen_layer(ctx, self, l, h, kc, vc, Tq, q_offset, cache_len, dummy)
+        return qwen_layer(ctx, self, l, h, kcs[l], vcs[l], Tq, q_offset, cache_len, dummy)
 
     def lm_logits(mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf) raises -> List[Float32]:
         # Final RMSNorm + tied LM head over the last row (Qwen: no final softcap).
@@ -112,6 +113,18 @@ struct Weights(Movable, ModelWeights):
         with logits.map_to_host() as m:
             var mt = TileTensor(m, row_major(self.vocab))
             for i in range(self.vocab):
+                out.append(rebind[Scalar[DType.float32]](mt[i]))
+        return out^
+
+    def lm_logits_all(mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf) raises -> List[Float32]:
+        # All-row logits for spec-decode verification (Qwen: no final softcap).
+        var n = T * self.vocab
+        var logits = mm_norm(ctx, h, self.final_norm, self.embed, dummy, T, self.hidden, self.vocab, 0)
+        ctx.synchronize()
+        var out = List[Float32]()
+        with logits.map_to_host() as m:
+            var mt = TileTensor(m, row_major(n))
+            for i in range(n):
                 out.append(rebind[Scalar[DType.float32]](mt[i]))
         return out^
 

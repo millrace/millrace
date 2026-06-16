@@ -12,14 +12,15 @@ from layout import TileTensor, row_major
 
 from kernels import (
     matmul_kernel, matmul_simd_kernel, matmul_tiled_kernel,
-    matmul_q4_kernel, matmul_simd_q4_kernel, matmul_tiled_q4_kernel,
+    matmul_q4_kernel, matmul_q4_batch_kernel, matmul_q4_small_kernel,
+    matmul_simd_q4_kernel, matmul_tiled_q4_kernel,
     matmul_resid_kernel, matmul_q4_resid_kernel,
     matmul_norm_kernel, matmul_q4_norm_kernel,
     matmul_silu_resid_kernel, matmul_q4_silu_resid_kernel,
     rmsnorm_kernel, add_kernel, silu_mul_kernel, silu_mul_cat_kernel,
-    gelu_mul_cat_kernel, softcap_kernel, add_scalar_kernel, mul_scalar_kernel, vnorm_kernel,
+    gelu_mul_cat_kernel, gelu_mul_kernel, softcap_kernel, add_scalar_kernel, mul_scalar_kernel, vnorm_kernel,
     embed_kernel, slice_row_kernel, copy_kernel, copy_strided_kernel,
-    SG_BM, SG_BN, SG_TPB, Q4_GROUP,
+    SG_BM, SG_BN, SG_TPB, Q4_GROUP, SPEC_MAX_M, SPEC_SMALL_MIN, _SM_BN, _SM_TPB,
 )
 
 comptime BLOCK = 256
@@ -116,6 +117,20 @@ def mm_w(ctx: DeviceContext, mut x: DevBuf, mut w: QMat, mut b: DevBuf,
         comptime k = matmul_q4_kernel[type_of(lay)]
         ctx.enqueue_function[k](xt, pt, st, bt, yt, M, K, N, NG, use_bias,
             grid_dim=ceildiv(M * N * WARP_SIZE, BLOCK), block_dim=BLOCK)
+    elif M >= SPEC_SMALL_MIN and M <= SPEC_MAX_M and simd_ok:
+        # Mid-small M (≈5..8, larger speculative verify): dedicated int4 GEMM with a
+        # single 8-row MMA tile — MMA-efficient like the prefill GEMM but without
+        # its wasted 56-row padding at small M. Flat ~M-independent here and well
+        # below both the batched GEMV (linear, loses past Q≈5) and the 64-row GEMM.
+        comptime ks = matmul_q4_small_kernel[type_of(lay)]
+        ctx.enqueue_function[ks](xt, pt, st, bt, yt, M, K, N, NG, use_bias,
+            grid_dim=(ceildiv(N, _SM_BN), 1), block_dim=_SM_TPB)
+    elif M <= SPEC_MAX_M:
+        # Tiny M (2..4) — or no simdgroup intrinsic: batched GEMV (weights read once,
+        # M rows accumulated in registers); cheapest at the smallest batch sizes.
+        comptime kb = matmul_q4_batch_kernel[type_of(lay)]
+        ctx.enqueue_function[kb](xt, pt, st, bt, yt, M, K, N, NG, use_bias,
+            grid_dim=ceildiv(N * WARP_SIZE, BLOCK), block_dim=BLOCK)
     elif simd_ok:
         comptime ks = matmul_simd_q4_kernel[type_of(lay)]
         ctx.enqueue_function[ks](xt, pt, st, bt, yt, M, K, N, NG, use_bias,
@@ -335,6 +350,17 @@ def gelu_mul_cat(ctx: DeviceContext, mut gu: DevBuf, T: Int, inter: Int) raises 
     ctx.enqueue_function[k](
         TileTensor(gu, row_major(T * 2 * inter)), TileTensor(y, lay), T, inter,
         grid_dim=ceildiv(T * inter, BLOCK), block_dim=BLOCK,
+    )
+    return y^
+
+def gelu_mul(ctx: DeviceContext, mut a: DevBuf, mut b: DevBuf, n: Int) raises -> DevBuf:
+    """Y = gelu_tanh(a)·b over two separate [n] buffers (Gemma3n PLE gate)."""
+    var y = ctx.enqueue_create_buffer[DType.float32](n)
+    var lay = row_major(n)
+    comptime k = gelu_mul_kernel[type_of(lay)]
+    ctx.enqueue_function[k](
+        TileTensor(a, lay), TileTensor(b, lay), TileTensor(y, lay), n,
+        grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK,
     )
     return y^
 

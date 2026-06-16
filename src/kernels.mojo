@@ -465,6 +465,61 @@ def matmul_q4_kernel[
         Y[m * N + n] = rebind[Y.ElementType](total)
 
 
+comptime SPEC_MAX_M = 8         # small-M int4 path cap. Above this the flat 64-row
+                                # simdgroup GEMM wins; mm_w routes M>SPEC_MAX_M there.
+comptime SPEC_SMALL_MIN = 5     # M in [SPEC_SMALL_MIN, SPEC_MAX_M] uses the 1-tile
+                                # MMA GEMM (flat); M in [2, SPEC_SMALL_MIN) uses the
+                                # batched GEMV (cheaper at the very smallest batches).
+
+
+def matmul_q4_batch_kernel[
+    LT: TensorLayout
+](
+    X: TileTensor[DType.float32, LT, MutAnyOrigin],
+    P: TileTensor[DType.uint32, LT, MutAnyOrigin],
+    S: TileTensor[DType.float32, LT, MutAnyOrigin],
+    B: TileTensor[DType.float32, LT, MutAnyOrigin],
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],
+    M: Int, K: Int, N: Int, NG: Int, use_bias: Int,
+):
+    """Batched int4 GEMV for small M (2..SPEC_MAX_M, e.g. speculative verify):
+    one warp per output COLUMN n. The warp loads each 256-bit weight oct ONCE —
+    the bandwidth cost — and accumulates all M activation rows in registers, so
+    weight traffic ≈ the M=1 GEMV regardless of M (x rows are small and re-read
+    per m). This keeps small-M verify forwards far below the simdgroup-GEMM's
+    flat ~700 ms. Weight unpack (the ALU-heavy nibble→f32) is done once per oct
+    and reused across all M rows; same exact-scale invariant (one group scale per
+    64-element oct, since 8|128)."""
+    comptime assert X.flat_rank == 1
+    var n = Int(global_idx.x) // WARP_SIZE
+    var lane = Int(global_idx.x) % WARP_SIZE
+    if n >= N:
+        return
+    var words = K // 8
+    var rowword = n * words
+    var pp = P.ptr
+    var xp = X.ptr
+    var sp = S.ptr
+    var acc = InlineArray[Float32, SPEC_MAX_M](fill=0.0)
+    var octs = words // 8                 # 8 packed u32 = 64 weights per lane/step
+    for q in range(lane, octs, WARP_SIZE):
+        var word8 = (pp + rowword + q * 8).load[width=8]()
+        var k0 = q * 64
+        var s = sp[n * NG + (k0 >> Q4_SHIFT)]
+        comptime for j in range(8):
+            var nibs = (SIMD[DType.uint32, 8](word8[j]) >> _Q4_SHIFTS) & 0xF
+            var qf = (nibs.cast[DType.int32]() - 8).cast[DType.float32]()
+            for m in range(M):
+                var xv = (xp + m * K + k0 + j * 8).load[width=8]()
+                acc[m] += (qf * xv).reduce_add() * s
+    for m in range(M):
+        var total = warp_sum(acc[m])
+        if lane == 0:
+            if use_bias != 0:
+                total += rebind[Scalar[DType.float32]](B[n])
+            Y[m * N + n] = rebind[Y.ElementType](total)
+
+
 def matmul_norm_kernel[
     LT: TensorLayout
 ](
@@ -862,6 +917,114 @@ def matmul_simd_q4_kernel[
                     Y[grow * N + gcol] = rebind[Y.ElementType](v)
 
 
+# Small-M (≤8) int4 GEMM: ONE 8-row MMA tile, so a Q≤8 speculative-verify forward
+# wastes ≤3 padding rows instead of the 64-row simd GEMM's 56–59 (it computes a
+# full 64-row tile regardless of M → compute-bound on wasted rows at small M). Same
+# coalesced shared-W dequant + 8×8 MMA math as matmul_simd_q4_kernel, just with the
+# M dimension collapsed to a single fragment shared across all the col simdgroups.
+comptime _SM_BN = 64                          # output cols per block
+comptime _SM_NSG = 4                          # simdgroups/block (col-tiled, 1 row tile)
+comptime _SM_SGN = _SM_BN // _SM_NSG          # 16 cols per simdgroup
+comptime _SM_NTN = _SM_SGN // _MMA8           # 2 col-fragments per simdgroup
+comptime _SM_TPB = _SM_NSG * 32               # 128 threads/block
+comptime _SM_BK = 32                           # K-chunk staged to shared (32×64 fp32
+                                               # = 8 KB; 4 words/col ⇒ 4-wide coalesce)
+
+
+def matmul_q4_small_kernel[
+    LT: TensorLayout
+](
+    X: TileTensor[DType.float32, LT, MutAnyOrigin],
+    P: TileTensor[DType.uint32, LT, MutAnyOrigin],
+    S: TileTensor[DType.float32, LT, MutAnyOrigin],
+    B: TileTensor[DType.float32, LT, MutAnyOrigin],
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],
+    M: Int, K: Int, N: Int, NG: Int, use_bias: Int,
+):
+    """int4 GEMM for M ≤ 8 (speculative verify). grid=(ceildiv(N,_SM_BN),1),
+    block_dim=_SM_TPB. One 8-row MMA tile (row_base=0) is shared across the block's
+    `_SM_NSG` col-simdgroups; W[blk_col..+64, kc..+_SM_BK] is cooperatively
+    dequantized into shared once per K-chunk and each simdgroup MMAs its 2 col-
+    fragments from it. X stays on the global cache path. Output/scale invariants
+    match matmul_simd_q4_kernel."""
+    comptime assert X.flat_rank == 1
+    var tid = Int(thread_idx.x)
+    var lane = tid % 32
+    var fl = _frag8_layout(lane)
+    var frow = fl[0]
+    var fcol = fl[1]
+    var sg = tid // 32
+    var blk_col = Int(block_idx.x) * _SM_BN
+    var col_base = blk_col + sg * _SM_SGN
+
+    var Bs = stack_allocation[
+        _SM_BK * _SM_BN, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var xp = X.ptr
+    var pp = P.ptr
+    var sp = S.ptr
+    var acc = InlineArray[SIMD[DType.float32, _FRAG8], _SM_NTN](
+        fill=SIMD[DType.float32, _FRAG8](0)
+    )
+
+    var kc = 0
+    while kc < K:
+        # Column-major thread→word map (consecutive threads = consecutive columns
+        # at the same k-run): writes to Bs are bank-conflict-free (consecutive
+        # shared slots). A K-major map would coalesce the global W reads but strides
+        # the Bs writes by SG_BN → shared bank conflicts that measured net-slower.
+        comptime _NW = _SM_BN * (_SM_BK // 8)
+        for w in range(tid, _NW, _SM_TPB):
+            var j_local = w % _SM_BN
+            var krun = (w // _SM_BN) * 8
+            var gj = blk_col + j_local
+            var gk0 = kc + krun
+            if gj < N and gk0 < K:
+                var word = pp[(gj * K + gk0) >> 3]
+                var scale = sp[gj * NG + (gk0 >> Q4_SHIFT)]
+                var nibs = (SIMD[DType.uint32, 8](word) >> _Q4_SHIFTS) & 0xF
+                var qf = (nibs.cast[DType.int32]() - 8).cast[DType.float32]() * scale
+                comptime for t in range(8):
+                    Bs[(krun + t) * _SM_BN + j_local] = qf[t] if gk0 + t < K else 0.0
+            else:
+                comptime for t in range(8):
+                    Bs[(krun + t) * _SM_BN + j_local] = 0.0
+        barrier()
+
+        comptime _KS = _SM_BK // _MMA8
+        for kss in range(_KS):
+            var kk = kc + kss * _MMA8
+            if kk >= K:
+                continue
+            var ktail = (kk + _MMA8 > K)
+            # A (X) fragment — single 8-row tile (rows 0..7 = frow), cols kk+fcol,+1.
+            var grow = frow
+            var afrag = SIMD[DType.float32, _FRAG8](0)
+            if grow < M and not ktail:
+                afrag = (xp + grow * K + kk + fcol).load[width=_FRAG8]()
+            elif grow < M:
+                comptime for s in range(_FRAG8):
+                    if kk + fcol + s < K:
+                        afrag[s] = xp[grow * K + kk + fcol + s]
+            comptime for ni in range(_SM_NTN):
+                var brow = (kss * _MMA8 + frow) * _SM_BN + sg * _SM_SGN + ni * _MMA8 + fcol
+                var bfrag = (Bs + brow).load[width=_FRAG8]()
+                acc[ni] = _mma8x8(afrag, bfrag, acc[ni])
+        barrier()
+        kc += _SM_BK
+
+    comptime for ni in range(_SM_NTN):
+        var frag = acc[ni]
+        comptime for s in range(_FRAG8):
+            var grow = frow
+            var gcol = col_base + ni * _MMA8 + fcol + s
+            if grow < M and gcol < N:
+                var v = frag[s]
+                if use_bias != 0:
+                    v += rebind[Scalar[DType.float32]](B[gcol])
+                Y[grow * N + gcol] = rebind[Y.ElementType](v)
+
+
 def silu_mul_kernel[
     LT: TensorLayout
 ](
@@ -925,6 +1088,27 @@ def gelu_mul_cat_kernel[
     var u = rebind[Scalar[DType.float32]](GU[t * 2 * inter + i + inter])
     var gelu = 0.5 * g * (1.0 + tanh(_GELU_C * (g + 0.044715 * g * g * g)))
     Y[idx] = rebind[Y.ElementType](gelu * u)
+
+
+def gelu_mul_kernel[
+    LT: TensorLayout
+](
+    A: TileTensor[DType.float32, LT, MutAnyOrigin],   # [n] gate
+    B: TileTensor[DType.float32, LT, MutAnyOrigin],   # [n] multiplier
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],   # [n] out
+    n: Int,
+):
+    """Y = gelu_tanh(A)·B over two SEPARATE [n] buffers (Gemma3n per-layer-input
+    gate: gelu(gate(h)) ⊙ per_layer_input). Sibling of gelu_mul_cat_kernel, which
+    reads one fused gate++up buffer instead."""
+    comptime assert A.flat_rank == 1
+    var i = global_idx.x
+    if i >= n:
+        return
+    var g = rebind[Scalar[DType.float32]](A[i])
+    var u = rebind[Scalar[DType.float32]](B[i])
+    var gelu = 0.5 * g * (1.0 + tanh(_GELU_C * (g + 0.044715 * g * g * g)))
+    Y[i] = rebind[Y.ElementType](gelu * u)
 
 
 def softcap_kernel[

@@ -227,12 +227,25 @@ def load_one_bf16(ctx: DeviceContext, path: String, begin: Int, end: Int) raises
     var nbytes = end - begin
     var count = nbytes // 2
     var dev_u16 = ctx.enqueue_create_buffer[DType.uint16](count)
+    # Read in ≤1 GiB chunks: macOS read() fails with EINVAL for a single count >2 GiB,
+    # which the gemma-4 e2b embed_tokens_per_layer (262144×8960 bf16 = 4.7 GiB) hits.
+    comptime CHUNK = 1 << 30
     with open(path, "r") as f:
         _ = f.seek(UInt64(begin))
-        var raw = f.read_bytes(nbytes)
         var host = ctx.enqueue_create_host_buffer[DType.uint16](count)
         ctx.synchronize()
-        memcpy(dest=host.unsafe_ptr().bitcast[UInt8](), src=raw.unsafe_ptr(), count=nbytes)
+        var dst = host.unsafe_ptr().bitcast[UInt8]()
+        var off = 0
+        while off < nbytes:
+            var want = nbytes - off
+            if want > CHUNK:
+                want = CHUNK
+            var raw = f.read_bytes(want)
+            var got = len(raw)
+            if got == 0:
+                break
+            memcpy(dest=dst + off, src=raw.unsafe_ptr(), count=got)
+            off += got
         ctx.enqueue_copy(dev_u16, host)
         ctx.synchronize()
     return dev_u16^

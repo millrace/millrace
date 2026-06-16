@@ -28,7 +28,7 @@ from std.collections import InlineArray
 from std.memory import stack_allocation
 from std.sys.info import external_call
 from layout import TileTensor, TensorLayout, row_major
-from kernels import matmul_kernel
+from kernels import matmul_kernel, matmul_q4_batch_kernel, matmul_q4_small_kernel, _SM_BN, _SM_TPB
 
 comptime Q4_GROUP = 128
 comptime Q4_SHIFT = 7                                          # log2(128)
@@ -214,7 +214,7 @@ def quantize_g128(W: List[Float32], N: Int, K: Int) raises -> Tuple[List[UInt32]
                     qr = -7
                 deq[n * K + k] = Float32(qr) * s
                 var lin = n * K + k
-                packed[lin >> 3] = packed[lin >> 3] | (UInt32(qr + 8) << ((lin & 7) * 4))
+                packed[lin >> 3] = packed[lin >> 3] | (UInt32(qr + 8) << UInt32((lin & 7) * 4))
     return (packed^, scales^, deq^)
 
 
@@ -235,7 +235,8 @@ def maxabs_err(a: List[Float32], b: List[Float32]) -> Tuple[Float64, Float64]:
     return (md, mr)
 
 
-def check(ctx: DeviceContext, name: String, M: Int, K: Int, N: Int, use_simd: Bool) raises:
+def check(ctx: DeviceContext, name: String, M: Int, K: Int, N: Int, mode: Int) raises:
+    # mode: 0 = local decode GEMV, 1 = local simd GEMM, 2 = library batched GEMV
     var NG = K // Q4_GROUP
     var seed = UInt64(0x1234567 + M * 7 + N * 13 + K)
     var Wh = List[Float32]()
@@ -289,10 +290,18 @@ def check(ctx: DeviceContext, name: String, M: Int, K: Int, N: Int, use_simd: Bo
     var bt = TileTensor(bb, row_major(N))
     var yt = TileTensor(yb, row_major(M * N))
 
-    if use_simd:
+    if mode == 1:
         comptime k = q4_simd_kernel[type_of(row_major(1))]
         ctx.enqueue_function[k](xt, pt, st, bt, yt, M, K, N, NG, 1,
             grid_dim=(ceildiv(N, SG_BN), ceildiv(M, SG_BM)), block_dim=SG_TPB)
+    elif mode == 2:
+        comptime k = matmul_q4_batch_kernel[type_of(row_major(1))]
+        ctx.enqueue_function[k](xt, pt, st, bt, yt, M, K, N, NG, 1,
+            grid_dim=ceildiv(N * WARP_SIZE, BLOCK), block_dim=BLOCK)
+    elif mode == 3:
+        comptime k = matmul_q4_small_kernel[type_of(row_major(1))]
+        ctx.enqueue_function[k](xt, pt, st, bt, yt, M, K, N, NG, 1,
+            grid_dim=(ceildiv(N, _SM_BN), 1), block_dim=_SM_TPB)
     else:
         comptime k = q4_gemv_kernel[type_of(row_major(1))]
         ctx.enqueue_function[k](xt, pt, st, bt, yt, M, K, N, NG, 1,
@@ -359,15 +368,26 @@ def main() raises:
     var ctx = DeviceContext()
     print("=== int4 g128 kernel correctness (vs CPU dequant reference) ===")
     print("-- decode GEMV (M=1):")
-    check(ctx, "gemv", 1, 256, 64, False)
-    check(ctx, "gemv", 1, 896, 128, False)
-    check(ctx, "gemv", 1, 2048, 320, False)
-    check(ctx, "gemv", 1, 11008, 256, False)
+    check(ctx, "gemv", 1, 256, 64, 0)
+    check(ctx, "gemv", 1, 896, 128, 0)
+    check(ctx, "gemv", 1, 2048, 320, 0)
+    check(ctx, "gemv", 1, 11008, 256, 0)
     print("-- prefill simd GEMM (M>1):")
-    check(ctx, "simd", 8, 256, 64, True)
-    check(ctx, "simd", 40, 896, 137, True)
-    check(ctx, "simd", 64, 2048, 320, True)
-    check(ctx, "simd", 33, 11008, 256, True)
+    check(ctx, "simd", 8, 256, 64, 1)
+    check(ctx, "simd", 40, 896, 137, 1)
+    check(ctx, "simd", 64, 2048, 320, 1)
+    check(ctx, "simd", 33, 11008, 256, 1)
+    print("-- batched GEMV (small M, library kernel):")
+    check(ctx, "batch", 2, 256, 64, 2)
+    check(ctx, "batch", 5, 896, 137, 2)
+    check(ctx, "batch", 8, 2048, 320, 2)
+    check(ctx, "batch", 4, 11008, 256, 2)
+    print("-- small-M int4 GEMM (1 MMA row tile, library kernel):")
+    check(ctx, "small", 1, 256, 64, 3)
+    check(ctx, "small", 5, 896, 137, 3)
+    check(ctx, "small", 8, 2048, 320, 3)
+    check(ctx, "small", 4, 11008, 256, 3)
+    check(ctx, "small", 8, 2048, 130, 3)   # N not a multiple of _SM_BN
 
     print("\n=== decode GEMV speed: bf16 vs int4 g128 (M=1, 3B shapes) ===")
     bench_speed(ctx, "q/o  ", 2048, 2048)

@@ -56,9 +56,18 @@ trait ModelWeights(Movable):
     def embed_prompt(mut self, ctx: DeviceContext, mut ids: DeviceBuffer[DType.int32], T: Int) raises -> DevBuf:
         ...
 
-    def run_layer(mut self, ctx: DeviceContext, l: Int, mut h: DevBuf, mut kc: DevBuf, mut vc: DevBuf,
+    def run_layer(mut self, ctx: DeviceContext, l: Int, mut h: DevBuf,
+                 mut kcs: List[DevBuf], mut vcs: List[DevBuf],
                  Tq: Int, q_offset: Int, cache_len: Int, mut dummy: DevBuf) raises -> DevBuf:
+        # Receives ALL per-layer K/V caches (not just layer l's) so a family can
+        # implement cross-layer KV sharing (Gemma-4 e2b). Dense families index [l].
         ...
 
     def lm_logits(mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf) raises -> List[Float32]:
+        ...
+
+    def lm_logits_all(mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf) raises -> List[Float32]:
+        # Logits for ALL T positions (row-major T×vocab), for speculative-decode
+        # batch verification. Same head as `lm_logits` but over every row, not just
+        # the last. Returns a flat host list of length T*vocab.
         ...

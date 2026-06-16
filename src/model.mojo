@@ -31,5 +31,6 @@ from qwen import (
 )
 from engine import (
     Session, new_session, sess_prefill, sess_prefill_suffix,
-    sess_step, generate, generate_sample, upload_ids, argmax_last, logits_last,
+    sess_step, generate, generate_sample, generate_spec, generate_spec_draft, sess_verify,
+    _ngram_draft, _argmax_row, upload_ids, argmax_last, logits_last,
 )

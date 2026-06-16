@@ -111,10 +111,21 @@ int4-quality = { cmd = "mkdir -p build && mojo build tests/manual/int4_quality.m
 # KV session -> prefill/decode -> detokenize), the exact stack server.gen_full
 # drives. Loads the ~7 GB int4 model (needs the gemma-4-12B checkpoint cached).
 gemma-serve-smoke = { cmd = "mkdir -p build && mojo build tests/manual/gemma_serve_smoke.mojo -I src -I ../jinja2.mojo/src -I ../flare -o build/gemma_serve_smoke && ./build/gemma_serve_smoke" }
+# Coherence smoke test for the gemma-4 e2b speculative-decode draft model (int4).
+e2b-smoke = { cmd = "mkdir -p build && mojo build tests/manual/e2b_smoke.mojo -I src -I ../jinja2.mojo/src -I ../flare -o build/e2b_smoke && ./build/e2b_smoke" }
+# Per-layer numeric validation of the e2b forward vs HF gemma4 (ids [2,4521,1902];
+# compare against max-backend/.scratch/e2b_hf_ref.py — argmax should be 236787).
+e2b-debug = { cmd = "mkdir -p build && mojo build tests/manual/e2b_debug.mojo -I src -I ../jinja2.mojo/src -I ../flare -o build/e2b_debug && ./build/e2b_debug" }
+# Speculative decode: e2b draft verifying against the 12B target (both int4 co-resident).
+# Asserts greedy-exact vs `generate`, reports tok/s + draft acceptance + speedup.
+e2b-spec = { cmd = "mkdir -p build && mojo build tests/manual/e2b_spec.mojo -I src -I ../jinja2.mojo/src -I ../flare -o build/e2b_spec && ./build/e2b_spec" }
 # Gemma prompt render vs transformers (text + thinking + tool defs + tool_calls
 # + tool results, incl. multi-turn), CPU-only — no weights/GPU. Validates
 # src/gemma_chat.mojo (+ gemma_tools.mojo) against tests/fixtures/gemma.
 gemma-template-test = { cmd = "mkdir -p build && mojo build tests/manual/gemma_template_test.mojo -I src -I ../jinja2.mojo/src -I ../flare -o build/gemma_template_test && ./build/gemma_template_test" }
+# Speculative-decode parity + timing: greedy `generate` vs prompt-lookup
+# `generate_spec` on Gemma 4 12B int4 (must be bit-identical; reports speedup).
+spec-decode = { cmd = "mkdir -p build && mojo build tests/manual/spec_decode.mojo -I src -I ../jinja2.mojo/src -I ../flare -o build/spec_decode && ./build/spec_decode" }
 
 # Cross-engine benchmark (millrace vs mlx_lm.server vs Ollama): TTFT, decode
 # tok/s, cold/warm prefix. Stdlib python, no GPU build. Start the servers first
