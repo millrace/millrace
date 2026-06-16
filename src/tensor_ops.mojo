@@ -18,7 +18,8 @@ from kernels import (
     matmul_norm_kernel, matmul_q4_norm_kernel,
     matmul_silu_resid_kernel, matmul_q4_silu_resid_kernel,
     rmsnorm_kernel, add_kernel, silu_mul_kernel, silu_mul_cat_kernel,
-    gelu_mul_cat_kernel, gelu_mul_kernel, softcap_kernel, add_scalar_kernel, mul_scalar_kernel, vnorm_kernel,
+    gelu_mul_cat_kernel, gelu_mul_kernel, gelu_mul_strided_kernel, rmsnorm_add_kernel,
+    softcap_kernel, add_scalar_kernel, mul_scalar_kernel, vnorm_kernel,
     embed_kernel, slice_row_kernel, copy_kernel, copy_strided_kernel,
     SG_BM, SG_BN, SG_TPB, Q4_GROUP, SPEC_MAX_M, SPEC_SMALL_MIN, _SM_BN, _SM_TPB,
 )
@@ -308,6 +309,32 @@ def rmsnorm(ctx: DeviceContext, mut x: DevBuf, mut w: DevBuf, T: Int, dim: Int) 
     ctx.enqueue_function[k](
         TileTensor(x, lay), TileTensor(w, row_major(dim)), TileTensor(y, lay), T, dim,
         grid_dim=ceildiv(T * WARP_SIZE, BLOCK), block_dim=BLOCK,   # one warp per row
+    )
+    return y^
+
+def rmsnorm_add(ctx: DeviceContext, mut x: DevBuf, mut w: DevBuf, mut resid: DevBuf,
+                T: Int, dim: Int, scale: Float32 = 1.0) raises -> DevBuf:
+    """(RMSNorm(x)·w + resid)·scale in one launch — fuses Gemma's post-proj norm +
+    residual add (+ optional layer scalar)."""
+    var y = ctx.enqueue_create_buffer[DType.float32](T * dim)
+    var lay = row_major(T * dim)
+    comptime k = rmsnorm_add_kernel[type_of(lay)]
+    ctx.enqueue_function[k](
+        TileTensor(x, lay), TileTensor(w, row_major(dim)), TileTensor(resid, lay),
+        TileTensor(y, lay), T, dim, scale,
+        grid_dim=ceildiv(T * WARP_SIZE, BLOCK), block_dim=BLOCK,
+    )
+    return y^
+
+def gelu_mul_strided(ctx: DeviceContext, mut a: DevBuf, mut p: DevBuf,
+                     T: Int, n: Int, stride: Int, off: Int) raises -> DevBuf:
+    """gelu(a[t,j])·p[t, off+j] — PLE gate fused with the strided per-layer-input slice."""
+    var y = ctx.enqueue_create_buffer[DType.float32](T * n)
+    var lay = row_major(T * n)
+    comptime k = gelu_mul_strided_kernel[type_of(lay)]
+    ctx.enqueue_function[k](
+        TileTensor(a, lay), TileTensor(p, row_major(T * stride)), TileTensor(y, lay),
+        T, n, stride, off, grid_dim=ceildiv(T * n, BLOCK), block_dim=BLOCK,
     )
     return y^
 

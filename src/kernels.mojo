@@ -117,6 +117,37 @@ def rmsnorm_kernel[
         Y[t * H + d] = rebind[Y.ElementType](v / rms * wv)
 
 
+def rmsnorm_add_kernel[
+    LT: TensorLayout
+](
+    X: TileTensor[DType.float32, LT, MutAnyOrigin],
+    W: TileTensor[DType.float32, LT, MutAnyOrigin],
+    R: TileTensor[DType.float32, LT, MutAnyOrigin],    # residual, added after norm
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],
+    T: Int,
+    H: Int,
+    scale: Float32,                                    # final ×scale (1.0 = none)
+):
+    """Y = (RMSNorm(X)·W + R) · scale — fuses the rmsnorm + residual add (+ an
+    optional per-layer scalar) that Gemma applies after every proj into ONE launch
+    (3 of these per e2b layer). Same warp-per-row reduction as rmsnorm_kernel."""
+    comptime assert X.flat_rank == 1
+    var t = Int(global_idx.x) // WARP_SIZE
+    var lane = Int(global_idx.x) % WARP_SIZE
+    if t >= T:
+        return
+    var ss = Float32(0.0)
+    for d in range(lane, H, WARP_SIZE):
+        var v = rebind[Scalar[DType.float32]](X[t * H + d])
+        ss += v * v
+    var rms = sqrt(warp_sum(ss) / Float32(H) + EPS)
+    for d in range(lane, H, WARP_SIZE):
+        var v = rebind[Scalar[DType.float32]](X[t * H + d])
+        var wv = rebind[Scalar[DType.float32]](W[d])
+        var rv = rebind[Scalar[DType.float32]](R[t * H + d])
+        Y[t * H + d] = rebind[Y.ElementType]((v / rms * wv + rv) * scale)
+
+
 def matmul_kernel[
     LT: TensorLayout
 ](
@@ -1107,6 +1138,28 @@ def gelu_mul_kernel[
         return
     var g = rebind[Scalar[DType.float32]](A[i])
     var u = rebind[Scalar[DType.float32]](B[i])
+    var gelu = 0.5 * g * (1.0 + tanh(_GELU_C * (g + 0.044715 * g * g * g)))
+    Y[i] = rebind[Y.ElementType](gelu * u)
+
+
+def gelu_mul_strided_kernel[
+    LT: TensorLayout
+](
+    A: TileTensor[DType.float32, LT, MutAnyOrigin],   # [T, n] gate
+    P: TileTensor[DType.float32, LT, MutAnyOrigin],   # [T, stride] (per-layer-input table)
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],   # [T, n] out
+    T: Int, n: Int, stride: Int, off: Int,
+):
+    """Y[t,j] = gelu_tanh(A[t,j]) · P[t, off+j] — the Gemma3n PLE gate fused with the
+    strided slice of the per-layer-input table (copy_strided + gelu_mul → 1 launch)."""
+    comptime assert A.flat_rank == 1
+    var i = global_idx.x
+    if i >= T * n:
+        return
+    var t = i // n
+    var j = i % n
+    var g = rebind[Scalar[DType.float32]](A[i])
+    var u = rebind[Scalar[DType.float32]](P[t * stride + off + j])
     var gelu = 0.5 * g * (1.0 + tanh(_GELU_C * (g + 0.044715 * g * g * g)))
     Y[i] = rebind[Y.ElementType](gelu * u)
 

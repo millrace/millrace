@@ -30,8 +30,8 @@ from layout import TileTensor, row_major
 from kernels import rope_q_kernel, rope_k_kernel, tc_attn_kernel, vnorm_kernel
 from tensor_ops import (
     BLOCK, DevBuf, WBuf, QMat, qmat_bf16, mm_w, mm_norm, mm_w_norm,
-    embed_tokens, last_row, rmsnorm, add, gelu_mul_cat, gelu_mul, softcap,
-    mul_scalar, copy_strided,
+    embed_tokens, last_row, rmsnorm, rmsnorm_add, add, gelu_mul_cat, gelu_mul,
+    gelu_mul_strided, softcap, mul_scalar, copy_strided,
 )
 from safetensors import (
     TensorEntry, gather_tensors, load_named, load_named_bf16, load_proj, fuse_pair,
@@ -357,25 +357,18 @@ def e2b_layer(ctx: DeviceContext, mut w: GemmaE2bWeights, l: Int, mut h: DevBuf,
     var qkv = mm_w_norm(ctx, h, w.ln1[l], w.qkv[l], dummy, Tq, hd, W, 0, w.simd_ok)
     var o = e2b_attn(ctx, qkv, kcs[src], vcs[src], write, w.qnorm[l], w.knorm[l], full, Tq, q_offset, cache_len)
     var ao = mm_w(ctx, o, w.ow[l], dummy, Tq, q_dim, hd, 0, w.simd_ok)
-    var aon = rmsnorm(ctx, ao, w.ln_post_attn[l], Tq, hd)
-    var h1 = add(ctx, h, aon, Tq * hd)
+    var h1 = rmsnorm_add(ctx, ao, w.ln_post_attn[l], h, Tq, hd)   # post_attn_norm + residual
 
     var gu = mm_w_norm(ctx, h1, w.ln_pre_ff[l], w.gate_up[l], dummy, Tq, hd, 2 * inter, 0, w.simd_ok)
     var act = gelu_mul_cat(ctx, gu, Tq, inter)
     var ff = mm_w(ctx, act, w.down[l], dummy, Tq, inter, hd, 0, w.simd_ok)
-    var ffn = rmsnorm(ctx, ff, w.ln_post_ff[l], Tq, hd)
-    var h2 = add(ctx, h1, ffn, Tq * hd)      # post-FF hidden (NO layer_scalar yet)
+    var h2 = rmsnorm_add(ctx, ff, w.ln_post_ff[l], h1, Tq, hd)    # post_ff_norm + residual
 
     # ── Per-Layer Embedding integration (BEFORE layer_scalar, per gemma4 ref) ──
     # first = gelu(per_layer_input_gate(h2)) ⊙ per_layer_input[l]
-    # h2 = h2 + post_per_layer_input_norm(per_layer_projection(first))
+    # h_out = (h2 + post_per_layer_input_norm(per_layer_projection(first))) · layer_scalar
     var g = mm_w(ctx, h2, w.pli_gate[l], dummy, Tq, hd, E_HPLI, 0, w.simd_ok)
-    var pli = ctx.enqueue_create_buffer[DType.float32](Tq * E_HPLI)
-    copy_strided(ctx, w.ple, pli, Tq, E_PLE_WIDTH, l * E_HPLI, 0, E_HPLI, Tq * E_HPLI)
-    var gp = gelu_mul(ctx, g, pli, Tq * E_HPLI)
+    var gp = gelu_mul_strided(ctx, g, w.ple, Tq, E_HPLI, E_PLE_WIDTH, l * E_HPLI)
     var pred = mm_w(ctx, gp, w.pli_proj[l], dummy, Tq, E_HPLI, hd, 0, w.simd_ok)
-    pred = rmsnorm(ctx, pred, w.pli_post_norm[l], Tq, hd)
-    var h3 = add(ctx, h2, pred, Tq * hd)
-
-    # ── per-layer learned scalar (LAST, after PLE) ──
-    return mul_scalar(ctx, h3, Tq * hd, w.layer_scalar[l])
+    # PLE residual + layer_scalar fused into the post-PLE norm.
+    return rmsnorm_add(ctx, pred, w.pli_post_norm[l], h2, Tq, hd, w.layer_scalar[l])
