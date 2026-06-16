@@ -33,7 +33,7 @@ from layout import TileTensor, row_major
 from kernels import rope_q_kernel, rope_k_kernel, tc_attn_kernel, vnorm_kernel
 from tensor_ops import (
     BLOCK, DevBuf, WBuf, QMat, qmat_bf16, mm_w, mm_norm, mm_w_norm,
-    embed_tokens, last_row, rmsnorm, add, gelu_mul_cat, softcap, mul_scalar,
+    embed_tokens, last_row, rmsnorm, rmsnorm_add, add, gelu_mul_cat, softcap, mul_scalar,
 )
 from safetensors import (
     TensorEntry, gather_tensors, load_named, load_named_bf16, load_proj, fuse_pair,
@@ -344,16 +344,12 @@ def gemma_layer(ctx: DeviceContext, mut w: GemmaWeights, l: Int, mut h: DevBuf,
     var o = gemma_attn(ctx, qkv, kc, vc, w.qnorm[l], w.knorm[l], full, Tq, q_offset, cache_len)
     # o_proj(o)[q_dim→hd]
     var ao = mm_w(ctx, o, w.ow[l], dummy, Tq, q_dim, hd, 0, w.simd_ok)
-    # post_attention_layernorm THEN residual add (Gemma applies the norm to attn out).
-    var aon = rmsnorm(ctx, ao, w.ln_post_attn[l], Tq, hd)
-    var h1 = add(ctx, h, aon, Tq * hd)
+    # post_attention_layernorm + residual add fused (Gemma norms the attn out).
+    var h1 = rmsnorm_add(ctx, ao, w.ln_post_attn[l], h, Tq, hd)
 
     # ── feed-forward block ──
     var gu = mm_w_norm(ctx, h1, w.ln_pre_ff[l], w.gate_up[l], dummy, Tq, hd, 2 * w.inter, 0, w.simd_ok)
     var act = gelu_mul_cat(ctx, gu, Tq, w.inter)
     var ff = mm_w(ctx, act, w.down[l], dummy, Tq, w.inter, hd, 0, w.simd_ok)
-    var ffn = rmsnorm(ctx, ff, w.ln_post_ff[l], Tq, hd)
-    var h2 = add(ctx, h1, ffn, Tq * hd)
-
-    # ── per-layer learned scalar ──
-    return mul_scalar(ctx, h2, Tq * hd, w.layer_scalar[l])
+    # post_feedforward_layernorm + residual + the per-layer scalar, all fused.
+    return rmsnorm_add(ctx, ff, w.ln_post_ff[l], h1, Tq, hd, w.layer_scalar[l])
