@@ -145,7 +145,12 @@ def load_gemma_weights(ctx: DeviceContext, path: String, layers: List[Int], q4: 
     var name2idx = Dict[String, Int]()
     for e in range(len(entries)):
         name2idx[entries[e].name] = e
+    # Text-decoder tensor prefix. Older Gemma-4 checkpoints use `language_model.model.`;
+    # newer transformers exports (e.g. the QAT-unquantized) swap the order to
+    # `model.language_model.`. Pick whichever the checkpoint actually has.
     var pfx = String("language_model.model.")
+    if (pfx + "embed_tokens.weight") not in name2idx:
+        pfx = String("model.language_model.")
 
     var embed = load_named_bf16(ctx, paths, entries, name2idx, pfx + "embed_tokens.weight")
     var final_norm = load_named(ctx, paths, entries, name2idx, pfx + "norm.weight")
