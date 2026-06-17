@@ -78,3 +78,10 @@ trait ModelWeights(Movable):
         # batch verification. Same head as `lm_logits` but over every row, not just
         # the last. Returns a flat host list of length T*vocab.
         ...
+
+    def token_logprobs(mut self, ctx: DeviceContext, mut h: DevBuf, n: Int,
+                       targets: List[Int], mut dummy: DevBuf) raises -> List[Float32]:
+        # log P(targets[i] | h[i]) for the first n rows — the LM head (+ any softcap)
+        # followed by an on-GPU per-row log-softmax-of-target (nll_gather), so the
+        # n×vocab logits never reach the host. For perplexity / echo logprobs.
+        ...

@@ -36,7 +36,7 @@ from flare.http import Handler, SseChannel, SseEvent, sse_response
 from std.utils import Variant
 from model import (
     Weights, load_weights, probe_simd_gemm, EOS1, EOS2,
-    Session, new_session, sess_prefill_suffix, sess_step, sess_verify,
+    Session, new_session, sess_prefill_suffix, sess_step, sess_verify, sess_token_logprobs,
     _ngram_draft, _argmax_row,
     argmax_f, process_logits, sample, sess_embed,
     FAMILY_QWEN, FAMILY_GEMMA, ModelConfig, TOOL_GEMMA,
@@ -344,6 +344,16 @@ def _is_stop(s: ServerState, tok: Int) -> Bool:
     """The server's stop set: the model's EOS pair + its optional extra stop token
     (e.g. Gemma's <|tool_response>), all carried by ModelConfig."""
     return tok == s.cfg.eos1 or tok == s.cfg.eos2 or tok == s.cfg.extra_stop
+
+
+def _token_logprobs(mut s: ServerState, tokens: List[Int]) raises -> List[Float32]:
+    """Teacher-forced per-token logprobs for one window (a fresh offset-0 forward).
+    Overwrites the chat KV cache, so invalidate the prefix-cache record."""
+    s.sess.pos = 0
+    s.cached = List[Int]()
+    if s.model.isa[GemmaWeights]():
+        return sess_token_logprobs(s.ctx, s.model[GemmaWeights], s.sess, tokens)
+    return sess_token_logprobs(s.ctx, s.model[Weights], s.sess, tokens)
 
 
 def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
@@ -833,6 +843,8 @@ struct Api(Handler, Copyable, Movable):
             return ok_json(models_json(self.st[].model_id, self.st[].embed_id))
         if path == "/v1/version":
             return ok_json(version_json(self.st[].model_id))
+        if is_post and path == "/v1/completions":
+            return self.handle_completions(req)
         if is_post and path == "/v1/chat/completions":
             return self.handle_chat(req)
         if is_post and path == "/v1/responses":
@@ -840,6 +852,64 @@ struct Api(Handler, Copyable, Movable):
         if is_post and path == "/v1/embeddings":
             return self.handle_embeddings(req)
         return not_found("no route for " + req.method + " " + path)
+
+    def handle_completions(self, req: Request) raises -> Response:
+        """OpenAI /v1/completions, echo+logprobs only — a scoring endpoint for
+        perplexity. `prompt` is a token-id array (preferred — no tokenizer mismatch)
+        or a raw string (tokenized with the model's tokenizer, NO chat template).
+        Runs a teacher-forced forward and returns `logprobs.token_logprobs` =
+        [null, log P(t1|t0), log P(t2|t0:1), …]; the client computes
+        PPL = exp(-mean token_logprobs). No text is generated (echo-only)."""
+        ref s = self.st[]
+        var bv = parse_json(req.text())
+        var pr = bv.map_get("prompt")
+        if not pr:
+            return bad_request('{"error":{"message":"completions: missing \\"prompt\\""}}')
+        var tokens = List[Int]()
+        var pv = pr.value()
+        if pv.tag == VLIST:
+            for j in range(len(pv.c[].vals)):
+                var e = pv.c[].vals[j]
+                if e.tag != VINT:
+                    return bad_request('{"error":{"message":"completions: prompt array must be token ids"}}')
+                tokens.append(e.i)
+        elif pv.tag == VSTR:
+            tokens = s.tok.encode(to_bytes(pv.s))
+            # Gemma requires a leading <bos>. The chat path gets it from the
+            # template's literal "<bos>"; raw-text encode() does NOT add one
+            # (and must not, or the chat path would double-BOS). Without it
+            # Gemma's logprobs are garbage (PPL in the thousands), so prepend
+            # it here for raw-string scoring to match how the model is used.
+            if s.cfg.tool_style == TOOL_GEMMA:
+                var merged = s.tok.encode(to_bytes(String("<bos>")))
+                for i in range(len(tokens)):
+                    merged.append(tokens[i])
+                tokens = merged^
+        else:
+            return bad_request('{"error":{"message":"completions: prompt must be a string or token-id array"}}')
+        if len(tokens) < 2:
+            return bad_request('{"error":{"message":"completions: need >= 2 tokens"}}')
+        if len(tokens) > s.max_seq:
+            return bad_request('{"error":{"message":"completions: window of ' + String(len(tokens))
+                + ' exceeds context ' + String(s.max_seq) + '"}}')
+
+        var lps = _token_logprobs(s, tokens)   # T-1 logprobs (for tokens[1..T-1])
+        var tok_arr = String("[")
+        for i in range(len(tokens)):
+            if i > 0:
+                tok_arr += ","
+            tok_arr += String(tokens[i])
+        tok_arr += "]"
+        var lp_arr = String("[null")            # token_logprobs[0] = null (no context)
+        for i in range(len(lps)):
+            lp_arr += "," + String(lps[i])
+        lp_arr += "]"
+        print("  completions: ", len(tokens), " tok scored", sep="")
+        return ok_json('{"id":"cmpl-millrace","object":"text_completion","model":"'
+            + s.model_id + '","choices":[{"text":"","index":0,"logprobs":{"tokens":'
+            + tok_arr + ',"token_logprobs":' + lp_arr
+            + '},"finish_reason":"length"}],"usage":{"prompt_tokens":'
+            + String(len(tokens)) + ',"total_tokens":' + String(len(tokens)) + '}}')
 
     def handle_embeddings(self, req: Request) raises -> Response:
         """OpenAI /v1/embeddings. Routed to the SECONDARY embedding model

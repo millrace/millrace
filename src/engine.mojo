@@ -122,6 +122,24 @@ def sess_prefill_suffix[W: ModelWeights](ctx: DeviceContext, mut w: W, mut s: Se
     return w.lm_logits(ctx, h, Q, s.dummy)
 
 
+def sess_token_logprobs[W: ModelWeights](ctx: DeviceContext, mut w: W, mut s: Session,
+                        tokens: List[Int]) raises -> List[Float32]:
+    """Teacher-forced log-probs for a token window: a fresh forward (offset 0) over
+    `tokens`, then log P(tokens[i+1] | tokens[0..i]) for i in [0, T-2] — T-1 floats,
+    each conditioned on ≥1 in-window token. Drives perplexity / echo logprobs; the
+    n×vocab logits stay on-GPU (token_logprobs)."""
+    var T = len(tokens)
+    var ids_dev = upload_ids(ctx, tokens)
+    var h = w.embed_prompt(ctx, ids_dev, T)
+    for l in range(w.config().nlayers):
+        h = w.run_layer(ctx, l, h, s.kcs, s.vcs, T, 0, s.cache_len, s.dummy)
+    s.pos = T
+    var targets = List[Int]()
+    for i in range(1, T):
+        targets.append(tokens[i])
+    return w.token_logprobs(ctx, h, T - 1, targets, s.dummy)
+
+
 def sess_step[W: ModelWeights](ctx: DeviceContext, mut w: W, mut s: Session, token: Int) raises -> List[Float32]:
     var one = upload_ids(ctx, [token])
     var h = w.embed_prompt(ctx, one, 1)

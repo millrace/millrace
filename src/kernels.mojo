@@ -117,6 +117,41 @@ def rmsnorm_kernel[
         Y[t * H + d] = rebind[Y.ElementType](v / rms * wv)
 
 
+def nll_gather_kernel[
+    LT: TensorLayout
+](
+    L: TileTensor[DType.float32, LT, MutAnyOrigin],     # [n, vocab] logits
+    TGT: TileTensor[DType.int32, LT, MutAnyOrigin],     # [n] target token id per row
+    OUT: TileTensor[DType.float32, LT, MutAnyOrigin],   # [n] log P(target | row) = log_softmax(L[i])[tgt]
+    n: Int,
+    vocab: Int,
+):
+    """Per-row log-probability of a target token, in ONE pass over the logits on
+    the GPU — for perplexity / echo logprobs. One warp per row: lanes split the
+    vocab to find the row max + Σexp(x−max) (numerically stable), then lane 0 emits
+    L[i,tgt] − max − log(Σexp). Avoids ever copying the [n×vocab] logits to host."""
+    comptime assert L.flat_rank == 1
+    var i = Int(global_idx.x) // WARP_SIZE
+    var lane = Int(global_idx.x) % WARP_SIZE
+    if i >= n:
+        return
+    var base = i * vocab
+    var m = Float32(-3.0e38)
+    for v in range(lane, vocab, WARP_SIZE):
+        var x = rebind[Scalar[DType.float32]](L[base + v])
+        if x > m:
+            m = x
+    m = warp_max(m)
+    var s = Float32(0.0)
+    for v in range(lane, vocab, WARP_SIZE):
+        s += exp(rebind[Scalar[DType.float32]](L[base + v]) - m)
+    s = warp_sum(s)
+    if lane == 0:
+        var tgt = Int(rebind[Scalar[DType.int32]](TGT[i]))
+        var lt = rebind[Scalar[DType.float32]](L[base + tgt])
+        OUT[i] = rebind[OUT.ElementType](lt - m - log(s))
+
+
 def rmsnorm_add_kernel[
     LT: TensorLayout
 ](

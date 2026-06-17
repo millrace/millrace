@@ -33,7 +33,7 @@ from layout import TileTensor, row_major
 from kernels import rope_q_kernel, rope_k_kernel, tc_attn_kernel, vnorm_kernel
 from tensor_ops import (
     BLOCK, DevBuf, WBuf, QMat, qmat_bf16, mm_w, mm_norm, mm_w_norm,
-    embed_tokens, last_row, rmsnorm, rmsnorm_add, add, gelu_mul_cat, softcap, mul_scalar,
+    embed_tokens, last_row, rmsnorm, rmsnorm_add, add, gelu_mul_cat, softcap, mul_scalar, nll_gather,
 )
 from safetensors import (
     TensorEntry, gather_tensors, load_named, load_named_bf16, load_proj, fuse_pair,
@@ -130,6 +130,12 @@ struct GemmaWeights(Movable, ModelWeights):
             for i in range(n):
                 out.append(rebind[Scalar[DType.float32]](mt[i]))
         return out^
+
+    def token_logprobs(mut self, ctx: DeviceContext, mut h: DevBuf, n: Int,
+                       targets: List[Int], mut dummy: DevBuf) raises -> List[Float32]:
+        var logits = mm_norm(ctx, h, self.final_norm, self.embed, dummy, n, self.hidden, self.vocab, 0)
+        softcap(ctx, logits, n * self.vocab, G_FINAL_SOFTCAP)
+        return nll_gather(ctx, logits, targets, n, self.vocab)
 
 
 def load_gemma_weights(ctx: DeviceContext, path: String, layers: List[Int], q4: Bool = False) raises -> GemmaWeights:

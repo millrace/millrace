@@ -25,7 +25,7 @@ from kernels import (
 )
 from tensor_ops import (
     BLOCK, DevBuf, WBuf, PBuf, QMat, qmat_bf16, mm_w_norm, mm_w_add, mm_w_silu_add,
-    embed_tokens, mm_norm, last_row, rmsnorm,
+    embed_tokens, mm_norm, last_row, rmsnorm, nll_gather,
 )
 from safetensors import (
     TensorEntry, gather_tensors, load_named, load_named_bf16, load_proj, fuse_pair, concat_bias,
@@ -127,6 +127,11 @@ struct Weights(Movable, ModelWeights):
             for i in range(n):
                 out.append(rebind[Scalar[DType.float32]](mt[i]))
         return out^
+
+    def token_logprobs(mut self, ctx: DeviceContext, mut h: DevBuf, n: Int,
+                       targets: List[Int], mut dummy: DevBuf) raises -> List[Float32]:
+        var logits = mm_norm(ctx, h, self.final_norm, self.embed, dummy, n, self.hidden, self.vocab, 0)
+        return nll_gather(ctx, logits, targets, n, self.vocab)
 
 
 def _hidden_size(entries: List[TensorEntry], name2idx: Dict[String, Int], pfx: String) raises -> Int:

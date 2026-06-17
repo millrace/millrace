@@ -19,7 +19,7 @@ from kernels import (
     matmul_silu_resid_kernel, matmul_q4_silu_resid_kernel,
     rmsnorm_kernel, add_kernel, silu_mul_kernel, silu_mul_cat_kernel,
     gelu_mul_cat_kernel, gelu_mul_kernel, gelu_mul_strided_kernel, rmsnorm_add_kernel,
-    softcap_kernel, add_scalar_kernel, mul_scalar_kernel, vnorm_kernel,
+    nll_gather_kernel, softcap_kernel, add_scalar_kernel, mul_scalar_kernel, vnorm_kernel,
     embed_kernel, slice_row_kernel, copy_kernel, copy_strided_kernel,
     SG_BM, SG_BN, SG_TPB, Q4_GROUP, SPEC_MAX_M, SPEC_SMALL_MIN, _SM_BN, _SM_TPB,
 )
@@ -390,6 +390,31 @@ def gelu_mul(ctx: DeviceContext, mut a: DevBuf, mut b: DevBuf, n: Int) raises ->
         grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK,
     )
     return y^
+
+def nll_gather(ctx: DeviceContext, mut logits: DevBuf, targets: List[Int],
+               n: Int, vocab: Int) raises -> List[Float32]:
+    """Per-position log P(target) from [n×vocab] GPU logits — one GPU pass, returns
+    n host floats (no n×vocab host copy). For perplexity / echo logprobs."""
+    var tgt = ctx.enqueue_create_buffer[DType.int32](n)
+    with tgt.map_to_host() as m:
+        var mt = TileTensor(m, row_major(n))
+        for i in range(n):
+            mt[i] = rebind[mt.ElementType](Int32(targets[i]))
+    var out = ctx.enqueue_create_buffer[DType.float32](n)
+    var nlay = row_major(n)
+    comptime k = nll_gather_kernel[type_of(nlay)]
+    ctx.enqueue_function[k](
+        TileTensor(logits, row_major(n * vocab)), TileTensor(tgt, nlay),
+        TileTensor(out, nlay), n, vocab,
+        grid_dim=ceildiv(n * WARP_SIZE, BLOCK), block_dim=BLOCK,
+    )
+    ctx.synchronize()
+    var res = List[Float32]()
+    with out.map_to_host() as m:
+        var mt = TileTensor(m, row_major(n))
+        for i in range(n):
+            res.append(rebind[Scalar[DType.float32]](mt[i]))
+    return res^
 
 def softcap(ctx: DeviceContext, mut x: DevBuf, n: Int, cap: Float32) raises:
     """In-place logit soft-capping x ← cap·tanh(x/cap) (Gemma)."""
