@@ -1,6 +1,7 @@
 """Per-layer hidden magnitude trace through the Qwen3-8B (arch 3) bf16 forward, to
 localize where the representation collapses (uniform logits => zero hidden)."""
 
+from std.sys import argv
 from std.gpu.host import DeviceContext
 from std.math import sqrt
 from layout import TileTensor, row_major
@@ -8,7 +9,8 @@ from qwen import load_weights
 from engine import new_session, upload_ids
 from tensor_ops import probe_simd_gemm, DevBuf
 
-comptime SNAP = "/Users/mseritan/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218"
+comptime SNAP_8B = "/Users/mseritan/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218"
+comptime SNAP_14B = "/Users/mseritan/.cache/huggingface/hub/models--Qwen--Qwen3-14B/snapshots/40c069824f4251a91eefaf281ebe4c544efd3e18"
 
 
 def dump(ctx: DeviceContext, mut h: DevBuf, T: Int, hd: Int, label: String) raises:
@@ -29,9 +31,13 @@ def dump(ctx: DeviceContext, mut h: DevBuf, T: Int, hd: Int, label: String) rais
 
 
 def main() raises:
+    var a = argv()
+    var is14 = len(a) > 1 and String(a[1]) == "14b"
+    var q4 = len(a) > 2 and String(a[2]) == "int4"
+    var snap = String(SNAP_14B) if is14 else String(SNAP_8B)
     var ctx = DeviceContext()
-    print("loading Qwen3-8B bf16…")
-    var w = load_weights(ctx, SNAP, False)
+    print("loading", "14B" if is14 else "8B", "int4" if q4 else "bf16", "…")
+    var w = load_weights(ctx, snap, q4)
     w.simd_ok = probe_simd_gemm(ctx)
     var hd = w.hidden
     print("arch=", w.arch, " hidden=", hd, " hq=", w.hq, " hkv=", w.hkv,

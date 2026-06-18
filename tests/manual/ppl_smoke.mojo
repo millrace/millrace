@@ -24,7 +24,8 @@ from engine import new_session, sess_token_logprobs
 from tokenizer import load_tokenizer_json, Tokenizer
 from tensor_ops import probe_simd_gemm
 
-comptime MAX_SEQ = 32768          # mirror server.MAX_SEQ (exercises the real KV size)
+comptime SESSION_LEN = 4096       # fits every model's KV; correctness, not deploy-fit
+                                  # (the server's per-model max_seq cap handles fit)
 comptime SENTENCE = "The capital of France is Paris, and the capital of Japan is Tokyo."
 comptime DEFAULT_MODEL = "Qwen/Qwen2.5-3B-Instruct"
 comptime DEFAULT_THRESHOLD = Float64(50.0)   # healthy ~8-13; broken is 100s..1e9
@@ -84,7 +85,7 @@ def main() raises:
 
     var w = load_weights(ctx, snap, True)
     w.simd_ok = probe_simd_gemm(ctx)
-    var s = new_session(ctx, MAX_SEQ, w.config().nlayers, w.config().nkv)
+    var s = new_session(ctx, SESSION_LEN, w.config().nlayers, w.config().nkv)
     var lp = sess_token_logprobs(ctx, w, s, ids)
     var nll = Float64(0.0)
     for i in range(len(lp)):
@@ -92,10 +93,13 @@ def main() raises:
     var ppl = exp(nll / Float64(len(lp)))
     print("  PPL:", ppl, " over", len(lp), "scored tokens")
 
-    # Sanity 2: a working model is well under the threshold; a broken forward /
-    # lm_head / KV over-commit yields uniform logits => PPL ~= vocab (~151936).
-    if not isfinite(ppl) or ppl >= threshold:
-        print("  FAIL: PPL", ppl, ">= threshold", threshold, "(broken forward/lm_head/KV)")
+    # Sanity 2: a healthy model lands in ~[2, threshold). Too HIGH => uniform logits
+    # (broken forward / lm_head / KV over-commit, PPL ~= vocab ~151936). Too LOW
+    # (PPL ~ 1) => degenerate/overconfident logits (NaN/Inf, e.g. an int4 overflow),
+    # which can't happen for natural text.
+    if not isfinite(ppl) or ppl >= threshold or ppl < 1.5:
+        print("  FAIL: PPL", ppl, "outside healthy [1.5,", threshold,
+              ") — broken/degenerate forward, lm_head, or KV")
         ok = False
 
     if ok:
