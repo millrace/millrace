@@ -25,12 +25,12 @@ from kernels import (
 )
 from tensor_ops import (
     BLOCK, DevBuf, WBuf, PBuf, QMat, qmat_bf16, mm_w_norm, mm_w_add, mm_w_silu_add,
-    embed_tokens, mm_norm, last_row, rmsnorm,
+    embed_tokens, mm_norm, last_row, rmsnorm, nll_gather,
 )
 from safetensors import (
     TensorEntry, gather_tensors, load_named, load_named_bf16, load_proj, fuse_pair, concat_bias,
 )
-from model_iface import ModelConfig, ModelWeights, FAMILY_QWEN, ACT_SILU, ACT_GELU
+from model_iface import ModelConfig, ModelWeights, FAMILY_QWEN, ACT_SILU, ACT_GELU, TOOL_QWEN
 from engine import new_session, upload_ids
 
 # Qwen2.5-0.5B preset (the default when the checkpoint matches hidden==896).
@@ -55,7 +55,10 @@ comptime FLASH_THRESHOLD = 20480
 
 @fieldwise_init
 struct Weights(Movable, ModelWeights):
-    var embed: WBuf            # bf16 — used as both embedding table and (tied) lm-head
+    var embed: WBuf            # bf16 — the input embedding table
+    var lm_head: WBuf         # bf16 — the output LM head. A 2nd copy of `embed` for
+                              # tied models (0.5B/3B/0.6B); the separate lm_head.weight
+                              # for untied Qwen3 chat models (8B/14B).
     var final_norm: DevBuf
     var ln1: List[DevBuf]
     var qkv: List[QMat]       # q_proj|k_proj|v_proj concatenated along N (one GEMV)
@@ -107,7 +110,7 @@ struct Weights(Movable, ModelWeights):
     def lm_logits(mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf) raises -> List[Float32]:
         # Final RMSNorm + tied LM head over the last row (Qwen: no final softcap).
         var hl = last_row(ctx, h, T, self.hidden)
-        var logits = mm_norm(ctx, hl, self.final_norm, self.embed, dummy, 1, self.hidden, self.vocab, 0)
+        var logits = mm_norm(ctx, hl, self.final_norm, self.lm_head, dummy, 1, self.hidden, self.vocab, 0)
         ctx.synchronize()
         var out = List[Float32]()
         with logits.map_to_host() as m:
@@ -119,7 +122,7 @@ struct Weights(Movable, ModelWeights):
     def lm_logits_all(mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf) raises -> List[Float32]:
         # All-row logits for spec-decode verification (Qwen: no final softcap).
         var n = T * self.vocab
-        var logits = mm_norm(ctx, h, self.final_norm, self.embed, dummy, T, self.hidden, self.vocab, 0)
+        var logits = mm_norm(ctx, h, self.final_norm, self.lm_head, dummy, T, self.hidden, self.vocab, 0)
         ctx.synchronize()
         var out = List[Float32]()
         with logits.map_to_host() as m:
@@ -127,6 +130,11 @@ struct Weights(Movable, ModelWeights):
             for i in range(n):
                 out.append(rebind[Scalar[DType.float32]](mt[i]))
         return out^
+
+    def token_logprobs(mut self, ctx: DeviceContext, mut h: DevBuf, n: Int,
+                       targets: List[Int], mut dummy: DevBuf) raises -> List[Float32]:
+        var logits = mm_norm(ctx, h, self.final_norm, self.lm_head, dummy, n, self.hidden, self.vocab, 0)
+        return nll_gather(ctx, logits, targets, n, self.vocab)
 
 
 def _hidden_size(entries: List[TensorEntry], name2idx: Dict[String, Int], pfx: String) raises -> Int:
@@ -163,14 +171,30 @@ def load_weights(ctx: DeviceContext, path: String, q4: Bool = False) raises -> W
     var inter = INTER
     var nlayers = NLAYERS
     var vocab = VOCAB
-    if is_qwen3:                 # Qwen3-Embedding-0.6B (decoupled q_dim + qk-norm)
-        arch = 2
-        hq = 16
+    if is_qwen3:                 # Qwen3 family (qk-norm, no qkv bias, head_dim 128, 8 kv)
         hkv = 8
         head_dim = 128
-        inter = 3072
-        nlayers = 28
-        vocab = 151669
+        if hidden == 1024:       # Qwen3-Embedding-0.6B (decoupled q_dim)
+            arch = 2
+            hq = 16
+            inter = 3072
+            nlayers = 28
+            vocab = 151669
+        elif hidden == 4096:     # Qwen3-8B (untied lm-head)
+            arch = 3
+            hq = 32
+            inter = 12288
+            nlayers = 36
+        elif hidden == 5120:     # Qwen3-14B (untied lm-head)
+            arch = 4
+            hq = 40
+            inter = 17408
+            nlayers = 40
+        else:
+            raise Error(
+                "unsupported Qwen3 hidden size " + String(hidden)
+                + " (expected 1024=Embedding-0.6B, 4096=8B, 5120=14B)"
+            )
     elif hidden == 2048:         # Qwen2.5-3B
         arch = 1
         hq = 16
@@ -182,7 +206,7 @@ def load_weights(ctx: DeviceContext, path: String, q4: Bool = False) raises -> W
         raise Error(
             "unsupported hidden size " + String(hidden)
             + " (expected 896 = Qwen2.5-0.5B, 2048 = Qwen2.5-3B,"
-            + " or 1024+q_norm = Qwen3-Embedding-0.6B)"
+            + " or a Qwen3 checkpoint with q_norm)"
         )
     var nkv = hkv * head_dim
     var q_dim = hq * head_dim    # Q-proj / attn-output width (decoupled for Qwen3)
@@ -190,6 +214,19 @@ def load_weights(ctx: DeviceContext, path: String, q4: Bool = False) raises -> W
     # int4 needs K (the reduction dim) to be a multiple of Q4_GROUP; hidden and
     # inter satisfy this for both supported archs. embed/lm-head stays bf16.
     var embed = load_named_bf16(ctx, paths, entries, name2idx, pfx + "embed_tokens.weight")
+    # LM head: untied checkpoints (Qwen3 8B/14B) ship a separate lm_head.weight;
+    # tied ones (0.5B/3B/0.6B) reuse the embedding, so load a 2nd copy of it so the
+    # logit path can always read self.lm_head without a tied/untied branch.
+    # `lm_head.weight` sits at the TOP level (sibling of `model.`), not under the
+    # `model.` prefix the body tensors use — so try the bare name too before tying.
+    var lm_head_name = pfx + "lm_head.weight"
+    if lm_head_name not in name2idx:
+        lm_head_name = String("lm_head.weight")
+    var lm_head: WBuf
+    if lm_head_name in name2idx:
+        lm_head = load_named_bf16(ctx, paths, entries, name2idx, lm_head_name)
+    else:
+        lm_head = load_named_bf16(ctx, paths, entries, name2idx, pfx + "embed_tokens.weight")
     var final_norm = load_named(ctx, paths, entries, name2idx, pfx + "norm.weight")
     var ln1 = List[DevBuf]()
     var qkv = List[QMat]()
@@ -210,8 +247,8 @@ def load_weights(ctx: DeviceContext, path: String, q4: Bool = False) raises -> W
         var qk = fuse_pair(ctx, qpw^, kpw^, q_dim, nkv, hidden, q4)
         qkv.append(fuse_pair(ctx, qk^, vpw^, q_dim + nkv, nkv, hidden, q4))
         # Qwen2.5 has q/k/v_proj biases (concatenated into the fused GEMV); Qwen3
-        # has none, so we push a size-1 dummy and pass use_bias=0 in qwen_layer.
-        if arch == 2:
+        # (arch >= 2) has none, so we push a size-1 dummy and pass use_bias=0.
+        if arch >= 2:
             qkv_b.append(ctx.enqueue_create_buffer[DType.float32](1))
             qnorm.append(load_named(ctx, paths, entries, name2idx, p + "self_attn.q_norm.weight"))
             knorm.append(load_named(ctx, paths, entries, name2idx, p + "self_attn.k_norm.weight"))
@@ -230,10 +267,10 @@ def load_weights(ctx: DeviceContext, path: String, q4: Bool = False) raises -> W
     # Behavior config: Qwen2.5 (arch 0/1) has QKV bias + no qk-norm; Qwen3 (arch 2)
     # is the reverse. All Gemma-only knobs stay off. θ/ε are shared across Qwen.
     var cfg = ModelConfig(
-        FAMILY_QWEN, nlayers, nkv, arch != 2, arch == 2, ACT_SILU, 0.0, 0.0, 0,
-        1000000.0, 1.0, 0.0, EOS1, EOS2,
+        FAMILY_QWEN, nlayers, nkv, arch < 2, arch >= 2, ACT_SILU, 0.0, 0.0, 0,
+        1000000.0, 1.0, 0.0, EOS1, EOS2, TOOL_QWEN, -1,
     )
-    return Weights(embed^, final_norm^, ln1^, qkv^, qkv_b^, ow^, ln2^, gate_up^, down^,
+    return Weights(embed^, lm_head^, final_norm^, ln1^, qkv^, qkv_b^, ow^, ln2^, gate_up^, down^,
                    qnorm^, knorm^, arch, nlayers, hidden, inter, nkv, hq, hkv, head_dim,
                    q_dim, vocab, False, q4, cfg^)
 
@@ -253,8 +290,8 @@ def rope_k(ctx: DeviceContext, mut kin: DevBuf, mut kc: DevBuf, mut knw: DevBuf,
     var nkv = hkv * head_dim
     var strd = in_stride if in_stride >= 0 else nkv
     var lay = row_major(Tq * strd)
-    var nlay = row_major(head_dim if arch == 2 else 1)
-    if arch == 2:
+    var nlay = row_major(head_dim if arch >= 2 else 1)
+    if arch >= 2:        # all Qwen3 (0.6B/8B/14B): 8 kv heads, head_dim 128, qk-norm
         comptime k = rope_k_kernel[type_of(lay), 8, 128, True]
         ctx.enqueue_function[k](
             TileTensor(kin, lay), TileTensor(kc, row_major(cache_len)), TileTensor(knw, nlay),
@@ -284,8 +321,8 @@ def rope_kv(ctx: DeviceContext, mut qkv: DevBuf, mut kc: DevBuf, mut vc: DevBuf,
     cache and copies V into the cache from the fused [q|k|v] buffer — one dispatch
     instead of two per layer."""
     var lay = row_major(Tq * in_stride)
-    var nlay = row_major(head_dim if arch == 2 else 1)
-    if arch == 2:
+    var nlay = row_major(head_dim if arch >= 2 else 1)
+    if arch >= 2:        # all Qwen3 (0.6B/8B/14B): 8 kv heads, head_dim 128, qk-norm
         comptime k = rope_kv_kernel[type_of(lay), 8, 128, True]
         ctx.enqueue_function[k](
             TileTensor(qkv, lay), TileTensor(kc, row_major(cache_len)), TileTensor(vc, row_major(cache_len)),
@@ -320,7 +357,7 @@ def attn_cached(ctx: DeviceContext, mut q: DevBuf, mut kc: DevBuf, mut vc: DevBu
     var q_dim = hq * head_dim
     var qstr = q_stride if q_stride >= 0 else q_dim
     var qslay = row_major(Tq * qstr)
-    var qnlay = row_major(head_dim if arch == 2 else 1)
+    var qnlay = row_major(head_dim if arch >= 2 else 1)
     var o = ctx.enqueue_create_buffer[DType.float32](Tq * q_dim)
     var lay = row_major(Tq * q_dim)
     var flash_decode = arch == 0 and q_offset + Tq > FLASH_THRESHOLD
@@ -331,6 +368,16 @@ def attn_cached(ctx: DeviceContext, mut q: DevBuf, mut kc: DevBuf, mut vc: DevBu
         var gd = ceildiv(Tq * hq * WARP_SIZE, BLOCK)
         if arch == 2:
             comptime k = attn_cached_rope_kernel[type_of(lay), 16, 8, 128, True]
+            ctx.enqueue_function[k](TileTensor(q, qslay), TileTensor(kc, row_major(cache_len)),
+                TileTensor(vc, row_major(cache_len)), TileTensor(qnw, qnlay), TileTensor(o, lay),
+                Tq, q_offset, qstr, q_off, grid_dim=gd, block_dim=BLOCK)
+        elif arch == 3:
+            comptime k = attn_cached_rope_kernel[type_of(lay), 32, 8, 128, True]
+            ctx.enqueue_function[k](TileTensor(q, qslay), TileTensor(kc, row_major(cache_len)),
+                TileTensor(vc, row_major(cache_len)), TileTensor(qnw, qnlay), TileTensor(o, lay),
+                Tq, q_offset, qstr, q_off, grid_dim=gd, block_dim=BLOCK)
+        elif arch == 4:
+            comptime k = attn_cached_rope_kernel[type_of(lay), 40, 8, 128, True]
             ctx.enqueue_function[k](TileTensor(q, qslay), TileTensor(kc, row_major(cache_len)),
                 TileTensor(vc, row_major(cache_len)), TileTensor(qnw, qnlay), TileTensor(o, lay),
                 Tq, q_offset, qstr, q_off, grid_dim=gd, block_dim=BLOCK)
@@ -351,6 +398,14 @@ def attn_cached(ctx: DeviceContext, mut q: DevBuf, mut kc: DevBuf, mut vc: DevBu
     var qlay = row_major(Tq * q_dim)
     if arch == 2:
         comptime kq = rope_q_kernel[type_of(qlay), 16, 128, True]
+        ctx.enqueue_function[kq](TileTensor(q, qslay), TileTensor(qr, qlay), TileTensor(qnw, qnlay),
+            Tq, q_offset, qstr, q_off, THETA, -1, grid_dim=ceildiv(Tq * hq, BLOCK), block_dim=BLOCK)
+    elif arch == 3:
+        comptime kq = rope_q_kernel[type_of(qlay), 32, 128, True]
+        ctx.enqueue_function[kq](TileTensor(q, qslay), TileTensor(qr, qlay), TileTensor(qnw, qnlay),
+            Tq, q_offset, qstr, q_off, THETA, -1, grid_dim=ceildiv(Tq * hq, BLOCK), block_dim=BLOCK)
+    elif arch == 4:
+        comptime kq = rope_q_kernel[type_of(qlay), 40, 128, True]
         ctx.enqueue_function[kq](TileTensor(q, qslay), TileTensor(qr, qlay), TileTensor(qnw, qnlay),
             Tq, q_offset, qstr, q_off, THETA, -1, grid_dim=ceildiv(Tq * hq, BLOCK), block_dim=BLOCK)
     elif arch == 1:
@@ -385,6 +440,20 @@ def attn_cached(ctx: DeviceContext, mut q: DevBuf, mut kc: DevBuf, mut vc: DevBu
                 TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset, Float32(-1.0), 0,
                 grid_dim=grid, block_dim=WARP_SIZE,
             )
+        elif arch == 3:
+            comptime k = tc_attn_kernel[type_of(lay), 32, 8, 128]
+            ctx.enqueue_function[k](
+                TileTensor(qr, row_major(Tq * q_dim)), TileTensor(kc, row_major(cache_len)),
+                TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset, Float32(-1.0), 0,
+                grid_dim=grid, block_dim=WARP_SIZE,
+            )
+        elif arch == 4:
+            comptime k = tc_attn_kernel[type_of(lay), 40, 8, 128]
+            ctx.enqueue_function[k](
+                TileTensor(qr, row_major(Tq * q_dim)), TileTensor(kc, row_major(cache_len)),
+                TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset, Float32(-1.0), 0,
+                grid_dim=grid, block_dim=WARP_SIZE,
+            )
         elif arch == 1:
             comptime k = tc_attn_kernel[type_of(lay), 16, 2, 128]
             ctx.enqueue_function[k](
@@ -402,6 +471,20 @@ def attn_cached(ctx: DeviceContext, mut q: DevBuf, mut kc: DevBuf, mut vc: DevBu
     elif arch == 2:
         # DECODE (Tq=1): warp-per-(query,head), keys split across the 32 lanes.
         comptime k = attn_cached_kernel[type_of(lay), 16, 8, 128]
+        ctx.enqueue_function[k](
+            TileTensor(qr, row_major(Tq * q_dim)), TileTensor(kc, row_major(cache_len)),
+            TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset,
+            grid_dim=ceildiv(Tq * hq * WARP_SIZE, BLOCK), block_dim=BLOCK,
+        )
+    elif arch == 3:
+        comptime k = attn_cached_kernel[type_of(lay), 32, 8, 128]
+        ctx.enqueue_function[k](
+            TileTensor(qr, row_major(Tq * q_dim)), TileTensor(kc, row_major(cache_len)),
+            TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset,
+            grid_dim=ceildiv(Tq * hq * WARP_SIZE, BLOCK), block_dim=BLOCK,
+        )
+    elif arch == 4:
+        comptime k = attn_cached_kernel[type_of(lay), 40, 8, 128]
         ctx.enqueue_function[k](
             TileTensor(qr, row_major(Tq * q_dim)), TileTensor(kc, row_major(cache_len)),
             TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset,

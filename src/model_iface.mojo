@@ -20,6 +20,11 @@ comptime FAMILY_GEMMA = 1
 comptime ACT_SILU = 0
 comptime ACT_GELU = 1
 
+# Tool-call / chat post-processing style (server reads ModelConfig.tool_style so
+# it never branches on family for behavior).
+comptime TOOL_QWEN = 0      # <tool_call>…</tool_call> JSON (parse_tool_calls)
+comptime TOOL_GEMMA = 1     # ```tool_code``` + thinking channel (parse_gemma_tool_calls)
+
 
 @fieldwise_init
 struct ModelConfig(ImplicitlyCopyable, Movable):
@@ -42,6 +47,8 @@ struct ModelConfig(ImplicitlyCopyable, Movable):
     var norm_offset: Float32    # 0.0 Qwen, 1.0 Gemma ((1+w) RMSNorm)
     var eos1: Int
     var eos2: Int
+    var tool_style: Int         # TOOL_QWEN / TOOL_GEMMA (chat post-processing)
+    var extra_stop: Int         # extra stop token id (-1 = none; Gemma's <|tool_response>)
 
 
 trait ModelWeights(Movable):
@@ -70,4 +77,11 @@ trait ModelWeights(Movable):
         # Logits for ALL T positions (row-major T×vocab), for speculative-decode
         # batch verification. Same head as `lm_logits` but over every row, not just
         # the last. Returns a flat host list of length T*vocab.
+        ...
+
+    def token_logprobs(mut self, ctx: DeviceContext, mut h: DevBuf, n: Int,
+                       targets: List[Int], mut dummy: DevBuf) raises -> List[Float32]:
+        # log P(targets[i] | h[i]) for the first n rows — the LM head (+ any softcap)
+        # followed by an on-GPU per-row log-softmax-of-target (nll_gather), so the
+        # n×vocab logits never reach the host. For perplexity / echo logprobs.
         ...

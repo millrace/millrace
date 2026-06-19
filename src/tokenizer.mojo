@@ -334,14 +334,26 @@ def load_tokenizer_json(path: String) raises -> Tokenizer:
     var merge_rank = Dict[Int, Int]()
     var merge_id = Dict[Int, Int]()
     ref mvals = merges.c[].vals
+    comptime VLIST = 6   # json.Value tag for a list (Qwen3+ merges are ["A","B"])
     for r in range(len(mvals)):
-        # "A B": neither side contains a literal space (byte 0x20 encodes as 'Ġ'),
-        # so split on the single separator; merged token = A concatenated with B.
-        var parts = String(mvals[r].s).split(" ")
-        if len(parts) != 2:
-            continue
-        var a = String(parts[0])
-        var b = String(parts[1])
+        # Two on-disk encodings: legacy Qwen2.5 stores each merge as the string
+        # "A B" (neither side contains a literal space — 0x20 encodes as 'Ġ'); newer
+        # tokenizer.json (Qwen3) stores it as a 2-element list ["A", "B"].
+        var a: String
+        var b: String
+        ref mr = mvals[r]
+        if mr.tag == VLIST:
+            ref pair = mr.c[].vals
+            if len(pair) != 2:
+                continue
+            a = String(pair[0].s)
+            b = String(pair[1].s)
+        else:
+            var parts = String(mr.s).split(" ")
+            if len(parts) != 2:
+                continue
+            a = String(parts[0])
+            b = String(parts[1])
         var merged = a + b
         if a not in vocab_map or b not in vocab_map or merged not in vocab_map:
             continue

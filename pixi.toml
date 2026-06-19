@@ -113,6 +113,11 @@ int4-quality = { cmd = "mkdir -p build && mojo build tests/manual/int4_quality.m
 gemma-serve-smoke = { cmd = "mkdir -p build && mojo build tests/manual/gemma_serve_smoke.mojo -I src -I ../jinja2.mojo/src -I ../flare -o build/gemma_serve_smoke && ./build/gemma_serve_smoke" }
 # Coherence smoke test for the gemma-4 e2b speculative-decode draft model (int4).
 e2b-smoke = { cmd = "mkdir -p build && mojo build tests/manual/e2b_smoke.mojo -I src -I ../jinja2.mojo/src -I ../flare -o build/e2b_smoke && ./build/e2b_smoke" }
+# Perplexity regression guard for the Qwen load+tokenize+serve stack: tokenize a
+# fixed sentence, run the server-equivalent forward (MAX_SEQ KV) and assert a
+# healthy PPL. Catches the per-char-tokenizer / uniform-logits / KV-over-commit
+# regressions. Default Qwen2.5-3B; pass an id+threshold for others (e.g. Qwen3-8B).
+ppl-smoke = { cmd = "mkdir -p build && mojo build tests/manual/ppl_smoke.mojo -I src -I ../jinja2.mojo/src -o build/ppl_smoke && ./build/ppl_smoke" }
 # Per-layer numeric validation of the e2b forward vs HF gemma4 (ids [2,4521,1902];
 # compare against max-backend/.scratch/e2b_hf_ref.py — argmax should be 236787).
 e2b-debug = { cmd = "mkdir -p build && mojo build tests/manual/e2b_debug.mojo -I src -I ../jinja2.mojo/src -I ../flare -o build/e2b_debug && ./build/e2b_debug" }

@@ -31,12 +31,12 @@ from kernels import rope_q_kernel, rope_k_kernel, tc_attn_kernel, vnorm_kernel
 from tensor_ops import (
     BLOCK, DevBuf, WBuf, QMat, qmat_bf16, mm_w, mm_norm, mm_w_norm,
     embed_tokens, last_row, rmsnorm, rmsnorm_add, add, gelu_mul_cat, gelu_mul,
-    gelu_mul_strided, softcap, mul_scalar, copy_strided,
+    gelu_mul_strided, softcap, mul_scalar, copy_strided, nll_gather,
 )
 from safetensors import (
     TensorEntry, gather_tensors, load_named, load_named_bf16, load_proj, fuse_pair,
 )
-from model_iface import ModelConfig, ModelWeights, FAMILY_GEMMA, ACT_GELU
+from model_iface import ModelConfig, ModelWeights, FAMILY_GEMMA, ACT_GELU, TOOL_GEMMA
 
 # ── e2b text dims (from text_config) ─────────────────────────────────────────
 comptime E_HIDDEN = 1536
@@ -154,6 +154,12 @@ struct GemmaE2bWeights(Movable, ModelWeights):
                 out.append(rebind[Scalar[DType.float32]](mt[i]))
         return out^
 
+    def token_logprobs(mut self, ctx: DeviceContext, mut h: DevBuf, n: Int,
+                       targets: List[Int], mut dummy: DevBuf) raises -> List[Float32]:
+        var logits = mm_norm(ctx, h, self.final_norm, self.embed, dummy, n, self.hidden, self.vocab, 0)
+        softcap(ctx, logits, n * self.vocab, E_FINAL_SOFTCAP)
+        return nll_gather(ctx, logits, targets, n, self.vocab)
+
 
 def _is_full_layer(l: Int) -> Bool:
     # layer_types: full_attention at 4,9,14,19,24,29,34 (every 5th, 1-indexed).
@@ -255,7 +261,7 @@ def load_e2b_weights(ctx: DeviceContext, path: String, q4: Bool = True) raises -
 
     var cfg = ModelConfig(
         FAMILY_GEMMA, E_NLAYERS, EFU_NKV, False, True, ACT_GELU, 0.0, E_FINAL_SOFTCAP,
-        E_SLIDING_WINDOW, ESL_THETA, E_EMBED_SCALE, 0.0, E_EOS1, E_EOS2,
+        E_SLIDING_WINDOW, ESL_THETA, E_EMBED_SCALE, 0.0, E_EOS1, E_EOS2, TOOL_GEMMA, 50,
     )
     return GemmaE2bWeights(
         embed^, embed_pl^, final_norm^, ln1^, ln_post_attn^, ln_pre_ff^, ln_post_ff^,

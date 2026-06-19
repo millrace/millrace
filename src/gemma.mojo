@@ -33,12 +33,12 @@ from layout import TileTensor, row_major
 from kernels import rope_q_kernel, rope_k_kernel, tc_attn_kernel, vnorm_kernel
 from tensor_ops import (
     BLOCK, DevBuf, WBuf, QMat, qmat_bf16, mm_w, mm_norm, mm_w_norm,
-    embed_tokens, last_row, rmsnorm, rmsnorm_add, add, gelu_mul_cat, softcap, mul_scalar,
+    embed_tokens, last_row, rmsnorm, rmsnorm_add, add, gelu_mul_cat, softcap, mul_scalar, nll_gather,
 )
 from safetensors import (
     TensorEntry, gather_tensors, load_named, load_named_bf16, load_proj, fuse_pair,
 )
-from model_iface import ModelConfig, ModelWeights, FAMILY_GEMMA, ACT_GELU
+from model_iface import ModelConfig, ModelWeights, FAMILY_GEMMA, ACT_GELU, TOOL_GEMMA
 
 # Gemma 4 12B-it dims (from text_config).
 comptime G_HIDDEN = 3840
@@ -131,6 +131,12 @@ struct GemmaWeights(Movable, ModelWeights):
                 out.append(rebind[Scalar[DType.float32]](mt[i]))
         return out^
 
+    def token_logprobs(mut self, ctx: DeviceContext, mut h: DevBuf, n: Int,
+                       targets: List[Int], mut dummy: DevBuf) raises -> List[Float32]:
+        var logits = mm_norm(ctx, h, self.final_norm, self.embed, dummy, n, self.hidden, self.vocab, 0)
+        softcap(ctx, logits, n * self.vocab, G_FINAL_SOFTCAP)
+        return nll_gather(ctx, logits, targets, n, self.vocab)
+
 
 def load_gemma_weights(ctx: DeviceContext, path: String, layers: List[Int], q4: Bool = False) raises -> GemmaWeights:
     """Load the Gemma text decoder. `layers` selects which decoder layers to
@@ -145,7 +151,12 @@ def load_gemma_weights(ctx: DeviceContext, path: String, layers: List[Int], q4: 
     var name2idx = Dict[String, Int]()
     for e in range(len(entries)):
         name2idx[entries[e].name] = e
+    # Text-decoder tensor prefix. Older Gemma-4 checkpoints use `language_model.model.`;
+    # newer transformers exports (e.g. the QAT-unquantized) swap the order to
+    # `model.language_model.`. Pick whichever the checkpoint actually has.
     var pfx = String("language_model.model.")
+    if (pfx + "embed_tokens.weight") not in name2idx:
+        pfx = String("model.language_model.")
 
     var embed = load_named_bf16(ctx, paths, entries, name2idx, pfx + "embed_tokens.weight")
     var final_norm = load_named(ctx, paths, entries, name2idx, pfx + "norm.weight")
@@ -221,7 +232,7 @@ def load_gemma_weights(ctx: DeviceContext, path: String, layers: List[Int], q4: 
     # (The per-layer test sizes its own caches.) norm_offset=0 (plain RMSNorm).
     var cfg = ModelConfig(
         FAMILY_GEMMA, G_NLAYERS, SL_NKV, False, True, ACT_GELU, 0.0, G_FINAL_SOFTCAP,
-        1024, SL_THETA, G_EMBED_SCALE, 0.0, G_EOS1, G_EOS2,
+        1024, SL_THETA, G_EMBED_SCALE, 0.0, G_EOS1, G_EOS2, TOOL_GEMMA, 50,   # 50 = <|tool_response>
     )
     return GemmaWeights(
         embed^, final_norm^, ln1^, ln_post_attn^, ln_pre_ff^, ln_post_ff^, qkv^, ow^,
