@@ -1,6 +1,7 @@
 # inference-server
 
-> Part of [**millfolio**](https://millfolio.app) — local-first LLM inference on Apple Silicon.
+> Part of [**millfolio**](https://millfolio.app), a private on-device document vault.
+> This is its inference engine — read more at [millfolio.app/server](https://millfolio.app/server).
 
 A from-scratch, **pure-Mojo** GPU inference engine for **Qwen2.5** (0.5B and 3B)
 on Apple Silicon (Metal), served over an OpenAI-compatible HTTP API. Every GPU
