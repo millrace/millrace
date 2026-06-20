@@ -19,7 +19,6 @@ and closing that gap is the interesting part.
 
 - **Performance numbers** (decode tok/s, prefill latency, the MLX/Ollama
   comparison) live on the site:
-  [millfolio.app/how-it-works](https://millfolio.app/how-it-works) and
   [millfolio.app/server](https://millfolio.app/server).
 - **The kernel-level deep dive** — the int4 GEMV bandwidth analysis, the
   simdgroup-matrix GEMM and tensor-core attention work — is in
