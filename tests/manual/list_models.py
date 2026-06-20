@@ -1,4 +1,4 @@
-"""List downloaded models and flag which millrace can serve.
+"""List downloaded models and flag which millfolio can serve.
 
 Scans the HuggingFace cache for models that actually have safetensors weights on
 disk (skipping metadata-only entries and .bin-only repos the engine can't load),
@@ -15,7 +15,7 @@ import sys
 
 from huggingface_hub import scan_cache_dir
 
-# hidden_size -> human label of the arch millrace's loader auto-detects.
+# hidden_size -> human label of the arch millfolio's loader auto-detects.
 SERVABLE = {896: "Qwen2.5-0.5B", 2048: "Qwen2.5-3B"}
 
 

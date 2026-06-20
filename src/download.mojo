@@ -189,7 +189,7 @@ def main() raises:
         base_url="",
         max_redirects=10,
         timeout_ms=TIMEOUT_MS,
-        user_agent="millrace-downloader/0.1",
+        user_agent="millfolio-downloader/0.1",
     )
 
     # 1) config.json first — mandatory, and its X-Repo-Commit pins the snapshot

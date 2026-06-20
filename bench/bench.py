@@ -7,7 +7,7 @@ Measures, per target, the two things that matter for an interactive coding agent
 plus a cold-vs-warm prefix test (does a follow-up turn reuse the cached prefix?).
 
 Method — the **two-point** trick, engine-agnostic (works whether a server streams
-token-by-token like MLX/Ollama or batches-then-streams like millrace):
+token-by-token like MLX/Ollama or batches-then-streams like millfolio):
   * T(1) = wall time of a non-streaming completion with max_tokens=1  ≈ prefill
   * T(N) = wall time with max_tokens=N
   * decode tok/s = (tokens@N − tokens@1) / (T(N) − T(1))
@@ -20,13 +20,13 @@ the running endpoints. Unreachable targets are skipped.
 Methodology guards: N warmup runs discarded, R repeats, report median + min/max,
 temperature 0 (greedy) for stable decode lengths, optional cooldown between
 targets to limit M4 thermal throttling. Quantization differs across engines by
-default (millrace 0.5B bf16 / 3B int4; MLX & Ollama ~4-bit) — that mismatch is
+default (millfolio 0.5B bf16 / 3B int4; MLX & Ollama ~4-bit) — that mismatch is
 real and is printed in the report header; read speed numbers with it in mind.
 
 Stdlib only (urllib) so it runs under any python3. Usage:
 
     python3 bench/bench.py                      # all targets in targets.json
-    python3 bench/bench.py --only millrace,mlx  # subset
+    python3 bench/bench.py --only millfolio,mlx  # subset
     python3 bench/bench.py --doctor             # just check which endpoints are up
     python3 bench/bench.py --repeats 7 --max-tokens 256 --out bench/results/run.json
 """

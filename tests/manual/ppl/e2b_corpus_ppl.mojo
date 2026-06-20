@@ -1,4 +1,4 @@
-"""Corpus perplexity for the millrace e2b model (gemma_e2b.mojo), comparable to
+"""Corpus perplexity for the millfolio e2b model (gemma_e2b.mojo), comparable to
 the assay numbers for Qwen / 12B. Reads pre-tokenized windows (BOS-prepended) from
 .scratch/e2b_corpus_ids.txt — one window per line, space-separated token ids — runs
 a teacher-forced forward per window, and aggregates NLL corpus-wide:
@@ -13,7 +13,7 @@ from engine import new_session, upload_ids
 from tensor_ops import probe_simd_gemm
 
 comptime SNAP = "/Users/mseritan/.cache/huggingface/hub/models--mlx-community--gemma-4-e2b-it-bf16/snapshots/22a2753af6114b0c364f09921771b458e40b9e09"
-comptime IDS = "/Users/mseritan/dev/millrace/inference-server/.scratch/e2b_corpus_ids.txt"
+comptime IDS = "/Users/mseritan/dev/millfolio/engine/.scratch/e2b_corpus_ids.txt"
 
 
 def main() raises:

@@ -2,7 +2,7 @@
 
 Loads the e2b checkpoint into Gemma4ForCausalLM (same path as e2b_hf_ref.py),
 teacher-forces a token sequence, and prints logP(token_k | t0..t_{k-1}) for each
-position. Compare against millrace's e2b token_logprobs to validate the shared
+position. Compare against millfolio's e2b token_logprobs to validate the shared
 forward kernels are *calibration*-correct (not just argmax-correct)."""
 import os, glob, json, math
 import torch
@@ -29,7 +29,7 @@ model.eval()
 tok = AutoTokenizer.from_pretrained(SNAP)
 SENT = "The Time Traveller (for so it will be convenient to speak of him) was expounding a recondite matter to us."
 ids = tok(SENT, add_special_tokens=False)["input_ids"]
-ids = [2] + ids   # prepend BOS, matching millrace's Gemma raw-text path
+ids = [2] + ids   # prepend BOS, matching millfolio's Gemma raw-text path
 print("IDS=" + json.dumps(ids))
 
 with torch.no_grad():

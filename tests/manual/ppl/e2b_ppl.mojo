@@ -1,6 +1,6 @@
-"""Dump millrace e2b per-position logprobs for a fixed token sequence, to compare
+"""Dump millfolio e2b per-position logprobs for a fixed token sequence, to compare
 against the HF gemma4-e2b reference (.scratch/e2b_ppl_ref.py). Same ids fed to
-both; if millrace is flat (no near-0 logprobs on predictable tokens) while HF is
+both; if millfolio is flat (no near-0 logprobs on predictable tokens) while HF is
 confident, the shared logprobs/final-norm path is miscalibrated."""
 
 from std.gpu.host import DeviceContext
@@ -35,10 +35,10 @@ def main() raises:
     var lp = gw.token_logprobs(ctx, h, T - 1, targets, s.dummy)
 
     var nll = Float64(0.0)
-    print("MILLRACE_E2B_LP=[null", end="")
+    print("MILLFOLIO_E2B_LP=[null", end="")
     for i in range(len(lp)):
         print(",", lp[i], end="")
         nll += -Float64(lp[i])
     print("]")
     var mean = nll / Float64(len(lp))
-    print("MILLRACE_E2B mean_nll=", mean, " PPL=", 2.718281828459045 ** mean)
+    print("MILLFOLIO_E2B mean_nll=", mean, " PPL=", 2.718281828459045 ** mean)

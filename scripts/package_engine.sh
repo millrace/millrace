@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Build runner.zip — the engine ("runner") source bundle the Millrace menu app
+# Build runner.zip — the engine ("runner") source bundle the Millfolio menu app
 # downloads, then `mojo build`s on-device against a separately-fetched Mojo
-# compiler (see millrace/app Bootstrapper). The bundle unzips to three siblings:
+# compiler (see millfolio/app Bootstrapper). The bundle unzips to three siblings:
 #
 #   inference-server/   src + assets +
 #                   build/{libflare_tls.so + libssl.3 + libcrypto.3, rpath-fixed}

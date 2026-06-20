@@ -2,7 +2,7 @@
 
 `bench.py` measures **prefill latency**, **decode tok/s** (steady-state
 generation), and a **cold-vs-warm prefix** test across any local
-OpenAI-compatible servers — millrace, `mlx_lm.server`, and Ollama all expose
+OpenAI-compatible servers — millfolio, `mlx_lm.server`, and Ollama all expose
 POST `/v1/chat/completions`, so one harness drives all three identically.
 
 **Method — the two-point trick** (engine-agnostic, robust to how a server
@@ -22,15 +22,15 @@ Unreachable targets are skipped, so benchmark whatever is up.
 ```sh
 pixi run bench --doctor                 # which endpoints are reachable
 pixi run bench                          # benchmark all reachable targets
-pixi run bench -- --only millrace,ollama-3b --repeats 7 --out bench/results/run.json
+pixi run bench -- --only millfolio,ollama-3b --repeats 7 --out bench/results/run.json
 ```
 
 ## Starting each engine
 
-One model per server instance for millrace/MLX (Ollama serves many). Default
-ports: millrace 8000, MLX 8080, Ollama 11434.
+One model per server instance for millfolio/MLX (Ollama serves many). Default
+ports: millfolio 8000, MLX 8080, Ollama 11434.
 
-**millrace** (this repo):
+**millfolio** (this repo):
 ```sh
 pixi run serve                                              # 0.5B bf16
 QWEN_SAFETENSORS=<path-to-Qwen2.5-3B-Instruct> QWEN_Q4=1 pixi run serve   # 3B int4
@@ -58,10 +58,10 @@ ollama pull qwen2.5:3b
 - **cold→warm**: a lower *warm* TTFT means the engine reused the cached
   conversation prefix instead of re-prefilling it.
 - **Quantization differs by engine** and is printed per target (model id):
-  millrace 0.5B is bf16 / 3B is group-128 int4; MLX & Ollama default to ~4-bit.
+  millfolio 0.5B is bf16 / 3B is group-128 int4; MLX & Ollama default to ~4-bit.
   A 4-bit engine moving fewer weight bytes will show faster decode — that is a
   quantization gap, not purely an engine-efficiency gap. Compare like with like
-  (e.g. millrace-3B-int4 vs mlx/ollama 4-bit 3B).
+  (e.g. millfolio-3B-int4 vs mlx/ollama 4-bit 3B).
 
 Results JSON (with `--out`) records every median/min/max plus the resolved model
 id and token-count source (`usage` if the server reports it, else streamed-delta

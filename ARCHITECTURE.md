@@ -1,6 +1,6 @@
 # inference-server — Architecture
 
-A **native-Mojo** re-implementation of the millrace inference path. Where
+A **native-Mojo** re-implementation of the millfolio inference path. Where
 [`../max-backend`](../max-backend/ARCHITECTURE.md) drives MAX's *Python* pipeline
 over Mojo↔Python interop (its Phase-2 pivot, since no MAX *Mojo* Graph API
 ships), this repo takes on the piece max-backend explicitly deferred: **writing
@@ -390,7 +390,7 @@ that was the conscious deviation forced by the missing MAX Mojo Graph API (its
 straight to the GPU, the path max-backend could *not* use because MAX's Metal
 kernels were broken (its §8 #2), but which its isolation ladder showed is open to
 hand-written Mojo kernels. When the engine here is proven (Phase 4) and the
-server is ported (Phase 6), the millrace request path is pure Mojo from socket to
+server is ported (Phase 6), the millfolio request path is pure Mojo from socket to
 logits, running on the Apple Silicon GPU, with **no Python and no MAX at
 runtime** — the stance max-backend set out with and had to defer. MAX survives
 only as the CPU oracle that tells us our GPU kernels are right.
@@ -507,7 +507,7 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
     resolved (Phase 6b, ✅).** The server began on raw libc sockets because
     **flare pinned Mojo `==1.0.0b1`** while this engine needs the `1.0.0b2`
     nightly's `std.gpu`/`TileTensor` API. That conflict is now **fixed in the
-    `../flare` fork (millrace/flare)**, so `src/server.mojo` reuses flare's
+    `../flare` fork (millfolio/flare)**, so `src/server.mojo` reuses flare's
     kqueue reactor + `Router`/`Handler`/SSE — the same layer max-backend uses —
     wired to *this* engine's GPU generation instead of MAX. The bump was small:
     1.0.0b2 makes `UnsafePointer` **non-nullable**, so flare's 19
@@ -542,7 +542,7 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
     position) in model.mojo — `sess_prefill`/`sess_step` — shared by greedy,
     sampled, and streaming (greedy parity gate still passes). **opencode
     integration:** `pixi run opencode` queries the server's `/v1/models`
-    (`opencode_config.py`) and generates a config declaring a `millrace` provider
+    (`opencode_config.py`) and generates a config declaring a `millfolio` provider
     (`@ai-sdk/openai-compatible`) for exactly the served model, then points
     opencode at it. Empirically opencode drives **`/v1/chat/completions`** (not
     `/v1/responses` as max-backend's note guessed — that provider uses chat

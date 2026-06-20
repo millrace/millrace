@@ -84,10 +84,10 @@ comptime MODEL_GEMMA = "google/gemma-4-12b-it"
 # the embedding endpoint stays unloaded (/v1/embeddings → 503).
 comptime MODEL_EMBED = "Qwen/Qwen3-Embedding-0.6B"
 comptime PORT = 8000
-# Engine version, reported by GET /v1/version (used by the Millrace menu app to
+# Engine version, reported by GET /v1/version (used by the Millfolio menu app to
 # detect a running engine and show its version). Bump on releases. Placeholder
 # scheme for now; wire to a real build/version source later.
-comptime MILLRACE_VERSION = "0.1.0"
+comptime MILLFOLIO_VERSION = "0.1.0"
 
 # jinja2.mojo Value tags (value.mojo)
 comptime VBOOL = 2
@@ -117,8 +117,8 @@ comptime SPEC_COLD_LIMIT = 2
 comptime SPEC_COOLDOWN = 32
 
 # Responses-API ids (opencode / Vercel AI SDK)
-comptime RESP_ID = "resp_millrace"
-comptime MSG_ID = "msg_millrace"
+comptime RESP_ID = "resp_millfolio"
+comptime MSG_ID = "msg_millfolio"
 
 
 # ── Shared model state ───────────────────────────────────────────────────────
@@ -297,7 +297,7 @@ struct Reply(Movable):
     var ids: List[Int]      # generated token ids (EOS dropped)
     var stopped: Bool       # True if generation ended on EOS, False if length cap
     # Per-request stats (also printed to stdout) — surfaced to clients as a
-    # non-standard `"millrace"` field so a UI can show prefill cost + throughput.
+    # non-standard `"millfolio"` field so a UI can show prefill cost + throughput.
     var n_prompt: Int       # prompt tokens
     var reused: Int         # prompt tokens served from the KV cache (not recomputed)
     var prefilled: Int      # prompt tokens actually prefilled this request
@@ -544,11 +544,11 @@ def html_response(s: String) -> Response:
 
 def chat_page() -> String:
     """A minimal self-contained chat UI served at `/` — streams from
-    /v1/chat/completions and shows the per-request `millrace` stats (prefill cost
+    /v1/chat/completions and shows the per-request `millfolio` stats (prefill cost
     + throughput) under each answer. The whole point: surface the timing the
     server logs to stdout in the browser. No backslash escapes (the SSE newline
     is built with String.fromCharCode) so this stays a verbatim Mojo string."""
-    return """<!doctype html><html><head><meta charset="utf-8"><title>millrace</title>
+    return """<!doctype html><html><head><meta charset="utf-8"><title>millfolio</title>
 <style>
  :root{--bg:#122632;--ink:#eaf1f6;--muted:#9fb4c2;--accent:#ff7a1c;--line:rgba(159,180,194,.18)}
  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,Inter,system-ui,sans-serif}
@@ -562,7 +562,7 @@ def chat_page() -> String:
        color:var(--ink);padding:.6rem .8rem;font:inherit}
  button{background:var(--accent);border:0;border-radius:8px;color:#1a1207;font-weight:600;padding:0 1.1rem;cursor:pointer}
 </style></head><body><main>
- <h1>millrace</h1><p class="sub" id="model">local chat — with prefill + throughput stats</p>
+ <h1>millfolio</h1><p class="sub" id="model">local chat — with prefill + throughput stats</p>
  <div id="log"></div>
  <form id="f"><input id="q" placeholder="Ask something..." autocomplete="off" autofocus><button>Send</button></form>
 <script>
@@ -575,7 +575,7 @@ def chat_page() -> String:
  document.getElementById('f').onsubmit=async function(e){
    e.preventDefault();var inp=document.getElementById('q');var q=inp.value.trim();if(!q)return;inp.value='';
    add('you','');document.getElementById('log').lastChild.lastChild.textContent=q;
-   var out=add('millrace');var st=document.createElement('div');st.className='stats';st.textContent='generating...';
+   var out=add('millfolio');var st=document.createElement('div');st.className='stats';st.textContent='generating...';
    out.div.appendChild(st);
    var r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},
      body:JSON.stringify({stream:true,messages:[{role:'user',content:q}]})});
@@ -586,7 +586,7 @@ def chat_page() -> String:
        if(!line)continue;var data=line.slice(5).trim();if(data==='[DONE]')continue;
        var o;try{o=JSON.parse(data)}catch(_){continue}
        var ch=o.choices&&o.choices[0]&&o.choices[0].delta&&o.choices[0].delta.content;if(ch)out.span.textContent+=ch;
-       if(o.millrace){var m=o.millrace;st.textContent='prefill '+m.prefill_ms+' ms  ·  '+m.tok_per_s+' tok/s  ·  prompt '
+       if(o.millfolio){var m=o.millfolio;st.textContent='prefill '+m.prefill_ms+' ms  ·  '+m.tok_per_s+' tok/s  ·  prompt '
          +m.prompt_tokens+' (reused '+m.reused+', prefilled '+m.prefilled+')  ·  gen '+m.gen_tokens+' tok';}
      }document.getElementById('log').scrollTop=1e9;}
  };
@@ -603,7 +603,7 @@ def service_unavailable(msg: String) -> Response:
     return resp^
 
 def _model_obj(id: String) -> String:
-    return ('{"id":"' + id + '","object":"model","created":0,"owned_by":"millrace"}')
+    return ('{"id":"' + id + '","object":"model","created":0,"owned_by":"millfolio"}')
 
 def models_json(model: String, embed_model: String) -> String:
     """List the chat model, plus the embedding model when one is loaded
@@ -615,7 +615,7 @@ def models_json(model: String, embed_model: String) -> String:
 
 def version_json(model: String) -> String:
     return (
-        '{"engine":"millrace","version":"' + MILLRACE_VERSION
+        '{"engine":"millfolio","version":"' + MILLFOLIO_VERSION
         + '","model":"' + model + '"}'
     )
 
@@ -639,9 +639,9 @@ def embeddings_json(model: String, data: String, n_tok: Int) -> String:
         + ',"total_tokens":' + String(n_tok) + "}}"
     )
 
-def millrace_stats(r: Reply) -> String:
-    """The non-standard `millrace` stats object (prefill cost + decode throughput).
-    Additive top-level field — OpenAI clients ignore unknown fields, a millrace
+def millfolio_stats(r: Reply) -> String:
+    """The non-standard `millfolio` stats object (prefill cost + decode throughput).
+    Additive top-level field — OpenAI clients ignore unknown fields, a millfolio
     UI reads it. Mirrors the `gen:` line the server logs to stdout."""
     return (
         '{"prefill_ms":' + String(Int(r.pf_ms + 0.5))
@@ -661,11 +661,11 @@ def _reasoning_field(reasoning: String) -> String:
     return String("")
 
 def completion_json(model: String, content: String, n_prompt: Int, n_gen: Int,
-                    finish: String, millrace: String = String(""),
+                    finish: String, millfolio: String = String(""),
                     reasoning: String = String("")) -> String:
-    var extra = (',"millrace":' + millrace) if millrace.byte_length() > 0 else String("")
+    var extra = (',"millfolio":' + millfolio) if millfolio.byte_length() > 0 else String("")
     return (
-        '{"id":"chatcmpl-millrace","object":"chat.completion","created":0,"model":"'
+        '{"id":"chatcmpl-millfolio","object":"chat.completion","created":0,"model":"'
         + model + '","choices":[{"index":0,"message":{"role":"assistant","content":"'
         + content + '"' + _reasoning_field(reasoning) + '},"finish_reason":"' + finish + '"}],'
         + '"usage":{"prompt_tokens":' + String(n_prompt)
@@ -677,22 +677,22 @@ def chunk_reasoning_json(model: String, reasoning: String) -> String:
     """A streaming chunk carrying reasoning as a `reasoning_content` delta
     (`reasoning` must already be JSON-escaped)."""
     return (
-        '{"id":"chatcmpl-millrace","object":"chat.completion.chunk","created":0,"model":"'
+        '{"id":"chatcmpl-millfolio","object":"chat.completion.chunk","created":0,"model":"'
         + model + '","choices":[{"index":0,"delta":{"reasoning_content":"' + reasoning
         + '"},"finish_reason":null}]}'
     )
 
 def chunk_json(model: String, delta: String, finish: Bool, fin: String,
-               millrace: String = String("")) -> String:
+               millfolio: String = String("")) -> String:
     var delta_obj = String("{}")
     var finish_reason = String("null")
     if finish:
         finish_reason = '"' + fin + '"'
     else:
         delta_obj = '{"content":"' + delta + '"}'
-    var extra = (',"millrace":' + millrace) if millrace.byte_length() > 0 else String("")
+    var extra = (',"millfolio":' + millfolio) if millfolio.byte_length() > 0 else String("")
     return (
-        '{"id":"chatcmpl-millrace","object":"chat.completion.chunk","created":0,"model":"'
+        '{"id":"chatcmpl-millfolio","object":"chat.completion.chunk","created":0,"model":"'
         + model + '","choices":[{"index":0,"delta":' + delta_obj
         + ',"finish_reason":' + finish_reason + "}]" + extra + "}"
     )
@@ -723,7 +723,7 @@ def completion_tools_json(model: String, content: String, calls: List[ToolCall],
     if content.byte_length() > 0:
         content_field = '"' + esc(content) + '"'
     return (
-        '{"id":"chatcmpl-millrace","object":"chat.completion","created":0,"model":"'
+        '{"id":"chatcmpl-millfolio","object":"chat.completion","created":0,"model":"'
         + model + '","choices":[{"index":0,"message":{"role":"assistant","content":'
         + content_field + _reasoning_field(esc(reasoning)) + ',"tool_calls":' + tool_calls_array_json(calls)
         + '},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":' + String(n_prompt)
@@ -734,7 +734,7 @@ def completion_tools_json(model: String, content: String, calls: List[ToolCall],
 def chunk_role_json(model: String) -> String:
     """Opening streaming chunk announcing the assistant role (content null)."""
     return (
-        '{"id":"chatcmpl-millrace","object":"chat.completion.chunk","created":0,"model":"'
+        '{"id":"chatcmpl-millfolio","object":"chat.completion.chunk","created":0,"model":"'
         + model + '","choices":[{"index":0,"delta":{"role":"assistant","content":null}'
         + ',"finish_reason":null}]}'
     )
@@ -749,7 +749,7 @@ def chunk_toolcall_json(model: String, i: Int, call: ToolCall) -> String:
         + '","arguments":"' + esc(call.arguments) + '"}}]}'
     )
     return (
-        '{"id":"chatcmpl-millrace","object":"chat.completion.chunk","created":0,"model":"'
+        '{"id":"chatcmpl-millfolio","object":"chat.completion.chunk","created":0,"model":"'
         + model + '","choices":[{"index":0,"delta":' + delta + ',"finish_reason":null}]}'
     )
 
@@ -780,7 +780,7 @@ def output_message_json(content: String, status: String) -> String:
 def output_reasoning_json(reasoning: String, status: String) -> String:
     """A Responses-API `reasoning` output item (`reasoning` pre-escaped)."""
     return (
-        '{"type":"reasoning","id":"rs_millrace","status":"' + status
+        '{"type":"reasoning","id":"rs_millfolio","status":"' + status
         + '","summary":[{"type":"summary_text","text":"' + reasoning + '"}]}'
     )
 
@@ -836,7 +836,7 @@ struct Api(Handler, Copyable, Movable):
         var is_post = req.method == Method.POST
 
         if path == "/health":
-            return ok("millrace ok")
+            return ok("millfolio ok")
         if path == "/":
             return html_response(chat_page())
         if path == "/v1/models":
@@ -905,7 +905,7 @@ struct Api(Handler, Copyable, Movable):
             lp_arr += "," + String(lps[i])
         lp_arr += "]"
         print("  completions: ", len(tokens), " tok scored", sep="")
-        return ok_json('{"id":"cmpl-millrace","object":"text_completion","model":"'
+        return ok_json('{"id":"cmpl-millfolio","object":"text_completion","model":"'
             + s.model_id + '","choices":[{"text":"","index":0,"logprobs":{"tokens":'
             + tok_arr + ',"token_logprobs":' + lp_arr
             + '},"finish_reason":"length"}],"usage":{"prompt_tokens":'
@@ -999,7 +999,7 @@ struct Api(Handler, Copyable, Movable):
         var r = gen_full(s, ids, max_new, temp, top_k, top_p)
         var fin = String("stop") if r.stopped else String("length")
         print("  chat: ", len(r.ids), " tokens [", fin, "]", sep="")
-        var stats = millrace_stats(r)
+        var stats = millfolio_stats(r)
         var has_tools = req_has_tools(bv)
 
         # Gemma: always post-process — split off the thinking channel (surfaced as
@@ -1058,7 +1058,7 @@ struct Api(Handler, Copyable, Movable):
             var deltas = stream_deltas(s, r.ids)
             for i in range(len(deltas)):
                 ch.push(SseEvent.message(chunk_json(s.model_id, deltas[i], False, fin)))
-            # The final chunk carries the millrace stats (generation is already
+            # The final chunk carries the millfolio stats (generation is already
             # done by here, so they're complete).
             ch.push(SseEvent.message(chunk_json(s.model_id, "", True, fin, stats)))
             ch.push(SseEvent.message("[DONE]"))
@@ -1241,7 +1241,7 @@ def hf_cache_path(model_id: String) raises -> String:
 
 
 struct Config(Copyable, Movable):
-    """Server config from ~/.config/millrace/config.json (+ env). All keys optional;
+    """Server config from ~/.config/millfolio/config.json (+ env). All keys optional;
     precedence is: env var > config file > built-in default."""
     var port: Int
     var model: String       # default chat model/checkpoint (when no CLI arg / $QWEN_SAFETENSORS)
@@ -1271,7 +1271,7 @@ def _config_atoi(s: String, default: Int) -> Int:
 
 
 def load_config() -> Config:
-    """Load ~/.config/millrace/config.json (override path: $MILLRACE_CONFIG).
+    """Load ~/.config/millfolio/config.json (override path: $MILLFOLIO_CONFIG).
     Recognized keys: port (int), model (str), embed_model (str), q4 (bool),
     kv_budget_mb (int, MiB). `model` is the chat model; `embed_model` is the
     secondary embedding model (HF id or checkpoint path, same treatment as
@@ -1282,9 +1282,9 @@ def load_config() -> Config:
     var q4 = False
     var kv_mb = Int(KV_BUDGET_BYTES) // (1024 * 1024)   # default 8 GiB -> 8192 MiB
 
-    var path = String(getenv("MILLRACE_CONFIG"))
+    var path = String(getenv("MILLFOLIO_CONFIG"))
     if path.byte_length() == 0:
-        path = String(getenv("HOME")) + "/.config/millrace/config.json"
+        path = String(getenv("HOME")) + "/.config/millfolio/config.json"
     try:
         var v = parse_json(read_text(path))
         port = get_int(v, "port", port)
@@ -1300,7 +1300,7 @@ def load_config() -> Config:
         pass  # missing / unreadable / malformed config -> defaults
 
     # env overrides (where one exists)
-    var ep = String(getenv("MILLRACE_PORT"))
+    var ep = String(getenv("MILLFOLIO_PORT"))
     if ep.byte_length() > 0:
         port = _config_atoi(ep, port)
     if String(getenv("QWEN_Q4")) == "1":
@@ -1309,7 +1309,7 @@ def load_config() -> Config:
 
 
 def main() raises:
-    # Config: ~/.config/millrace/config.json (+ env). Path override: $MILLRACE_CONFIG.
+    # Config: ~/.config/millfolio/config.json (+ env). Path override: $MILLFOLIO_CONFIG.
     var cfg = load_config()
     # Checkpoint selection: `serve <hf-id-or-path>` (CLI) > $QWEN_SAFETENSORS >
     # config `model` > meta.txt. An HF id resolves to its cached snapshot dir; the
@@ -1437,7 +1437,7 @@ def main() raises:
     var sess = new_session(ctx, p_maxseq, p_nlayers, p_nkv)
 
     # Disk-backed prefix cache (per model), survives restarts.
-    var kvdir = String(getenv("HOME")) + "/.cache/millrace/kv/" + _slug(model_id)
+    var kvdir = String(getenv("HOME")) + "/.cache/millfolio/kv/" + _slug(model_id)
     var bcache = BlockCache(kvdir, BLOCK_TOK, p_nkv, p_nlayers, cfg.kv_budget_mb * 1024 * 1024, model_id)  # MiB -> bytes
     if bcache.enabled:
         print("  kv-cache: ", kvdir, " (", len(bcache.order), " blocks cached, cap ",
@@ -1513,7 +1513,7 @@ def main() raises:
     sp.init_pointee_move(state^)
     var api = Api(sp)
 
-    print("millrace serving on http://127.0.0.1:", cfg.port, "  (flare)  v", MILLRACE_VERSION, sep="")
+    print("millfolio serving on http://127.0.0.1:", cfg.port, "  (flare)  v", MILLFOLIO_VERSION, sep="")
     print("  GET  /v1/models")
     print("  GET  /v1/version")
     print("  POST /v1/chat/completions  (stream + non-stream)")

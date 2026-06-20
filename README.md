@@ -1,6 +1,6 @@
 # inference-server
 
-> Part of [**millrace**](https://millrace.app) — local-first LLM inference on Apple Silicon.
+> Part of [**millfolio**](https://millfolio.app) — local-first LLM inference on Apple Silicon.
 
 A from-scratch, **pure-Mojo** GPU inference engine for **Qwen2.5** (0.5B and 3B)
 on Apple Silicon (Metal), served over an OpenAI-compatible HTTP API. Every GPU
@@ -18,7 +18,7 @@ gap is the interesting part, and it's documented honestly below.
 
 **Approach**
 
-|                     | **millrace**                          | [MLX](https://github.com/ml-explore/mlx) ([`mlx-lm`](https://github.com/ml-explore/mlx-lm)) | [Ollama](https://github.com/ollama/ollama) ([`llama.cpp`](https://github.com/ggml-org/llama.cpp)) |
+|                     | **millfolio**                          | [MLX](https://github.com/ml-explore/mlx) ([`mlx-lm`](https://github.com/ml-explore/mlx-lm)) | [Ollama](https://github.com/ollama/ollama) ([`llama.cpp`](https://github.com/ggml-org/llama.cpp)) |
 |---------------------|---------------------------------------|------------------------------|-----------------------------|
 | Implementation      | pure Mojo                             | C++/Metal core, Python API   | C/C++, Metal backend        |
 | GPU kernels         | custom-written Mojo (Metal via AIR)   | MLX framework                | llama.cpp Metal shaders     |
@@ -31,7 +31,7 @@ gap is the interesting part, and it's documented honestly below.
 isolation (`pixi run bench`; two-point method). Lower-is-better for prefill,
 higher-is-better for decode.
 
-| metric (3B, 4-bit)            | **millrace** (int4) | MLX (4-bit) | Ollama (4-bit) |
+| metric (3B, 4-bit)            | **millfolio** (int4) | MLX (4-bit) | Ollama (4-bit) |
 |-------------------------------|--------------------:|------------:|---------------:|
 | decode (tok/s)                |               ~18   |        52   |          47    |
 | prefill, ~70-tok prompt (ms)  |      ~390 (was 540) |       220   |         165    |
@@ -177,7 +177,7 @@ loads the weights onto the GPU, and listens on **http://127.0.0.1:8000**:
 serving Qwen/Qwen2.5-0.5B-Instruct  (hidden=896, layers=24, heads=14/2, head_dim=64)
   prefill GEMM: simdgroup-matrix (~4.5x)
   weights: bf16
-millrace serving on http://127.0.0.1:8000  (flare)
+millfolio serving on http://127.0.0.1:8000  (flare)
   GET  /v1/models
   POST /v1/chat/completions  (stream + non-stream)
   POST /v1/responses         (stream + non-stream)
@@ -192,13 +192,13 @@ curl -s localhost:8000/v1/chat/completions \
 
 ## Configuration
 
-Optional config at `~/.config/millrace/config.json` (override the path with
-`MILLRACE_CONFIG`), parsed with the same jinja2.mojo json the server uses for requests.
+Optional config at `~/.config/millfolio/config.json` (override the path with
+`MILLFOLIO_CONFIG`), parsed with the same jinja2.mojo json the server uses for requests.
 All keys are optional — see [`config.example.json`](config.example.json):
 
 | key | default | notes / env override |
 |---|---|---|
-| `port` | `8000` | `MILLRACE_PORT` |
+| `port` | `8000` | `MILLFOLIO_PORT` |
 | `model` | (meta.txt fixture) | chat model — HF id or checkpoint path; below CLI arg + `$QWEN_SAFETENSORS` |
 | `embed_model` | `Qwen/Qwen3-Embedding-0.6B` (from HF cache) | embedding model for `/v1/embeddings` — HF id or checkpoint path; `EMBED_SAFETENSORS` |
 | `q4` | `false` | group-128 int4 projection weights; `QWEN_Q4=1` |
@@ -253,7 +253,7 @@ vs bf16 agreement) and `pixi run q4-kernels` (kernel correctness + speed).
 ## Benchmark
 
 `pixi run bench` measures prefill latency, decode tok/s, and cold-vs-warm prefix
-reuse against any running OpenAI-compatible servers (millrace, `mlx_lm.server`,
+reuse against any running OpenAI-compatible servers (millfolio, `mlx_lm.server`,
 Ollama) — see [`bench/README.md`](bench/README.md) for how to start each engine
 and read the numbers, and [`bench/results/`](bench/results/) for a captured run.
 
@@ -267,7 +267,7 @@ pixi run opencode -- run "your prompt"   # one-shot
 ```
 
 The task queries the server's `/v1/models`, generates an OpenCode config that
-declares a `millrace` provider (`@ai-sdk/openai-compatible`, pointed at
+declares a `millfolio` provider (`@ai-sdk/openai-compatible`, pointed at
 `http://127.0.0.1:8000/v1`) listing **exactly the model the server is serving**
 (`opencode_config.py`), and points OpenCode at it via `OPENCODE_CONFIG`. So
 whatever you launched `serve` with — 0.5B, `serve -- Qwen/Qwen2.5-3B-Instruct`,

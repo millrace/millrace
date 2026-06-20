@@ -11,8 +11,8 @@ import sys
 from transformers import AutoTokenizer
 
 SNAP = "/Users/mseritan/.cache/huggingface/hub/models--mlx-community--gemma-4-e2b-it-bf16/snapshots/22a2753af6114b0c364f09921771b458e40b9e09"
-CORPUS = "/Users/mseritan/dev/millrace/assay/corpus.txt"
-OUT = "/Users/mseritan/dev/millrace/inference-server/.scratch/e2b_corpus_ids.txt"
+CORPUS = "/Users/mseritan/dev/millfolio/assay/corpus.txt"
+OUT = "/Users/mseritan/dev/millfolio/engine/.scratch/e2b_corpus_ids.txt"
 WINDOW_CHARS, MAX_WINDOWS = 1800, 24
 
 

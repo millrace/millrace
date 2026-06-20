@@ -2,7 +2,7 @@
 name = "inference-server"
 version = "0.1.0"
 authors = ["Marius S <marius@seritan.net>"]
-description = "Native-Mojo GPU re-implementation of millrace inference: a hardcoded Qwen2.5-0.5B-Instruct forward pass on Apple Silicon (Metal). See ARCHITECTURE.md."
+description = "Native-Mojo GPU re-implementation of millfolio inference: a hardcoded Qwen2.5-0.5B-Instruct forward pass on Apple Silicon (Metal). See ARCHITECTURE.md."
 # Nightly Mojo: we need the current std.gpu / TileTensor GPU API (per the
 # modular `mojo-gpu-fundamentals` skill). No flare/MAX runtime dep yet — the
 # engine is pure Mojo (ARCHITECTURE.md §1, §8); serving is Phase 6.
@@ -132,9 +132,9 @@ gemma-template-test = { cmd = "mkdir -p build && mojo build tests/manual/gemma_t
 # `generate_spec` on Gemma 4 12B int4 (must be bit-identical; reports speedup).
 spec-decode = { cmd = "mkdir -p build && mojo build tests/manual/spec_decode.mojo -I src -I ../jinja2.mojo/src -I ../flare -o build/spec_decode && ./build/spec_decode" }
 
-# Cross-engine benchmark (millrace vs mlx_lm.server vs Ollama): TTFT, decode
+# Cross-engine benchmark (millfolio vs mlx_lm.server vs Ollama): TTFT, decode
 # tok/s, cold/warm prefix. Stdlib python, no GPU build. Start the servers first
-# (bench/README.md), then: pixi run bench [-- --only millrace,mlx --doctor ...].
+# (bench/README.md), then: pixi run bench [-- --only millfolio,mlx --doctor ...].
 bench = { cmd = "python3 bench/bench.py" }
 
 # Phase 6a end-to-end chat CLI (ARCHITECTURE.md §6): prompt -> text, pure Mojo on
@@ -170,7 +170,7 @@ download = { cmd = "mkdir -p build && mojo build src/download.mojo -I ../flare -
 # matching opencode config (so the picker shows exactly what's served — whatever
 # `serve` was launched with), then opencode is pointed at it via OPENCODE_CONFIG.
 # Usage: pixi run opencode  (interactive)  or  pixi run opencode -- run "prompt".
-opencode = { cmd = "CFG=$(python3 $PIXI_PROJECT_ROOT/opencode_config.py http://127.0.0.1:8000/v1) && OPENCODE_CONFIG=$CFG OPENAI_BASE_URL=http://127.0.0.1:8000/v1 OPENAI_API_KEY=millrace opencode" }
+opencode = { cmd = "CFG=$(python3 $PIXI_PROJECT_ROOT/opencode_config.py http://127.0.0.1:8000/v1) && OPENCODE_CONFIG=$CFG OPENAI_BASE_URL=http://127.0.0.1:8000/v1 OPENAI_API_KEY=millfolio opencode" }
 
 [feature.oracle.tasks]
 # Download a HF model's weights (safetensors + metadata only) into the local cache

@@ -1,7 +1,7 @@
 name: engine zip
 
-# Builds runner.zip — the engine ("runner") source bundle the Millrace menu app
-# (millrace/app) downloads, then `mojo build`s on-device. See scripts/package_engine.sh.
+# Builds runner.zip — the engine ("runner") source bundle the Millfolio menu app
+# (millfolio/app) downloads, then `mojo build`s on-device. See scripts/package_engine.sh.
 on:
   push:
     branches: [main]
@@ -24,11 +24,11 @@ jobs:
           path: inference-server
       - uses: actions/checkout@v6
         with:
-          repository: millrace/jinja2.mojo
+          repository: millfolio/jinja2.mojo
           path: jinja2.mojo
       - uses: actions/checkout@v6
         with:
-          repository: millrace/flare
+          repository: millfolio/flare
           path: flare
 
       - uses: prefix-dev/setup-pixi@v0.9.6
