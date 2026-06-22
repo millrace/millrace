@@ -771,7 +771,7 @@ def stream_deltas(mut s: ServerState, ids: List[Int]) raises -> List[String]:
 
 @fieldwise_init
 struct Api(Handler, Copyable, Movable):
-    var st: UnsafePointer[ServerState, MutExternalOrigin]
+    var st: UnsafePointer[ServerState, MutUntrackedOrigin]
 
     def serve(self, req: Request) raises -> Response:
         var path = req.url
@@ -1253,6 +1253,16 @@ def load_config() -> Config:
 def main() raises:
     # Config: ~/.config/millfolio/config.json (+ env). Path override: $MILLFOLIO_CONFIG.
     var cfg = load_config()
+
+    # Bind + listen BEFORE the (slow ~10-15s) weight load so a client connecting
+    # while the model loads is accepted + queued by the kernel (listen backlog 128)
+    # instead of getting ConnectionRefused. We don't accept()/serve() until the
+    # model is ready — the request just waits in the socket buffer — so `mill start`
+    # stops racing the weight load: connections succeed immediately, the first
+    # response just lands once weights are up. (TcpListener.bind calls listen().)
+    var srv = HttpServer.bind(SocketAddr.localhost(UInt16(cfg.port)))
+    print("listening on http://127.0.0.1:", cfg.port,
+          " — loading model; requests are queued until it's ready…", sep="")
     # Checkpoint selection: `serve <hf-id-or-path>` (CLI) > $QWEN_SAFETENSORS >
     # config `model` > meta.txt. An HF id resolves to its cached snapshot dir; the
     # served model id (reported by /v1/models) is that id, else derived from the arch.
@@ -1466,5 +1476,6 @@ def main() raises:
         print("  POST /v1/embeddings        (", banner_model_id, ")", sep="")
     else:
         print("  POST /v1/embeddings        (no embed model — 503)")
-    var srv = HttpServer.bind(SocketAddr.localhost(UInt16(cfg.port)))
+    # The listener was bound up front (above) so connections during the weight
+    # load weren't refused; now that the model is ready, start accepting + serving.
     srv.serve(api^)

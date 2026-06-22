@@ -169,10 +169,10 @@ struct BlockCache(Movable):
                 for l in range(self.nlayers):
                     with kcs[l].map_to_host() as h:
                         var p = h.unsafe_ptr().bitcast[UInt8]() + bi * slice_f * 4
-                        f.write_bytes(Span[UInt8, MutExternalOrigin](ptr=p, length=slice_f * 4))
+                        f.write_bytes(Span[UInt8, MutUntrackedOrigin](ptr=p, length=slice_f * 4))
                     with vcs[l].map_to_host() as h:
                         var p = h.unsafe_ptr().bitcast[UInt8]() + bi * slice_f * 4
-                        f.write_bytes(Span[UInt8, MutExternalOrigin](ptr=p, length=slice_f * 4))
+                        f.write_bytes(Span[UInt8, MutUntrackedOrigin](ptr=p, length=slice_f * 4))
 
     def restore_blocks(self, mut kcs: List[DevBuf], mut vcs: List[DevBuf],
                        hashes: List[UInt64], a: Int, b: Int) raises:

@@ -82,6 +82,16 @@ test-sample = "mojo run -I src -I tests/gates tests/gates/test_sample.mojo"
 # for the JSON parser/serializer. (No testio, so no -I tests/gates needed.)
 test-toolcall = "mojo run -I ../jinja2.mojo/src -I src tests/gates/test_toolcall.mojo"
 
+# The server binds + listen()s before loading weights, so connections during the
+# load are queued (not refused). Pure CPU (loopback sockets), no GPU/weights.
+# -I ../flare for TcpListener/TcpStream/SocketAddr; -I ../json (flare uses json).
+test-server-bind = "mojo run -I src -I ../flare -I ../json tests/gates/test_server_bind.mojo"
+
+# The CI suite: the pure-CPU gates that need NO GPU, weights, or torch fixtures.
+# Run by .github/workflows/test.yml on every push/PR. (The GPU/weights gates stay
+# manual via their own tasks — see CLAUDE.md.)
+test = { depends-on = ["test-toolcall", "test-server-bind"] }
+
 # Disk block KV-cache roundtrip (io/blockcache.mojo): store -> corrupt -> restore
 # bit-identical, chained-hash determinism, collision guard. Needs the GPU.
 test-blockcache = "mojo run -I src -I tests/gates tests/gates/test_blockcache.mojo"
