@@ -1,5 +1,7 @@
 # inference-server
 
+> 💬 **Community:** questions, ideas, and show-and-tell live in [GitHub Discussions](https://github.com/millfolio/millfolio/discussions).
+
 > Part of [**millfolio**](https://millfolio.app), a private on-device document vault.
 > This is its inference engine — read more at [millfolio.app/server](https://millfolio.app/server).
 
