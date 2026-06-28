@@ -17,6 +17,7 @@ from runtime.model_iface import ModelWeights
 def upload_ids(
     ctx: DeviceContext, vals: List[Int]
 ) raises -> DeviceBuffer[DType.int32]:
+    """Upload a list of token ids to a fresh int32 device buffer."""
     var n = len(vals)
     var d = ctx.enqueue_create_buffer[DType.int32](n)
     with d.map_to_host() as m:
@@ -55,15 +56,22 @@ struct Session(Movable):
     by greedy/sampled generate and the server's streaming loop."""
 
     var kcs: List[DevBuf]
+    """Per-layer key caches (one f32 device buffer per decoder layer)."""
     var vcs: List[DevBuf]
+    """Per-layer value caches (one f32 device buffer per decoder layer)."""
     var dummy: DevBuf
+    """A size-1 scratch buffer passed to kernels needing an unused output slot."""
     var cache_len: Int
+    """Capacity of each KV cache in elements (max_seq * nkv)."""
     var pos: Int
+    """Current decode position — the number of tokens already cached."""
 
 
 def new_session(
     ctx: DeviceContext, max_seq: Int, nlayers: Int, nkv: Int
 ) raises -> Session:
+    """Allocate a fresh `Session`: empty per-layer K/V caches sized for `max_seq`
+    tokens × `nkv` (heads·head_dim), with position 0."""
     var cache_len = max_seq * nkv
     var kcs = List[DevBuf]()
     var vcs = List[DevBuf]()
@@ -80,6 +88,9 @@ def sess_prefill[
 ](
     ctx: DeviceContext, mut w: W, mut s: Session, prompt: List[Int]
 ) raises -> List[Float32]:
+    """Prefill the whole `prompt` from position 0 (the offset==0 case of
+    `sess_prefill_suffix`): embed, run every layer, set `s.pos`, and return the
+    last-position logits."""
     var P = len(prompt)
     var ids_dev = upload_ids(ctx, prompt)
     var h = w.embed_prompt(ctx, ids_dev, P)
@@ -93,7 +104,9 @@ def sess_prefill[
 # common case), so progress reporting — and its per-layer synchronize — is skipped
 # entirely, leaving that hot path byte-for-byte as before.
 comptime PROGRESS_MIN_TOK = 2048
+"""Minimum suffix length before prefill progress reporting kicks in."""
 comptime PROGRESS_EVERY_NS = 5_000_000_000  # ~5 s between progress lines
+"""Throttle interval, in nanoseconds, between prefill progress lines (~5 s)."""
 
 
 def _ktok(n: Int) -> String:
@@ -192,6 +205,8 @@ def sess_step[
 ](ctx: DeviceContext, mut w: W, mut s: Session, token: Int) raises -> List[
     Float32
 ]:
+    """Decode one step: embed `token` at `s.pos`, run every layer, advance
+    `s.pos`, and return the next-position logits."""
     var one = upload_ids(ctx, [token])
     var h = w.embed_prompt(ctx, one, 1)
     for l in range(w.config().nlayers):

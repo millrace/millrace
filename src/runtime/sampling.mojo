@@ -7,8 +7,13 @@ from std.math import exp
 
 @fieldwise_init
 struct Dist(Movable):
+    """A pruned token distribution: the kept token ids and their renormalized
+    probabilities (output of `process_logits`, input to `sample`)."""
+
     var ids: List[Int]
+    """The kept candidate token ids."""
     var probs: List[Float32]
+    """The renormalized probabilities, aligned with `ids`."""
 
 
 def process_logits(
@@ -87,6 +92,7 @@ def process_logits(
 
 
 def next_rand(mut state: UInt64) -> UInt64:
+    """Advance the xorshift64 RNG in place and return the new state."""
     state ^= state << UInt64(13)
     state ^= state >> UInt64(7)
     state ^= state << UInt64(17)
@@ -94,6 +100,7 @@ def next_rand(mut state: UInt64) -> UInt64:
 
 
 def sample(dist: Dist, mut rng: UInt64) -> Int:
+    """Draw one token from `dist` by inverse-CDF over its probabilities."""
     var r = Float32(Int(next_rand(rng) >> UInt64(40))) / Float32(
         1 << 24
     )  # [0,1)
@@ -106,6 +113,7 @@ def sample(dist: Dist, mut rng: UInt64) -> Int:
 
 
 def argmax_f(logits: List[Float32]) -> Int:
+    """Return the index of the largest logit (the greedy next token)."""
     var best = -1
     var best_v = Float32(-1.0e30)
     for i in range(len(logits)):

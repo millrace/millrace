@@ -81,6 +81,7 @@ from json import parse_json, bytes_to_string
 # the prefix they share instead of re-prefilling it. 32768 = Qwen2.5's native
 # context; the cache is ~MAX_SEQ * 24 KiB ≈ 805 MB resident on the GPU.
 comptime MAX_SEQ = 32768
+"""Persistent KV-cache capacity in tokens for the primary (Qwen) model (its native 32k context; ~805 MB resident on the GPU)."""
 
 # Gemma's KV cache is uniform at nkv=2048 (the max of its sliding/full layer
 # types) across all 48 layers → ~768 KiB/token, so a 32k context would be ~26 GB
@@ -88,45 +89,66 @@ comptime MAX_SEQ = 32768
 # cache + the secondary embed model fit a 24 GB unified GPU: 4096 * 768 KiB ≈
 # 3.2 GB (raise on a larger machine).
 comptime GEMMA_MAX_SEQ = 4096
+"""Persistent KV-cache cap in tokens for Gemma, kept small (~3.2 GB) so its larger per-token cache fits a 24 GB unified GPU alongside weights."""
 # Gemma emits this after finishing its tool call(s); it marks the model's
 # turn boundary (the tool result goes next). Stop decoding there so we don't
 # greedily hallucinate a fake tool result past the call.
 comptime GEMMA_TOOL_RESPONSE = 50
+"""Gemma token id marking the model's turn boundary after a tool call; decoding stops here so a fake tool result isn't hallucinated."""
 
 # Disk-backed prefix cache: K/V persisted in BLOCK_TOK-token blocks so prefills
 # survive restarts and are shared across conversations (blockcache.mojo).
 comptime BLOCK_TOK = 256
+"""Block size in tokens for the disk-backed prefix cache (K/V persisted per block so prefills survive restarts)."""
 comptime KV_BUDGET_BYTES = 8 * 1024 * 1024 * 1024  # 8 GB LRU cap
+"""Default LRU cap in bytes (8 GB) for the disk-backed prefix cache."""
 
 comptime TEMPLATE = "assets/qwen2.5-chat-template.jinja"
+"""Path to the bundled Qwen2.5 Jinja chat template."""
 # Default served model ids by detected arch (used when no explicit id is given on
 # the CLI). The served id is otherwise whatever `serve <hf-id>` was launched with,
 # and is what /v1/models and every response report.
 comptime MODEL_05B = "Qwen/Qwen2.5-0.5B-Instruct"
+"""Default served id for the Qwen2.5 0.5B chat model."""
 comptime MODEL_3B = "Qwen/Qwen2.5-3B-Instruct"
+"""Default served id for the Qwen2.5 3B chat model."""
 comptime MODEL_GEMMA = "google/gemma-4-12b-it"
+"""Default served id for the Gemma 4 12B chat model."""
 # Default SECONDARY embedding model (arch==2). Resolved from the HF cache when no
 # $EMBED_SAFETENSORS / config `embed_model` is given; if it isn't cached either,
 # the embedding endpoint stays unloaded (/v1/embeddings → 503).
 comptime MODEL_EMBED = "Qwen/Qwen3-Embedding-0.6B"
+"""Default secondary embedding model id, resolved from the HF cache when no checkpoint is configured."""
 comptime PORT = 8000
+"""Default TCP port the server listens on."""
 # Engine version, reported by GET /v1/version (used by the Millfolio menu app to
 # detect a running engine and show its version). Bump on releases. Placeholder
 # scheme for now; wire to a real build/version source later.
 comptime MILLFOLIO_VERSION = "0.1.0"
+"""Engine version string reported by GET /v1/version."""
 
 # jinja2.mojo Value tags (value.mojo)
 comptime VBOOL = 2
+"""`Value` tag for a boolean (jinja2.mojo value.mojo)."""
 comptime VINT = 3
+"""`Value` tag for an integer (jinja2.mojo value.mojo)."""
 comptime VFLOAT = 4
+"""`Value` tag for a float (jinja2.mojo value.mojo)."""
 comptime VSTR = 5
+"""`Value` tag for a string (jinja2.mojo value.mojo)."""
 comptime VLIST = 6
+"""`Value` tag for a list (jinja2.mojo value.mojo)."""
 # sampling defaults (generation_config.json) when temperature > 0
 comptime DEF_TOPK = 20
+"""Default top-k sampling cutoff when temperature > 0."""
 comptime DEF_TOPP = Float32(0.8)
+"""Default top-p (nucleus) sampling threshold when temperature > 0."""
 comptime DEF_REP = Float32(1.1)
+"""Default repetition penalty when temperature > 0."""
 comptime DEF_MAXNEW = 256
+"""Default maximum number of new tokens to generate per request."""
 comptime SEED = UInt64(0x9E3779B97F4A7C15)
+"""Fixed RNG seed for sampling (deterministic generation across runs)."""
 
 # Speculative decoding (greedy/temp==0 only, where it is bit-exact). Prompt-lookup
 # (n-gram) drafts K tokens from the context's own history and verifies them in one
@@ -138,13 +160,19 @@ comptime SEED = UInt64(0x9E3779B97F4A7C15)
 # pauses drafting after SPEC_COLD_LIMIT consecutive zero-accept verifies and
 # re-probes after SPEC_COOLDOWN tokens, bounding non-echo text to ~baseline.
 comptime SPEC_K = 7
+"""Number of tokens drafted per speculative-decode step (greedy/temp==0 only)."""
 comptime SPEC_NGRAM = 3
+"""Context n-gram length used to look up a draft continuation (prompt-lookup)."""
 comptime SPEC_COLD_LIMIT = 2
+"""Consecutive zero-accept verifies after which the adaptive guard pauses drafting."""
 comptime SPEC_COOLDOWN = 32
+"""Tokens to wait before re-probing speculative drafting after the guard pauses it."""
 
 # Responses-API ids (opencode / Vercel AI SDK)
 comptime RESP_ID = "resp_millfolio"
+"""Fixed id for the Responses-API `response` object."""
 comptime MSG_ID = "msg_millfolio"
+"""Fixed id for a Responses-API assistant `message` output item."""
 
 
 # ── Shared model state ───────────────────────────────────────────────────────
@@ -161,26 +189,40 @@ struct ServerState(Movable):
     fields stay unset and /v1/embeddings falls back to the primary w/tok."""
 
     var ctx: DeviceContext
+    """The GPU device context the model and KV cache live on."""
     # The primary (chat) model is one of several weight structs, all conforming to
     # the ModelWeights trait, held in a Variant (Mojo has no trait objects). Every
     # weight-touching op dispatches once on `model.isa[…]()`; the rest of the server
     # is family-agnostic and reads per-model behavior (eos, tool style, extra stop)
     # from `cfg`. Adding a model = a Variant arm + a ModelConfig — no scattered ifs.
     var model: Variant[Weights, GemmaWeights]
+    """The primary (chat) model weights, dispatched on via `model.isa[…]()`."""
     var cfg: ModelConfig  # the primary model's config (behavior flags + eos)
+    """The primary model's config (behavior flags + eos)."""
     var primary_arch: Int  # Qwen arch (0/1/2) for the embed gate; -1 for Gemma
+    """Primary model architecture: Qwen arch (0/1/2) for the embed gate, -1 for Gemma."""
     var max_seq: Int  # primary KV-cache context cap
+    """Primary model's KV-cache context cap, in tokens."""
     var tok: Tokenizer
+    """Tokenizer for the primary (chat) model."""
     var tmpl: Template
+    """The primary model's chat template."""
     var sess: Session  # one long-lived KV cache, reused across requests
+    """One long-lived KV-cache session, reused across requests."""
     var cached: List[Int]  # token ids currently held in sess rows [0, len)
+    """Token ids currently held in the session's KV-cache rows [0, len)."""
     var model_id: String  # id reported by /v1/models + every response
+    """Model id reported by /v1/models and every response."""
     var bcache: BlockCache  # disk-backed prefix cache (survives restarts)
+    """Disk-backed prefix cache, shared across conversations and surviving restarts."""
     # Secondary embedding model (None when the primary is itself arch==2, or when
     # no embedding checkpoint could be resolved at startup). Always Qwen.
     var embed_w: Optional[Weights]
+    """Secondary embedding model weights, or None when no embedding model is loaded."""
     var embed_tok: Optional[Tokenizer]
+    """Tokenizer for the secondary embedding model, or None when none is loaded."""
     var embed_id: String  # id reported for the embedding model ("" if unset)
+    """Id reported for the embedding model ("" when unset)."""
 
     def __init__(
         out self,
@@ -198,6 +240,8 @@ struct ServerState(Movable):
         var embed_tok: Optional[Tokenizer],
         var embed_id: String,
     ):
+        """Take ownership of the loaded models, tokenizers, caches, and ids; start with an empty `cached` list.
+        """
         self.ctx = ctx^
         self.model = model^
         self.cfg = cfg
@@ -218,6 +262,7 @@ struct ServerState(Movable):
 
 
 def to_bytes(s: String) -> List[UInt8]:
+    """Copy a String's UTF-8 bytes into a `List[UInt8]`."""
     var out = List[UInt8]()
     var sb = s.as_bytes()
     for i in range(len(sb)):
@@ -226,6 +271,8 @@ def to_bytes(s: String) -> List[UInt8]:
 
 
 def get_int(req: Value, key: String, default: Int) -> Int:
+    """Read `key` from a JSON object as an Int (truncating a float), or `default` if absent/wrong type.
+    """
     var o = req.map_get(key)
     if o:
         var v = o.value()
@@ -237,6 +284,8 @@ def get_int(req: Value, key: String, default: Int) -> Int:
 
 
 def get_float(req: Value, key: String, default: Float64) -> Float64:
+    """Read `key` from a JSON object as a Float64 (promoting an int), or `default` if absent/wrong type.
+    """
     var o = req.map_get(key)
     if o:
         var v = o.value()
@@ -248,6 +297,8 @@ def get_float(req: Value, key: String, default: Float64) -> Float64:
 
 
 def get_bool(req: Value, key: String, default: Bool) -> Bool:
+    """Read `key` from a JSON object as a Bool, or `default` if absent/not a bool.
+    """
     var o = req.map_get(key)
     if o and o.value().tag == VBOOL:
         return o.value().b
@@ -255,6 +306,8 @@ def get_bool(req: Value, key: String, default: Bool) -> Bool:
 
 
 def get_str(req: Value, key: String) -> String:
+    """Read `key` from a JSON object as a String, or "" if absent/not a string.
+    """
     var o = req.map_get(key)
     if o and o.value().tag == VSTR:
         return o.value().s
@@ -334,6 +387,7 @@ def complete_utf8_len(b: List[UInt8]) -> Int:
 
 
 def slice_bytes(b: List[UInt8], start: Int, stop: Int) -> List[UInt8]:
+    """Copy the half-open byte range [start, stop) of `b` into a new list."""
     var out = List[UInt8]()
     for i in range(start, stop):
         out.append(b[i])
@@ -344,16 +398,26 @@ def slice_bytes(b: List[UInt8], start: Int, stop: Int) -> List[UInt8]:
 
 
 struct Reply(Movable):
+    """A buffered completion: the generated token ids plus per-request stats."""
+
     var ids: List[Int]  # generated token ids (EOS dropped)
+    """Generated token ids, with the EOS token dropped."""
     var stopped: Bool  # True if generation ended on EOS, False if length cap
+    """True if generation ended on EOS, False if it hit the length cap."""
     # Per-request stats (also printed to stdout) — surfaced to clients as a
     # non-standard `"millfolio"` field so a UI can show prefill cost + throughput.
     var n_prompt: Int  # prompt tokens
+    """Number of prompt tokens."""
     var reused: Int  # prompt tokens served from the KV cache (not recomputed)
+    """Prompt tokens served from the KV cache (not recomputed)."""
     var prefilled: Int  # prompt tokens actually prefilled this request
+    """Prompt tokens actually prefilled this request."""
     var pf_ms: Float64  # prefill wall-clock (ms)
+    """Prefill wall-clock time, in milliseconds."""
     var dec_ms: Float64  # decode wall-clock (ms)
+    """Decode wall-clock time, in milliseconds."""
     var tps: Float64  # decode throughput (tokens/sec)
+    """Decode throughput, in tokens per second."""
 
     def __init__(
         out self,
@@ -366,6 +430,8 @@ struct Reply(Movable):
         dec_ms: Float64 = 0.0,
         tps: Float64 = 0.0,
     ):
+        """Build a Reply from the generated ids and stop flag; stats default to zero.
+        """
         self.ids = ids^
         self.stopped = stopped
         self.n_prompt = n_prompt
@@ -700,6 +766,7 @@ def models_json(model: String, embed_model: String) -> String:
 
 
 def version_json(model: String) -> String:
+    """Build the GET /v1/version body (engine name, version, served model)."""
     return (
         '{"engine":"millfolio","version":"'
         + MILLFOLIO_VERSION
@@ -783,6 +850,8 @@ def completion_json(
     millfolio: String = String(""),
     reasoning: String = String(""),
 ) -> String:
+    """Build a non-streaming OpenAI chat.completion body (content + usage, plus optional millfolio stats and reasoning).
+    """
     var extra = (
         ',"millfolio":' + millfolio
     ) if millfolio.byte_length() > 0 else String("")
@@ -827,6 +896,8 @@ def chunk_json(
     fin: String,
     millfolio: String = String(""),
 ) -> String:
+    """Build a streaming chat.completion.chunk body carrying a content `delta` (or final finish_reason).
+    """
     var delta_obj = String("{}")
     var finish_reason = String("null")
     if finish:
@@ -882,6 +953,8 @@ def completion_tools_json(
     n_gen: Int,
     reasoning: String = String(""),
 ) -> String:
+    """Build a non-streaming chat.completion body whose message carries `tool_calls` (finish_reason "tool_calls").
+    """
     var content_field = String("null")
     if content.byte_length() > 0:
         content_field = '"' + esc(content) + '"'
@@ -957,6 +1030,8 @@ def function_call_item_json(
 
 
 def function_calls_output_json(calls: List[ToolCall]) -> String:
+    """Build a Responses-API output array of `function_call` items, one per call.
+    """
     var s = String("[")
     for i in range(len(calls)):
         if i > 0:
@@ -968,6 +1043,8 @@ def function_calls_output_json(calls: List[ToolCall]) -> String:
 
 
 def output_message_json(content: String, status: String) -> String:
+    """Build a Responses-API assistant `message` output item wrapping `content` (pre-escaped output_text).
+    """
     return (
         '{"type":"message","id":"'
         + MSG_ID
@@ -1015,6 +1092,8 @@ def response_object_raw(
 
 
 def resp_event(type: String, payload: String) -> SseEvent:
+    """Build a named Responses-API SSE frame: an `event:` line plus a JSON body whose `type` matches and is followed by `payload`.
+    """
     # Named SSE frame: an `event:` line plus a matching `"type"` in the JSON
     # (the Vercel AI SDK switches on the latter). `payload` = fields after type.
     return SseEvent.named(type, '{"type":"' + type + '",' + payload + "}")
@@ -1047,9 +1126,15 @@ def stream_deltas(mut s: ServerState, ids: List[Int]) raises -> List[String]:
 
 @fieldwise_init
 struct Api(Copyable, Handler, Movable):
+    """The flare HTTP handler: routes requests by method + path to the endpoint methods.
+    """
+
     var st: UnsafePointer[ServerState, MutUntrackedOrigin]
+    """Pointer to the shared, mutable `ServerState` (model + caches)."""
 
     def serve(self, req: Request) raises -> Response:
+        """Route a request by method and path to the matching endpoint, or 404.
+        """
         var path = req.url
         var is_post = req.method == Method.POST
 
@@ -1253,6 +1338,8 @@ struct Api(Copyable, Handler, Movable):
         return ok_json(embeddings_json(emb_id, data, n_tok))
 
     def handle_chat(self, req: Request) raises -> Response:
+        """Handle POST /v1/chat/completions: render the chat template, generate, and frame the result (streaming or buffered, with tool-call lifting).
+        """
         ref s = self.st[]
         var body = req.text()
         var bv = parse_json(body)
@@ -1403,6 +1490,8 @@ struct Api(Copyable, Handler, Movable):
         )
 
     def handle_responses(self, req: Request) raises -> Response:
+        """Handle POST /v1/responses: map the Responses-API body onto the chat shape, generate, and frame it as Responses output items.
+        """
         ref s = self.st[]
         var body = req.text()
         var bv0 = parse_json(body)
@@ -1674,6 +1763,7 @@ struct Api(Copyable, Handler, Movable):
 
 
 def read_text(path: String) raises -> String:
+    """Read and return the entire contents of the file at `path` as a String."""
     with open(path, "r") as f:
         return f.read()
 
@@ -1741,10 +1831,15 @@ struct Config(Copyable, Movable):
     precedence is: env var > config file > built-in default."""
 
     var port: Int
+    """TCP port to listen on."""
     var model: String  # default chat model/checkpoint (when no CLI arg / $QWEN_SAFETENSORS)
+    """Default chat model/checkpoint (used when no CLI arg / $QWEN_SAFETENSORS)."""
     var embed_model: String  # default embedding model/checkpoint (when no $EMBED_SAFETENSORS)
+    """Default embedding model/checkpoint (used when no $EMBED_SAFETENSORS)."""
     var q4: Bool  # group-128 int4 projection weights
+    """Whether to use group-128 int4 projection weights."""
     var kv_budget_mb: Int  # disk KV-cache LRU cap, in MiB
+    """Disk KV-cache LRU cap, in MiB."""
 
     def __init__(
         out self,
@@ -1754,6 +1849,8 @@ struct Config(Copyable, Movable):
         q4: Bool,
         kv_budget_mb: Int,
     ):
+        """Construct a Config from explicit port, model ids, q4 flag, and KV-cache budget.
+        """
         self.port = port
         self.model = model^
         self.embed_model = embed_model^
@@ -1815,6 +1912,8 @@ def load_config() -> Config:
 
 
 def main() raises:
+    """Entry point: load config, bind/listen, load the model(s), then serve requests until shutdown.
+    """
     # Config: ~/.config/millfolio/config.json (+ env). Path override: $MILLFOLIO_CONFIG.
     var cfg = load_config()
 

@@ -29,8 +29,11 @@ from layout import TileTensor, TensorLayout
 # multiple Qwen2.5 sizes (0.5B: 14/2/64, 3B: 16/2/128). THETA/EPS are shared
 # across all Qwen2.5 sizes, so they stay module constants.
 comptime THETA = Float32(1000000.0)  # RoPE base
+"""RoPE base frequency θ (shared across all Qwen2.5 sizes)."""
 comptime EPS = Float32(1.0e-6)  # RMSNorm epsilon
+"""RMSNorm epsilon ε added under the square root."""
 comptime FLASH_PW = 3  # flash query-tile: warps/block = FLASH_PW * GROUP
+"""Flash query-tile width: warps per block = FLASH_PW * GROUP."""
 
 
 @always_inline
@@ -49,6 +52,8 @@ def cvt_kernel[
     dst: TileTensor[DType.float32, LT, MutAnyOrigin],
     n: Int,
 ):
+    """Widen `n` bf16 values (raw u16 bits in `src`) to f32 in `dst`, elementwise.
+    """
     comptime assert dst.flat_rank == 1
     var i = global_idx.x
     if i >= n:
@@ -69,6 +74,8 @@ def embed_kernel[
     T: Int,
     H: Int,
 ):
+    """Embedding gather: dst[t,:] = bf16→f32 of emb row ids[t], for T tokens × H dims.
+    """
     comptime assert dst.flat_rank == 1
     var i = global_idx.x
     if i >= T * H:
@@ -89,6 +96,7 @@ def add_kernel[
     dst: TileTensor[DType.float32, LT, MutAnyOrigin],
     n: Int,
 ):
+    """Elementwise residual add: dst[i] = a[i] + b[i] over `n` elements."""
     comptime assert dst.flat_rank == 1
     var i = global_idx.x
     if i >= n:
@@ -107,6 +115,8 @@ def rmsnorm_kernel[
     T: Int,
     H: Int,
 ):
+    """RMSNorm: Y[t,d] = X[t,d] / √(mean_d(X[t,:]²)+EPS) · W[d], one warp per row.
+    """
     comptime assert X.flat_rank == 1
     # One warp per row: the old kernel ran the whole H-element reduction on a
     # single thread (one thread per row → 1 thread for decode's T=1), which made
@@ -344,12 +354,15 @@ def matmul_tiled_kernel[
 comptime _MMA8 = 8
 comptime _FRAG8 = 2  # 8×8 = 64 elems / 32 lanes = 2 floats per lane
 comptime SG_BM = 64  # threadgroup output rows
+"""Threadgroup output-tile rows (M) for the simdgroup-matrix GEMM."""
 comptime SG_BN = 64  # threadgroup output cols
+"""Threadgroup output-tile columns (N) for the simdgroup-matrix GEMM."""
 comptime _SG_SGM = SG_BM // 2  # 32 — simdgroup subtile rows
 comptime _SG_SGN = SG_BN // 2  # 32 — simdgroup subtile cols
 comptime _SG_NTM = _SG_SGM // _MMA8  # 4 row-fragments per simdgroup
 comptime _SG_NTN = _SG_SGN // _MMA8  # 4 col-fragments per simdgroup
 comptime SG_TPB = 4 * 32  # 128 threads/block = 4 simdgroups × 32
+"""Threads per block for the simdgroup-matrix GEMM (4 simdgroups × 32 lanes)."""
 
 
 @always_inline
@@ -496,7 +509,9 @@ def matmul_simd_kernel[
 # Only the W-read changes vs the bf16 kernels; the matmul math (and the
 # simdgroup-matrix path) is identical, so the 4.5× prefill carries over.
 comptime Q4_GROUP = 128
+"""Int4 quantization group size along K (one scale per 128 weights)."""
 comptime Q4_SHIFT = 7  # log2(Q4_GROUP)
+"""log2(Q4_GROUP): right-shift a K index to its group index."""
 comptime _Q4_SHIFTS = SIMD[DType.uint32, 8](0, 4, 8, 12, 16, 20, 24, 28)
 comptime _Q4_BK = 32  # K-chunk dequantized into shared per barrier
 # in matmul_simd_q4_kernel (mult of 8; 64×32 fp32 = 8 KB)
@@ -580,9 +595,11 @@ def matmul_q4_kernel[
 
 comptime SPEC_MAX_M = 8  # small-M int4 path cap. Above this the flat 64-row
 # simdgroup GEMM wins; mm_w routes M>SPEC_MAX_M there.
+"""Max M routed to the small-M int4 paths; above it the 64-row simd GEMM wins."""
 comptime SPEC_SMALL_MIN = 5  # M in [SPEC_SMALL_MIN, SPEC_MAX_M] uses the 1-tile
 # MMA GEMM (flat); M in [2, SPEC_SMALL_MIN) uses the
 # batched GEMV (cheaper at the very smallest batches).
+"""M threshold: ≥ this uses the 1-tile MMA GEMM, below it the batched GEMV."""
 
 
 def matmul_q4_batch_kernel[
@@ -1217,6 +1234,8 @@ def silu_mul_kernel[
     Y: TileTensor[DType.float32, LT, MutAnyOrigin],
     n: Int,
 ):
+    """SwiGLU on two separate buffers: Y[i] = silu(A[i]) · B[i] over `n` elements.
+    """
     comptime assert A.flat_rank == 1
     var i = global_idx.x
     if i >= n:
@@ -1425,6 +1444,8 @@ def copy_kernel[
     dst_offset: Int,
     n: Int,
 ):
+    """Copy `n` contiguous f32 elements from `src` into `dst` at `dst_offset`.
+    """
     comptime assert dst.flat_rank == 1
     var i = global_idx.x
     if i >= n:
@@ -1863,6 +1884,7 @@ def attn_cached_rope_kernel[
 
 
 comptime FLASH_BK = WARP_SIZE  # flash keys per tile = one per lane
+"""Flash-attention keys per tile: one per lane (= WARP_SIZE)."""
 
 
 def flash_attn_kernel[

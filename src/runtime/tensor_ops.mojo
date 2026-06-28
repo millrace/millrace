@@ -53,14 +53,18 @@ from kernels import (
 )
 
 comptime BLOCK = 256
+"""Default GPU threads-per-block for the 1D op launches."""
 
 comptime DevBuf = DeviceBuffer[DType.float32]
+"""An f32 device buffer — the common activation/working type."""
 comptime WBuf = DeviceBuffer[
     DType.uint16
 ]  # bf16 weights kept on-device as raw u16
+"""A u16 device buffer holding raw bf16 weights (widened per element)."""
 comptime PBuf = DeviceBuffer[
     DType.uint32
 ]  # packed group-128 int4 weights (8 nibbles/word)
+"""A u32 device buffer of packed group-128 int4 weights (8 nibbles/word)."""
 
 
 struct QMat(Movable):
@@ -71,13 +75,19 @@ struct QMat(Movable):
     model can mix (here: bf16 0.5B, int4 3B; either is selectable at load)."""
 
     var bf16: WBuf
+    """Raw bf16 weights (used when `q4` is False); else a size-1 dummy."""
     var packed: PBuf
+    """Packed group-128 int4 weights (used when `q4` is True); else a dummy."""
     var scales: DevBuf
+    """Per-group f32 scales for the int4 weights (used when `q4` is True)."""
     var q4: Bool
+    """Selects the representation: True = group-128 int4, False = bf16."""
 
     def __init__(
         out self, var bf16: WBuf, var packed: PBuf, var scales: DevBuf, q4: Bool
     ):
+        """Construct a QMat taking ownership of its three buffers and `q4` flag.
+        """
         self.bf16 = bf16^
         self.packed = packed^
         self.scales = scales^
@@ -85,6 +95,7 @@ struct QMat(Movable):
 
 
 def qmat_bf16(ctx: DeviceContext, var buf: WBuf) raises -> QMat:
+    """Wrap raw bf16 weights in a QMat (q4=False), with dummy int4 buffers."""
     return QMat(
         buf^,
         ctx.enqueue_create_buffer[DType.uint32](1),
@@ -107,6 +118,9 @@ def mm(
     use_bias: Int,
     simd_ok: Bool = False,
 ) raises -> DevBuf:
+    """Matmul x[M,K]·wᵀ[N,K] (+ optional bias) → y[M,N] for bf16 weights. Dispatches
+    on M: GEMV at M=1 (decode), simdgroup-matrix GEMM when `simd_ok` (prefill),
+    else the scalar register-tiled GEMM."""
     var y = ctx.enqueue_create_buffer[DType.float32](M * N)
     var lay = row_major(M * N)
     if M == 1:
@@ -542,6 +556,8 @@ def probe_simd_gemm(ctx: DeviceContext) raises -> Bool:
 def rmsnorm(
     ctx: DeviceContext, mut x: DevBuf, mut w: DevBuf, T: Int, dim: Int
 ) raises -> DevBuf:
+    """RMSNorm each of the T rows of x[T,dim] scaled by weight w[dim], one warp per
+    row → fresh [T,dim] buffer."""
     var y = ctx.enqueue_create_buffer[DType.float32](T * dim)
     var lay = row_major(T * dim)
     comptime k = rmsnorm_kernel[type_of(lay)]
@@ -616,6 +632,7 @@ def gelu_mul_strided(
 def add(
     ctx: DeviceContext, mut a: DevBuf, mut b: DevBuf, n: Int
 ) raises -> DevBuf:
+    """Elementwise a + b over n elements → fresh buffer."""
     var y = ctx.enqueue_create_buffer[DType.float32](n)
     var lay = row_major(n)
     comptime k = add_kernel[type_of(lay)]
@@ -633,6 +650,7 @@ def add(
 def silu_mul(
     ctx: DeviceContext, mut a: DevBuf, mut b: DevBuf, n: Int
 ) raises -> DevBuf:
+    """SwiGLU elementwise SiLU(a)·b over n elements → fresh buffer."""
     var y = ctx.enqueue_create_buffer[DType.float32](n)
     var lay = row_major(n)
     comptime k = silu_mul_kernel[type_of(lay)]
@@ -782,6 +800,8 @@ def embed_tokens(
     hidden: Int,
     vocab: Int,
 ) raises -> DevBuf:
+    """Gather the bf16 embedding rows for T token `ids` from emb[vocab,hidden],
+    widening to a fresh f32 [T,hidden] buffer."""
     var h = ctx.enqueue_create_buffer[DType.float32](T * hidden)
     var lay = row_major(T * hidden)
     comptime k = embed_kernel[
@@ -825,6 +845,8 @@ def copy_into(
     n: Int,
     dst_len: Int,
 ) raises:
+    """Copy n elements from src into dst starting at `dst_offset` (dst has capacity
+    `dst_len`)."""
     var lay = row_major(n)
     comptime k = copy_kernel[type_of(lay)]
     ctx.enqueue_function[k](

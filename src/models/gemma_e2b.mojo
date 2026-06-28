@@ -68,81 +68,143 @@ from runtime.model_iface import (
 
 # ── e2b text dims (from text_config) ─────────────────────────────────────────
 comptime E_HIDDEN = 1536
+"""Hidden (model) dimension of the e2b text decoder."""
 comptime E_INTER = 6144
+"""MLP intermediate dimension (doubled for the KV-shared double-wide layers)."""
 comptime E_NLAYERS = 35
+"""Number of decoder layers."""
 comptime E_FIRST_KV_SHARED = E_NLAYERS - 20  # 15 — layers ≥ this share KV AND use
+"""First layer index (15) whose checkpoint shares KV and uses a double-wide MLP."""
 # a DOUBLE-WIDE MLP (use_double_wide_mlp).
 comptime E_VOCAB = 262144
+"""Vocabulary size (shared with the 12B target, so draft tokens are verifiable)."""
 comptime E_HQ = 8
+"""Number of query attention heads."""
 comptime E_EOS1 = 1
+"""Primary end-of-sequence token id."""
 comptime E_EOS2 = 106
+"""Secondary end-of-sequence token id (end-of-turn)."""
 comptime E_EMBED_SCALE = Float32(39.19183588453085)  # sqrt(1536)
+"""Input-embedding scale factor (sqrt(hidden) = sqrt(1536))."""
 comptime E_FINAL_SOFTCAP = Float32(30.0)
+"""Logit soft-cap applied to the final LM-head output."""
 
 # sliding (default rope): head_dim 256, 1 kv head, θ=1e4, full rotary (128 pairs).
 comptime ESL_HEAD_DIM = 256
+"""Per-head dimension for the sliding-attention layers."""
 comptime ESL_HKV = 1
+"""Number of key/value heads for the sliding-attention layers."""
 comptime ESL_NKV = ESL_HKV * ESL_HEAD_DIM  # 256
+"""Total KV width per sliding layer (hkv × head_dim = 256)."""
 comptime ESL_THETA = Float32(10000.0)
+"""RoPE base frequency θ for the sliding-attention layers."""
 comptime ESL_ROT_PAIRS = ESL_HEAD_DIM // 2  # 128 (full)
+"""Number of rotary pairs for sliding layers (128 = full rotary over head_dim)."""
 comptime E_SLIDING_WINDOW = 512
+"""Local-attention window size for the sliding layers."""
 # full (proportional rope): head_dim 512, 1 kv head, θ=1e6, partial 64 pairs.
 comptime EFU_HEAD_DIM = 512
+"""Per-head dimension for the full-attention layers."""
 comptime EFU_HKV = 1
+"""Number of key/value heads for the full-attention layers."""
 comptime EFU_NKV = EFU_HKV * EFU_HEAD_DIM  # 512
+"""Total KV width per full layer (hkv × head_dim = 512)."""
 comptime EFU_THETA = Float32(1000000.0)
+"""RoPE base frequency θ for the full-attention layers."""
 comptime EFU_ROT_PAIRS = 64  # int(0.25 * 512 // 2)
+"""Number of rotary pairs for full layers (partial rotary, 64 pairs)."""
 
 # ── Per-Layer Embeddings (PLE) ───────────────────────────────────────────────
 comptime E_HPLI = 256  # hidden_size_per_layer_input
+"""Per-layer-input embedding width (hidden_size_per_layer_input)."""
 comptime E_PLE_WIDTH = E_NLAYERS * E_HPLI  # 8960 = embed_tokens_per_layer row
+"""Width of one embed_tokens_per_layer row (nlayers × 256 = 8960)."""
 comptime E_PLE_EMBED_SCALE = Float32(
     16.0
 )  # sqrt(256), embed_tokens_per_layer scale
+"""Scale applied to the per-layer embedding lookup (sqrt(256))."""
 comptime E_PLE_PROJ_SCALE = Float32(0.02551551815399144)  # 1536**-0.5
+"""Scale applied to the per-layer model projection (hidden**-0.5)."""
 comptime E_PLE_INPUT_SCALE = Float32(0.7071067811865476)  # 2**-0.5
+"""Scale combining projected + looked-up per-layer inputs (2**-0.5)."""
 
 
 @fieldwise_init
 struct GemmaE2bWeights(ModelWeights, Movable):
+    """Weights + config for the Gemma-4 e2b text decoder (the int4 speculative
+    draft model). Conforms to `ModelWeights` so the generic engine can run it.
+    """
+
     var embed: WBuf  # bf16, tied LM head (RAW — embed scale is input-only)
+    """`bf16` token-embedding table, also tied as the LM head (raw, unscaled)."""
     var embed_pl: WBuf  # bf16 embed_tokens_per_layer [vocab, 8960]
+    """`bf16` per-layer embedding table embed_tokens_per_layer [vocab, 8960]."""
     var final_norm: DevBuf
+    """Final RMSNorm weight before the LM head."""
     var ln1: List[DevBuf]
+    """Per-layer input (pre-attention) RMSNorm weights."""
     var ln_post_attn: List[DevBuf]
+    """Per-layer post-attention RMSNorm weights."""
     var ln_pre_ff: List[DevBuf]
+    """Per-layer pre-feedforward RMSNorm weights."""
     var ln_post_ff: List[DevBuf]
+    """Per-layer post-feedforward RMSNorm weights."""
     var qkv: List[QMat]  # fused [q|k|v] (all layers have v_proj)
+    """Per-layer fused [q|k|v] projection (every layer has its own v_proj)."""
     var ow: List[QMat]
+    """Per-layer attention output projection (o_proj)."""
     var qnorm: List[DevBuf]
+    """Per-layer query RMSNorm weights (applied per head)."""
     var knorm: List[DevBuf]
+    """Per-layer key RMSNorm weights (applied per head)."""
     var gate_up: List[QMat]
+    """Per-layer fused gate+up MLP projection."""
     var down: List[QMat]
+    """Per-layer MLP down projection."""
     var layer_scalar: List[Float32]
+    """Per-layer output scalar applied after PLE integration."""
     # PLE
     var plm_proj: QMat  # per_layer_model_projection [8960, 1536]
+    """Per-layer model projection per_layer_model_projection [8960, 1536]."""
     var plp_norm: DevBuf  # per_layer_projection_norm [256]
+    """Per-layer projection RMSNorm weight per_layer_projection_norm [256]."""
     var pli_gate: List[QMat]  # per_layer_input_gate [256, 1536]
+    """Per-layer input-gate projection per_layer_input_gate [256, 1536]."""
     var pli_proj: List[QMat]  # per_layer_projection [1536, 256]
+    """Per-layer projection back to hidden per_layer_projection [1536, 256]."""
     var pli_post_norm: List[DevBuf]  # post_per_layer_input_norm [1536]
+    """Per-layer post-PLE-input RMSNorm weights post_per_layer_input_norm [1536]."""
     var ple: DevBuf  # per-forward per-layer inputs [T, 8960]; set in embed_prompt
+    """Per-forward per-layer input signal [T, 8960]; populated by embed_prompt."""
     var is_full: List[Bool]
+    """Per-layer flag: True for full-attention layers, False for sliding."""
     var kv_src: List[Int]  # KV-share source layer per layer (own l for l<15)
+    """Per-layer KV-share source layer (own index for layers < 15)."""
     var hidden: Int
+    """Hidden dimension (E_HIDDEN)."""
     var inter: Int
+    """MLP intermediate dimension (E_INTER)."""
     var nlayers: Int
+    """Number of decoder layers (E_NLAYERS)."""
     var vocab: Int
+    """Vocabulary size (E_VOCAB)."""
     var hq: Int
+    """Number of query heads (E_HQ)."""
     var simd_ok: Bool
+    """Whether the SIMD-group GEMM fast path is enabled for this device."""
     var cfg: ModelConfig
+    """Generic model configuration consumed by the engine."""
 
     # ── ModelWeights conformance ─────────────────────────────────────────────
     def config(self) -> ModelConfig:
+        """Return the generic model configuration."""
         return self.cfg
 
     def embed_prompt(
         mut self, ctx: DeviceContext, mut ids: DeviceBuffer[DType.int32], T: Int
     ) raises -> DevBuf:
+        """Embed `T` token ids into hidden states and precompute the per-layer
+        (PLE) input signal for this forward pass; returns the scaled hidden."""
         var h = embed_tokens(ctx, ids, self.embed, T, self.hidden, self.vocab)
         h = mul_scalar(
             ctx, h, T * self.hidden, E_EMBED_SCALE
@@ -185,6 +247,7 @@ struct GemmaE2bWeights(ModelWeights, Movable):
         cache_len: Int,
         mut dummy: DevBuf,
     ) raises -> DevBuf:
+        """Run decoder layer `l` over hidden `h`, updating the KV caches."""
         return e2b_layer(
             ctx, self, l, h, kcs, vcs, Tq, q_offset, cache_len, dummy
         )
@@ -192,6 +255,7 @@ struct GemmaE2bWeights(ModelWeights, Movable):
     def lm_logits(
         mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf
     ) raises -> List[Float32]:
+        """Compute soft-capped LM-head logits for the LAST position only."""
         var hl = last_row(ctx, h, T, self.hidden)
         var logits = mm_norm(
             ctx,
@@ -216,6 +280,8 @@ struct GemmaE2bWeights(ModelWeights, Movable):
     def lm_logits_all(
         mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf
     ) raises -> List[Float32]:
+        """Compute soft-capped LM-head logits for ALL `T` positions (flattened).
+        """
         var n = T * self.vocab
         var logits = mm_norm(
             ctx,
@@ -245,6 +311,7 @@ struct GemmaE2bWeights(ModelWeights, Movable):
         targets: List[Int],
         mut dummy: DevBuf,
     ) raises -> List[Float32]:
+        """Return per-position log-probabilities of the given target tokens."""
         var logits = mm_norm(
             ctx,
             h,
@@ -580,6 +647,8 @@ def e2b_attn(
     q_offset: Int,
     cache_len: Int,
 ) raises -> DevBuf:
+    """Compute one attention block (RoPE Q/K, V-norm, tensor-core attention) for
+    e2b geometry; writes K/V into the caches only when `write` is True."""
     # `kc`/`vc` are the caches to ATTEND against. write=True (own-KV layer): compute
     # K/V from `qkv` and store them into kc/vc first. write=False (KV-shared layer):
     # kc/vc are an EARLIER layer's caches — only Q is computed; K/V are left as-is.
@@ -742,6 +811,8 @@ def e2b_layer(
     cache_len: Int,
     mut dummy: DevBuf,
 ) raises -> DevBuf:
+    """Forward one Gemma-4 e2b decoder layer: attention + MLP residual blocks
+    followed by Per-Layer-Embedding integration and the layer_scalar."""
     var full = w.is_full[l]
     var head_dim = EFU_HEAD_DIM if full else ESL_HEAD_DIM
     var hkv = EFU_HKV if full else ESL_HKV

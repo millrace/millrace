@@ -28,18 +28,31 @@ comptime _G_CLOSE = "<tool_call|>"
 
 
 struct ToolCall(Copyable, Movable):
+    """One parsed function call: a name plus JSON-string arguments (OpenAI shape).
+    """
+
     var name: String  # function name
+    """Function name."""
     var arguments: String  # arguments serialized as a JSON string (OpenAI shape)
+    """Arguments serialized as a JSON string (OpenAI shape)."""
 
     def __init__(out self, var name: String, var arguments: String):
+        """Construct a `ToolCall` from a function name and JSON-string arguments.
+        """
         self.name = name^
         self.arguments = arguments^
 
 
 struct ParsedReply(Movable):
+    """A parsed completion: free-text content, reasoning, and ordered tool calls.
+    """
+
     var content: String  # text outside any tool block (trimmed)
+    """Text outside any tool block (trimmed)."""
     var reasoning: String  # thinking-channel content ("" for Qwen / no channel)
+    """Thinking-channel content (empty for Qwen / no channel)."""
     var calls: List[ToolCall]  # tool calls in emission order
+    """Tool calls in emission order."""
 
     def __init__(
         out self,
@@ -47,11 +60,13 @@ struct ParsedReply(Movable):
         var reasoning: String,
         var calls: List[ToolCall],
     ):
+        """Construct a `ParsedReply` from content, reasoning, and tool calls."""
         self.content = content^
         self.reasoning = reasoning^
         self.calls = calls^
 
     def has_calls(self) -> Bool:
+        """Whether any tool calls were parsed."""
         return len(self.calls) > 0
 
 

@@ -18,6 +18,7 @@ nullable, required — the macro branches.
 from value import Value, VNONE, VBOOL, VINT, VFLOAT, VSTR, VLIST, VMAP
 
 comptime Q = '<|"|>'  # the gemma quote control token
+"""The Gemma quote control token."""
 
 
 def _upper(s: String) -> String:
@@ -106,6 +107,8 @@ def _str_list(v: Value) -> String:
 
 
 def format_argument(arg: Value, escape_keys: Bool) raises -> String:
+    """Format one argument `Value` as Gemma tool-call text (quoted string,
+    `true`/`false`, or a `{...}` object)."""
     if arg.tag == VSTR:
         return Q + arg.s + Q
     if arg.tag == VBOOL:
@@ -235,6 +238,8 @@ def _property_body(value: Value) raises -> String:
 
 
 def format_parameters(properties: Value, filter_keys: Bool) raises -> String:
+    """Format a JSON-schema `properties` map into Gemma `key:{...}` parameter
+    text, skipping standard schema keys when `filter_keys`."""
     var out = String("")
     var found_first = False
     var idx = dictsort(properties)
@@ -250,6 +255,8 @@ def format_parameters(properties: Value, filter_keys: Bool) raises -> String:
 
 
 def format_function_declaration(tool: Value) raises -> String:
+    """Format one tool's `function` (name + description + parameters) as a Gemma
+    function declaration."""
     var f = _get(tool, "function")
     var name = _get(f, "name").s
     var desc = _get(f, "description").s

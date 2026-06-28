@@ -68,61 +68,113 @@ from runtime.model_iface import (
 
 # Gemma 4 12B-it dims (from text_config).
 comptime G_HIDDEN = 3840
+"""Hidden (model) dimension of Gemma 4 12B-it."""
 comptime G_INTER = 15360
+"""MLP intermediate (feed-forward) dimension."""
 comptime G_NLAYERS = 48
+"""Number of decoder layers in the dense Gemma 4 12B text model."""
 comptime G_VOCAB = 262144
+"""Vocabulary size (tied embedding / LM head rows)."""
 comptime G_HQ = 16
+"""Number of query attention heads (both layer types)."""
 comptime G_EOS1 = 1
+"""End-of-sequence token id (`<eos>`)."""
 comptime G_EOS2 = 106
+"""End-of-turn token id (`<end_of_turn>`)."""
 comptime G_EMBED_SCALE = Float32(61.96773353931867)  # sqrt(3840)
+"""Input-path embedding scale factor, √hidden (= √3840)."""
 comptime G_FINAL_SOFTCAP = Float32(30.0)
+"""Final-logit softcap applied before sampling."""
 
 # sliding (default rope): head_dim 256, 8 kv heads, θ=1e4, full rotary (128 pairs).
 comptime SL_HEAD_DIM = 256
+"""Per-head dimension of sliding_attention layers."""
 comptime SL_HKV = 8
+"""Number of key/value heads in sliding_attention layers (GQA)."""
 comptime SL_NKV = SL_HKV * SL_HEAD_DIM  # 2048
+"""Total KV width of a sliding layer (SL_HKV × SL_HEAD_DIM = 2048)."""
 comptime SL_THETA = Float32(10000.0)
+"""RoPE base frequency θ for sliding layers (1e4)."""
 comptime SL_ROT_PAIRS = SL_HEAD_DIM // 2  # 128 (full)
+"""RoPE rotary pair count for sliding layers (full rotary: 128 pairs)."""
 comptime G_SLIDING_WINDOW = 1024  # sliding layers attend only the last 1024 keys
+"""Sliding-attention window: sliding layers attend only the last 1024 keys."""
 # full (proportional rope): head_dim 512 (global), 1 kv head, θ=1e6, partial 64 pairs.
 comptime FU_HEAD_DIM = 512
+"""Per-head dimension of full_attention layers (global head_dim)."""
 comptime FU_HKV = 1
+"""Number of key/value heads in full_attention layers (MQA: 1)."""
 comptime FU_NKV = FU_HKV * FU_HEAD_DIM  # 512
+"""Total KV width of a full layer (FU_HKV × FU_HEAD_DIM = 512)."""
 comptime FU_THETA = Float32(1000000.0)
+"""RoPE base frequency θ for full layers (1e6)."""
 comptime FU_ROT_PAIRS = 64  # int(0.25 * 512 // 2)
+"""RoPE rotary pair count for full layers (partial rotary: first 64 of 256)."""
 
 
 @fieldwise_init
 struct GemmaWeights(ModelWeights, Movable):
+    """Resident weights of the Gemma 4 12B dense text model (GPU buffers).
+
+    Holds the tied embedding, final norm, and the per-layer projection/norm
+    weights for all 48 decoder layers; conforms to `ModelWeights` so the engine
+    can prefill/decode it. Projection weights are group-128 int4 (`QMat`) when
+    loaded with `q4=True`, else bf16."""
+
     var embed: WBuf  # bf16, tied LM head (RAW — embed scale is input-only)
+    """Token embedding table (bf16); also the tied LM head (used raw)."""
     var final_norm: DevBuf  # final RMSNorm weight
+    """Final RMSNorm weight applied before the LM head."""
     var ln1: List[DevBuf]  # input_layernorm
+    """Per-layer input_layernorm (RMSNorm) weights."""
     var ln_post_attn: List[DevBuf]  # post_attention_layernorm
+    """Per-layer post_attention_layernorm weights."""
     var ln_pre_ff: List[DevBuf]  # pre_feedforward_layernorm
+    """Per-layer pre_feedforward_layernorm weights."""
     var ln_post_ff: List[DevBuf]  # post_feedforward_layernorm
+    """Per-layer post_feedforward_layernorm weights."""
     var qkv: List[QMat]  # full layers: [q|k] (no separate v); sliding: [q|k|v]
+    """Per-layer fused QKV projection (`[q|k]` for full layers, `[q|k|v]` for sliding)."""
     var ow: List[QMat]  # o_proj
+    """Per-layer attention output projection (o_proj)."""
     var qnorm: List[DevBuf]  # per-head q_norm [head_dim]
+    """Per-layer per-head query RMSNorm weights ([head_dim])."""
     var knorm: List[DevBuf]  # per-head k_norm [head_dim]
+    """Per-layer per-head key RMSNorm weights ([head_dim])."""
     var gate_up: List[QMat]  # gate|up fused
+    """Per-layer fused MLP gate|up projection."""
     var down: List[QMat]
+    """Per-layer MLP down projection."""
     var layer_scalar: List[Float32]  # [1] per-layer learned scalar
+    """Per-layer learned scalar applied to the layer output."""
     var is_full: List[Bool]  # True = full_attention layer
+    """Per-layer flag: True for full_attention layers, False for sliding."""
     var hidden: Int
+    """Hidden (model) dimension."""
     var inter: Int
+    """MLP intermediate dimension."""
     var nlayers: Int
+    """Number of decoder layers."""
     var vocab: Int
+    """Vocabulary size."""
     var hq: Int
+    """Number of query attention heads."""
     var simd_ok: Bool
+    """Whether the SIMD-group GEMM fast path is available on this device."""
     var cfg: ModelConfig
+    """Model-agnostic config the engine reads (family, EOS, softcap, …)."""
 
     # ── ModelWeights conformance ─────────────────────────────────────────────
     def config(self) -> ModelConfig:
+        """Return the model-agnostic `ModelConfig` the engine drives this model with.
+        """
         return self.cfg
 
     def embed_prompt(
         mut self, ctx: DeviceContext, mut ids: DeviceBuffer[DType.int32], T: Int
     ) raises -> DevBuf:
+        """Embed `T` prompt token ids and apply Gemma's input √hidden embedding scale.
+        """
         var h = embed_tokens(ctx, ids, self.embed, T, self.hidden, self.vocab)
         # Gemma scales the embeddings by √hidden on the INPUT path only.
         return mul_scalar(ctx, h, T * self.hidden, G_EMBED_SCALE)
@@ -139,6 +191,8 @@ struct GemmaWeights(ModelWeights, Movable):
         cache_len: Int,
         mut dummy: DevBuf,
     ) raises -> DevBuf:
+        """Run decoder layer `l` over hidden state `h`, reading/writing its KV cache.
+        """
         return gemma_layer(
             ctx, self, l, h, kcs[l], vcs[l], Tq, q_offset, cache_len, dummy
         )
@@ -146,6 +200,8 @@ struct GemmaWeights(ModelWeights, Movable):
     def lm_logits(
         mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf
     ) raises -> List[Float32]:
+        """Final norm + tied LM head over the LAST row, softcapped; the next-token logits.
+        """
         # Final (1+w) RMSNorm + tied LM head over the last row, then softcap=30.
         var hl = last_row(ctx, h, T, self.hidden)
         var logits = mm_norm(
@@ -171,6 +227,8 @@ struct GemmaWeights(ModelWeights, Movable):
     def lm_logits_all(
         mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf
     ) raises -> List[Float32]:
+        """Final norm + tied LM head over ALL `T` rows, softcapped (spec-decode verify).
+        """
         # All-row logits for spec-decode verification, with the final softcap=30
         # applied across every position.
         var n = T * self.vocab
@@ -202,6 +260,8 @@ struct GemmaWeights(ModelWeights, Movable):
         targets: List[Int],
         mut dummy: DevBuf,
     ) raises -> List[Float32]:
+        """Per-position log-probabilities of the `targets` token ids (softcapped).
+        """
         var logits = mm_norm(
             ctx,
             h,

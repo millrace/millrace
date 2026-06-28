@@ -18,49 +18,74 @@ from json import parse_json
 
 comptime MUL = 1 << 20  # pair key = left*MUL + right (ids < 262144 for Gemma,
 # < 151936 for Qwen; 1<<20 == 1048576 exceeds both)
+"""Multiplier packing a BPE pair into one key (`left*MUL + right`); exceeds both vocab sizes."""
 comptime APOS = 39
+"""ASCII code for the apostrophe (`'`), used in contraction pretokenization."""
 comptime SPACE = 32
+"""ASCII code for the space character."""
 comptime USCORE = 0x2581  # U+2581 "▁" — Gemma's normalized-space marker
+"""Codepoint U+2581 ("▁"), Gemma's SentencePiece normalized-space marker."""
 
 
 def is_letter(b: Int) -> Bool:
+    """True if byte `b` is an ASCII letter (A–Z or a–z)."""
     return (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
 
 
 def is_digit(b: Int) -> Bool:
+    """True if byte `b` is an ASCII digit (0–9)."""
     return b >= 48 and b <= 57
 
 
 def is_space(b: Int) -> Bool:
+    """True if byte `b` is ASCII whitespace (space, tab, LF, CR, VT, or FF)."""
     return b == 32 or b == 9 or b == 10 or b == 13 or b == 11 or b == 12
 
 
 def is_nl(b: Int) -> Bool:
+    """True if byte `b` is a newline character (LF or CR)."""
     return b == 10 or b == 13
 
 
 def lower(b: Int) -> Int:
+    """ASCII-lowercase byte `b` (A–Z → a–z; other bytes unchanged)."""
     return b + 32 if (b >= 65 and b <= 90) else b
 
 
 @fieldwise_init
 struct SpMatch(Copyable, Movable):
+    """The result of matching a special token: its id and byte length."""
+
     var id: Int
+    """Token id of the matched special token (-1 if no match)."""
     var length: Int
+    """Byte length of the matched special-token text (0 if no match)."""
 
 
 @fieldwise_init
 struct Tokenizer(Movable):
+    """Byte-level BPE tokenizer: the resolved id-space tables plus encode/decode.
+    """
+
     var byte_id: List[Int]  # [256] id of each single-byte token
+    """Id of each single-byte token, indexed by byte value (256 entries)."""
     var merge_rank: Dict[Int, Int]  # pairkey -> rank
+    """BPE merge priority: pair key → rank (lower rank merges first)."""
     var merge_id: Dict[Int, Int]  # pairkey -> merged id
+    """BPE merge result: pair key → id of the merged token."""
     var id_to_bytes: Dict[Int, List[UInt8]]
+    """Token id → its raw decoded bytes (used by `decode`)."""
     var sp_text: List[List[UInt8]]  # special token texts
+    """Special-token texts as raw byte sequences."""
     var sp_id: List[Int]  # parallel ids
+    """Token ids parallel to `sp_text`."""
     var cp_to_id: Dict[Int, Int]  # codepoint -> id (Gemma single-char symbols)
+    """Codepoint → id for Gemma single-codepoint vocab symbols (empty for Qwen)."""
     var gemma: Bool  # True -> SentencePiece-style path (no GPT2 regex)
+    """True selects the Gemma SentencePiece-style path (no GPT-2 regex)."""
 
     def bpe(self, mut ids: List[Int]) raises:
+        """Apply rank-greedy BPE merges in place over the token ids `ids`."""
         while len(ids) >= 2:
             var best_rank = 1 << 60
             var best_i = -1
@@ -78,6 +103,8 @@ struct Tokenizer(Movable):
             _ = ids.pop(best_i + 1)
 
     def next_chunk(self, buf: List[UInt8], pos: Int, end: Int) -> Int:
+        """Return the end of the next GPT-2 pretokenization chunk starting at `pos`.
+        """
         var c = Int(buf[pos])
 
         # rule 1: contractions (?i:'s|'t|'re|'ve|'m|'ll|'d)
@@ -159,6 +186,8 @@ struct Tokenizer(Movable):
     def encode_normal(
         self, buf: List[UInt8], start: Int, stop: Int, mut out: List[Int]
     ) raises:
+        """Encode the `[start, stop)` span (GPT-2 path): pretokenize, map bytes to ids, BPE, append to `out`.
+        """
         var p = start
         while p < stop:
             var e = self.next_chunk(buf, p, stop)
@@ -226,6 +255,8 @@ struct Tokenizer(Movable):
             out.append(x)
 
     def match_special(self, buf: List[UInt8], pos: Int) raises -> SpMatch:
+        """Return the longest special token matching at `pos` (id -1, length 0 if none).
+        """
         var best_id = -1
         var best_len = 0
         for s in range(len(self.sp_text)):
@@ -243,6 +274,8 @@ struct Tokenizer(Movable):
         return SpMatch(best_id, best_len)
 
     def encode(self, buf: List[UInt8]) raises -> List[Int]:
+        """Encode raw input bytes to a list of token ids (special tokens split out first).
+        """
         var out = List[Int]()
         var n = len(buf)
         var pos = 0
@@ -266,6 +299,8 @@ struct Tokenizer(Movable):
         return out^
 
     def decode(self, ids: List[Int]) raises -> List[UInt8]:
+        """Decode token ids back to raw bytes (vocab tokens, then special tokens).
+        """
         var out = List[UInt8]()
         for k in range(len(ids)):
             var id = ids[k]
@@ -282,12 +317,14 @@ struct Tokenizer(Movable):
 
 
 def hex_val(c: Int) -> Int:
+    """Value (0–15) of a hex-digit character code `c` (0–9 or lowercase a–f)."""
     if c >= 48 and c <= 57:
         return c - 48
     return c - 97 + 10  # a-f (Python .hex() is lowercase)
 
 
 def hex_to_bytes(s: String) -> List[UInt8]:
+    """Parse a lowercase hex string into the bytes it encodes."""
     var sb = s.as_bytes()
     var out = List[UInt8]()
     var i = 0
@@ -557,6 +594,8 @@ def load_gemma_tokenizer_json(path: String) raises -> Tokenizer:
 
 
 def load_tokenizer(dir: String) raises -> Tokenizer:
+    """Build a `Tokenizer` from tok-capture's resolved `.tsv` dumps (vocab/merges/specials) in `dir`.
+    """
     var byte_id = List[Int]()
     for _ in range(256):
         byte_id.append(-1)

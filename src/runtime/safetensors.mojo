@@ -16,37 +16,54 @@ from runtime.tensor_ops import BLOCK, DevBuf, WBuf, PBuf, QMat, qmat_bf16
 # ── safetensors header (JSON subset) ──────────────────────────────────────────
 
 comptime QUOTE = 34
+"""ASCII byte value for `\"`."""
 comptime LBRACE = 123
+"""ASCII byte value for `{`."""
 comptime RBRACE = 125
+"""ASCII byte value for `}`."""
 comptime LBRACK = 91
+"""ASCII byte value for `[`."""
 comptime RBRACK = 93
+"""ASCII byte value for `]`."""
 comptime COLON = 58
+"""ASCII byte value for `:`."""
 comptime COMMA = 44
+"""ASCII byte value for `,`."""
 
 
 @fieldwise_init
 struct TensorEntry(Copyable, Movable):
+    """One header entry: a tensor's name and its byte range in the data blob."""
+
     var name: String
+    """The tensor's name (the safetensors header key)."""
     var begin: Int
+    """Start byte offset of the tensor's data."""
     var end: Int
+    """End byte offset (exclusive) of the tensor's data."""
 
 
 def is_ws(c: Int) -> Bool:
+    """True if byte `c` is JSON whitespace (space, tab, LF, or CR)."""
     return c == 32 or c == 9 or c == 10 or c == 13
 
 
 def skip_ws(buf: List[UInt8], mut pos: Int):
+    """Advance `pos` past any run of whitespace in `buf`."""
     while pos < len(buf) and is_ws(Int(buf[pos])):
         pos += 1
 
 
 def expect(buf: List[UInt8], mut pos: Int, ch: Int) raises:
+    """Consume byte `ch` at `pos`, raising a parse error if it isn't there."""
     if pos >= len(buf) or Int(buf[pos]) != ch:
         raise Error("parse error at byte " + String(pos))
     pos += 1
 
 
 def parse_string(buf: List[UInt8], mut pos: Int) raises -> String:
+    """Parse a quoted JSON string at `pos` (no escape handling) and return it.
+    """
     expect(buf, pos, QUOTE)
     var s = String("")
     while pos < len(buf) and Int(buf[pos]) != QUOTE:
@@ -57,6 +74,7 @@ def parse_string(buf: List[UInt8], mut pos: Int) raises -> String:
 
 
 def parse_uint(buf: List[UInt8], mut pos: Int) raises -> Int:
+    """Parse a run of decimal digits at `pos` into an int (raises if none)."""
     var v = 0
     var start = pos
     while pos < len(buf) and Int(buf[pos]) >= 48 and Int(buf[pos]) <= 57:
@@ -68,6 +86,7 @@ def parse_uint(buf: List[UInt8], mut pos: Int) raises -> Int:
 
 
 def parse_int_array(buf: List[UInt8], mut pos: Int) raises -> List[Int]:
+    """Parse a JSON array of unsigned ints (e.g. data_offsets) at `pos`."""
     var out = List[Int]()
     expect(buf, pos, LBRACK)
     skip_ws(buf, pos)
@@ -87,6 +106,7 @@ def parse_int_array(buf: List[UInt8], mut pos: Int) raises -> List[Int]:
 
 
 def skip_value(buf: List[UInt8], mut pos: Int) raises:
+    """Advance `pos` past one JSON value (string, object, array, or scalar)."""
     skip_ws(buf, pos)
     var c = Int(buf[pos])
     if c == QUOTE:
@@ -116,6 +136,7 @@ def skip_value(buf: List[UInt8], mut pos: Int) raises:
 
 
 def skip_object(buf: List[UInt8], mut pos: Int) raises:
+    """Advance `pos` past a whole JSON object, including nested values."""
     expect(buf, pos, LBRACE)
     skip_ws(buf, pos)
     if Int(buf[pos]) == RBRACE:
@@ -136,6 +157,8 @@ def skip_object(buf: List[UInt8], mut pos: Int) raises:
 
 
 def parse_header(buf: List[UInt8]) raises -> List[TensorEntry]:
+    """Parse a safetensors header object into per-tensor entries, skipping the
+    `__metadata__` key. begin/end are offsets relative to the data blob."""
     var entries = List[TensorEntry]()
     var pos = 0
     skip_ws(buf, pos)
@@ -206,6 +229,8 @@ def read_header(path: String) raises -> List[TensorEntry]:
 def load_one(
     ctx: DeviceContext, path: String, begin: Int, end: Int
 ) raises -> DevBuf:
+    """Load the bf16 tensor in byte range [begin, end) and widen it to a fresh f32
+    device buffer (via the cvt kernel)."""
     var nbytes = end - begin
     var count = nbytes // 2
     var dev_f32 = ctx.enqueue_create_buffer[DType.float32](count)
@@ -241,6 +266,7 @@ def load_named(
     name2idx: Dict[String, Int],
     name: String,
 ) raises -> DevBuf:
+    """Look up tensor `name` and load it as a widened f32 device buffer."""
     var idx = name2idx[name]
     return load_one(ctx, paths[idx], entries[idx].begin, entries[idx].end)
 
@@ -285,6 +311,7 @@ def load_named_bf16(
     name2idx: Dict[String, Int],
     name: String,
 ) raises -> WBuf:
+    """Look up tensor `name` and load it as a raw bf16 (u16) device buffer."""
     var idx = name2idx[name]
     return load_one_bf16(ctx, paths[idx], entries[idx].begin, entries[idx].end)
 

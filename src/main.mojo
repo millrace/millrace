@@ -23,15 +23,19 @@ from chat import load_chat_template, render_chat
 from json import bytes_to_string
 
 comptime MAX_NEW = 64
+"""Maximum number of new tokens to generate for the prompt."""
 comptime TEMPLATE = "assets/qwen2.5-chat-template.jinja"
+"""Path to the Qwen2.5 chat template applied to the user prompt."""
 
 
 def read_text(path: String) raises -> String:
+    """Read the whole file at `path` into a String."""
     with open(path, "r") as f:
         return f.read()
 
 
 def to_bytes(s: String) -> List[UInt8]:
+    """Copy the UTF-8 bytes of `s` into a `List[UInt8]`."""
     var out = List[UInt8]()
     var sb = s.as_bytes()
     for i in range(len(sb)):
@@ -40,6 +44,8 @@ def to_bytes(s: String) -> List[UInt8]:
 
 
 def main() raises:
+    """Render the prompt, load weights, greedily generate, and print the answer.
+    """
     var user = String("What is the capital of France?")
     if len(argv()) > 1:
         var joined = String("")

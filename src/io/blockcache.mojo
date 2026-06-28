@@ -29,8 +29,11 @@ from std.gpu.host import DeviceContext, DeviceBuffer
 from std.memory import memcpy
 
 comptime DevBuf = DeviceBuffer[DType.float32]
+"""A device-side f32 buffer (one layer's K or V slab)."""
 comptime FNV_OFFSET = UInt64(14695981039346656037)
+"""FNV-1a 64-bit offset basis (initial hash value)."""
 comptime FNV_PRIME = UInt64(1099511628211)
+"""FNV-1a 64-bit prime (per-byte multiplier)."""
 
 
 def _mix(h0: UInt64, v: UInt64) -> UInt64:
@@ -60,15 +63,25 @@ def _write_text(path: String, s: String) raises:
 
 
 struct BlockCache(Movable):
+    """Disk-backed block KV cache: persists per-block K/V to `dir` so a restart or a
+    prefix-sharing request reuses computed K/V instead of re-prefilling."""
+
     var dir: String  # store directory (per model)
+    """Store directory (one per model)."""
     var B: Int  # tokens per block
+    """Tokens per block."""
     var nkv: Int  # K/V row width = HKV * HEAD_DIM
+    """K/V row width = HKV * HEAD_DIM."""
     var nlayers: Int
+    """Number of transformer layers (K/V slices stored per block)."""
     var max_blocks: Int  # budget / per-block bytes
+    """Block budget = byte budget // per-block bytes (0 = unlimited)."""
     var enabled: Bool
+    """False if filesystem setup failed; the server still runs, just uncached."""
     var order: List[
         String
     ]  # block hex hashes, LRU order (oldest first) = inventory
+    """Block hex hashes in LRU order (oldest first); also the on-disk inventory."""
 
     def __init__(
         out self,
@@ -79,6 +92,8 @@ struct BlockCache(Movable):
         budget_bytes: Int,
         model_id: String,
     ):
+        """Open (or create) the store at `dir`, sizing the block budget from
+        `budget_bytes` and wiping it if the stamped model dims don't match."""
         self.dir = dir
         self.B = B
         self.nkv = nkv

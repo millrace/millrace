@@ -58,6 +58,7 @@ def json_escape_str(b: List[UInt8]) -> String:
 
 
 def load_chat_template(path: String) raises -> Template:
+    """Load and compile the Jinja chat template at `path` into a `Template`."""
     with open(path, "r") as f:
         return Template.compile(f.read())
 

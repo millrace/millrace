@@ -38,9 +38,11 @@ from flare.http import HttpClient, Response
 
 
 comptime DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+"""HuggingFace repo id downloaded when none is given on the command line."""
 # Generous per-file read+connect timeout (30 min) — a multi-GB shard on a slow
 # link must not trip flare's default 30 s.
 comptime TIMEOUT_MS = 1_800_000
+"""Per-file HTTP read+connect timeout in milliseconds (30 min for large shards)."""
 
 
 def slug(model_id: String) -> String:
@@ -66,6 +68,7 @@ def hub_root() -> String:
 
 
 def resolve_url(repo: String, rev: String, file: String) -> String:
+    """HuggingFace `/resolve/<rev>/<file>` download URL for `repo`."""
     return "https://huggingface.co/" + repo + "/resolve/" + rev + "/" + file
 
 
@@ -89,6 +92,8 @@ def shard_names(index_text: String) -> List[String]:
 
 
 def write_bytes(path: String, data: List[UInt8]) raises:
+    """Write `data` to `path`, chunking to stay under macOS write(2)'s ~2 GiB cap.
+    """
     # macOS write(2) rejects a single call larger than INT_MAX (~2 GiB) with
     # EINVAL, and the 3B shards exceed that — so write in bounded chunks.
     var n = len(data)
@@ -105,6 +110,7 @@ def write_bytes(path: String, data: List[UInt8]) raises:
 
 
 def fetch(mut client: HttpClient, url: String) raises -> Response:
+    """GET `url` over `client` and return the full `Response`."""
     var resp = client.get(url)
     return resp^
 
@@ -167,6 +173,8 @@ def download_one(
 
 
 def main() raises:
+    """Download a Qwen2.5 checkpoint into the HuggingFace cache layout, pinning the
+    snapshot to the resolved commit and the `main` ref."""
     # Parse argv: [model-id] [--revision REV]
     var model = String(DEFAULT_MODEL)
     var rev = String("main")

@@ -17,9 +17,13 @@ from std.gpu.host import DeviceContext
 from layout import TileTensor, row_major
 
 comptime dtype = DType.float32
+"""Element type of the smoke-test buffers (f32)."""
 comptime N = 1024
+"""Number of elements processed by the check."""
 comptime BLOCK = 256
+"""GPU threads per block."""
 comptime layout = row_major[N]()
+"""Row-major 1D layout of N elements bound to each buffer."""
 
 
 def fma_kernel(
@@ -28,12 +32,15 @@ def fma_kernel(
     c: TileTensor[dtype, type_of(layout), MutAnyOrigin],
     size: Int,
 ):
+    """Compute `c[i] = a[i] * b[i] + a[i]` elementwise over `size` elements."""
     var tid = global_idx.x
     if tid < size:
         c[tid] = a[tid] * b[tid] + a[tid]
 
 
 def main() raises:
+    """Run the FMA kernel on the GPU and exit non-zero unless every element is 3.0.
+    """
     comptime if not has_accelerator():
         raise Error(
             "no GPU accelerator detected — this is a GPU-only build (needs"
