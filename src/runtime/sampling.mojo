@@ -25,7 +25,23 @@ def process_logits(
     rep_pen: Float32,
 ) raises -> Dist:
     """HF order: repetition_penalty → temperature → top_k → top_p → softmax.
-    Returns the kept token ids and their (renormalized) probabilities."""
+    Returns the kept token ids and their (renormalized) probabilities.
+
+    Args:
+        logits: The model's last-position logits, one per vocab token.
+        context: The token ids already seen (penalized by `rep_pen`).
+        temp: Temperature; every logit is divided by it.
+        top_k: Keep only the `top_k` largest logits (clamped to the vocab).
+        top_p: Nucleus threshold; keep the smallest prefix whose cumulative
+            probability reaches `top_p`.
+        rep_pen: Repetition penalty applied to tokens present in `context`.
+
+    Returns:
+        A `Dist` of the surviving token ids and their renormalized probabilities.
+
+    Raises:
+        Error: if `logits` is empty (the softmax step indexes the top logit).
+    """
     var v = logits.copy()
 
     # repetition penalty over the unique tokens seen so far
@@ -92,7 +108,14 @@ def process_logits(
 
 
 def next_rand(mut state: UInt64) -> UInt64:
-    """Advance the xorshift64 RNG in place and return the new state."""
+    """Advance the xorshift64 RNG in place and return the new state.
+
+    Args:
+        state: The RNG state, mutated in place to the next value.
+
+    Returns:
+        The advanced state (same value now held by `state`).
+    """
     state ^= state << UInt64(13)
     state ^= state >> UInt64(7)
     state ^= state << UInt64(17)
@@ -100,7 +123,15 @@ def next_rand(mut state: UInt64) -> UInt64:
 
 
 def sample(dist: Dist, mut rng: UInt64) -> Int:
-    """Draw one token from `dist` by inverse-CDF over its probabilities."""
+    """Draw one token from `dist` by inverse-CDF over its probabilities.
+
+    Args:
+        dist: The pruned distribution to sample from.
+        rng: The RNG state, advanced in place to produce the draw.
+
+    Returns:
+        The drawn token id (the last id if rounding leaves the CDF short).
+    """
     var r = Float32(Int(next_rand(rng) >> UInt64(40))) / Float32(
         1 << 24
     )  # [0,1)
@@ -113,7 +144,14 @@ def sample(dist: Dist, mut rng: UInt64) -> Int:
 
 
 def argmax_f(logits: List[Float32]) -> Int:
-    """Return the index of the largest logit (the greedy next token)."""
+    """Return the index of the largest logit (the greedy next token).
+
+    Args:
+        logits: The logits to scan.
+
+    Returns:
+        The index of the largest logit, or -1 if `logits` is empty.
+    """
     var best = -1
     var best_v = Float32(-1.0e30)
     for i in range(len(logits)):

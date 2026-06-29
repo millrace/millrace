@@ -169,13 +169,28 @@ struct Weights(ModelWeights, Movable):
 
     # ── ModelWeights conformance (the engine drives the loop via these) ──────────
     def config(self) -> ModelConfig:
-        """Return the model's `ModelConfig` (behavior flags + engine dims)."""
+        """Return the model's `ModelConfig` (behavior flags + engine dims).
+
+        Returns:
+            The model's `ModelConfig` (behavior flags + engine dims).
+        """
         return self.cfg
 
     def embed_prompt(
         mut self, ctx: DeviceContext, mut ids: DeviceBuffer[DType.int32], T: Int
     ) raises -> DevBuf:
         """Embed the `T` prompt token ids into hidden states (Qwen: no embed scale).
+
+        Args:
+            ctx: The GPU device context.
+            ids: The prompt token ids on device.
+            T: The number of prompt tokens.
+
+        Returns:
+            The hidden-state buffer for the `T` embedded tokens.
+
+        Raises:
+            If the embedding kernel dispatch fails.
         """
         return embed_tokens(
             ctx, ids, self.embed, T, self.hidden, self.vocab
@@ -194,6 +209,23 @@ struct Weights(ModelWeights, Movable):
         mut dummy: DevBuf,
     ) raises -> DevBuf:
         """Run decoder layer `l` over hidden states `h`, updating the layer's K/V caches.
+
+        Args:
+            ctx: The GPU device context.
+            l: The decoder-layer index.
+            h: The hidden-state buffer for the layer's input.
+            kcs: The per-layer key caches.
+            vcs: The per-layer value caches.
+            Tq: The number of query positions (prefill width, or 1 at decode).
+            q_offset: The absolute position of the first query token.
+            cache_len: The allocated KV-cache length.
+            dummy: A scratch buffer for unused kernel arguments.
+
+        Returns:
+            The updated hidden-state buffer after the layer.
+
+        Raises:
+            If a layer kernel dispatch fails.
         """
         return qwen_layer(
             ctx, self, l, h, kcs[l], vcs[l], Tq, q_offset, cache_len, dummy
@@ -203,6 +235,18 @@ struct Weights(ModelWeights, Movable):
         mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf
     ) raises -> List[Float32]:
         """Final RMSNorm + LM head over the last row; returns the last-token logits (Qwen: no final softcap).
+
+        Args:
+            ctx: The GPU device context.
+            h: The hidden-state buffer.
+            T: The number of rows in `h`.
+            dummy: A scratch buffer for unused kernel arguments.
+
+        Returns:
+            The vocab-sized last-token logits, on the host.
+
+        Raises:
+            If the LM-head GEMV dispatch or host copy fails.
         """
         # Final RMSNorm + tied LM head over the last row (Qwen: no final softcap).
         var hl = last_row(ctx, h, T, self.hidden)
@@ -229,6 +273,18 @@ struct Weights(ModelWeights, Movable):
         mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf
     ) raises -> List[Float32]:
         """Final RMSNorm + LM head over all rows; returns all-row logits for spec-decode verification (Qwen: no final softcap).
+
+        Args:
+            ctx: The GPU device context.
+            h: The hidden-state buffer.
+            T: The number of rows in `h`.
+            dummy: A scratch buffer for unused kernel arguments.
+
+        Returns:
+            The `T`×vocab logits for every row, flattened, on the host.
+
+        Raises:
+            If the LM-head GEMV dispatch or host copy fails.
         """
         # All-row logits for spec-decode verification (Qwen: no final softcap).
         var n = T * self.vocab
@@ -260,6 +316,19 @@ struct Weights(ModelWeights, Movable):
         mut dummy: DevBuf,
     ) raises -> List[Float32]:
         """Return the log-probs of the `targets` tokens under the LM head over `n` rows.
+
+        Args:
+            ctx: The GPU device context.
+            h: The hidden-state buffer.
+            n: The number of rows to score.
+            targets: The target token ids whose log-probs to gather.
+            dummy: A scratch buffer for unused kernel arguments.
+
+        Returns:
+            The per-row log-probabilities of the `targets` tokens.
+
+        Raises:
+            If the LM-head GEMV or gather dispatch fails.
         """
         var logits = mm_norm(
             ctx,
@@ -288,6 +357,17 @@ def load_weights(
     ctx: DeviceContext, path: String, q4: Bool = False
 ) raises -> Weights:
     """Load a Qwen2.5/Qwen3 checkpoint into `Weights`, auto-detecting the architecture from its dims (`q4` selects int4 projection weights).
+
+    Args:
+        ctx: The GPU device context.
+        path: The checkpoint directory/safetensors path.
+        q4: Load the projection weights as group-128 int4 (embed/lm-head stay bf16).
+
+    Returns:
+        The loaded `Weights` with auto-detected architecture dims.
+
+    Raises:
+        If the checkpoint is missing tensors or has an unsupported hidden size.
     """
     var gathered = gather_tensors(path)
     var entries = gathered[0].copy()
@@ -572,7 +652,25 @@ def rope_k(
     arch selects the comptime head-dim instantiation (0 = 0.5B, 1 = 3B,
     2 = Qwen3 with per-head QK-RMSNorm using `knw` [head_dim] before rotation).
     `kin` may be a strided K-slice of a fused [q|k|v] buffer (in_stride/in_off);
-    in_stride<0 defaults to the contiguous nkv stride."""
+    in_stride<0 defaults to the contiguous nkv stride.
+
+    Args:
+        ctx: The GPU device context.
+        kin: The projected K input (may be a strided K-slice of a fused [q|k|v] buffer).
+        kc: The K cache to write the rotated K into.
+        knw: The per-head K-RMSNorm weights (Qwen3 only; ignored for Qwen2.5).
+        Tq: The number of query positions.
+        q_offset: The absolute position of the first token.
+        cache_len: The allocated KV-cache length.
+        hkv: The number of key/value heads.
+        head_dim: The per-head dimension.
+        arch: The architecture selector (0 = 0.5B, 1 = 3B, 2 = Qwen3).
+        in_stride: The row stride of `kin` (<0 = the contiguous nkv stride).
+        in_off: The offset of the K slice within each `kin` row.
+
+    Raises:
+        If the RoPE-K kernel dispatch fails.
+    """
     var nkv = hkv * head_dim
     var strd = in_stride if in_stride >= 0 else nkv
     var lay = row_major(Tq * strd)
@@ -642,7 +740,27 @@ def rope_kv(
 ) raises:
     """Rope_k + the V cache-copy in one launch (rope_kv_kernel): rotates K into the
     cache and copies V into the cache from the fused [q|k|v] buffer — one dispatch
-    instead of two per layer."""
+    instead of two per layer.
+
+    Args:
+        ctx: The GPU device context.
+        qkv: The fused [q|k|v] projection buffer to read K and V from.
+        kc: The K cache to write the rotated K into.
+        vc: The V cache to copy V into.
+        knw: The per-head K-RMSNorm weights (Qwen3 only; ignored for Qwen2.5).
+        Tq: The number of query positions.
+        q_offset: The absolute position of the first token.
+        cache_len: The allocated KV-cache length.
+        hkv: The number of key/value heads.
+        head_dim: The per-head dimension.
+        arch: The architecture selector (0 = 0.5B, 1 = 3B, 2 = Qwen3).
+        in_stride: The row stride of the fused `qkv` buffer.
+        k_off: The offset of the K slice within each row.
+        v_off: The offset of the V slice within each row.
+
+    Raises:
+        If the fused RoPE-K / V-copy kernel dispatch fails.
+    """
     var lay = row_major(Tq * in_stride)
     var nlay = row_major(head_dim if arch >= 2 else 1)
     if arch >= 2:  # all Qwen3 (0.6B/8B/14B): 8 kv heads, head_dim 128, qk-norm
@@ -716,6 +834,29 @@ def attn_cached(
     q_off: Int = 0,
 ) raises -> DevBuf:
     """Attention over the cached K/V: rotate Q (rope_q), then attend against the already-rotated K/V cache. Returns the q_dim-wide output.
+
+    Args:
+        ctx: The GPU device context.
+        q: The projected Q input (may be a strided Q-slice of a fused [q|k|v] buffer).
+        kc: The K cache (already rotated).
+        vc: The V cache.
+        qnw: The per-head Q-RMSNorm weights (Qwen3 only; ignored for Qwen2.5).
+        Tq: The number of query positions (prefill width, or 1 at decode).
+        q_offset: The absolute position of the first query token.
+        cache_len: The allocated KV-cache length.
+        hidden: The hidden size.
+        hq: The number of query heads.
+        hkv: The number of key/value heads.
+        head_dim: The per-head dimension.
+        arch: The architecture selector (0 = 0.5B, 1 = 3B, 2 = Qwen3).
+        q_stride: The row stride of `q` (<0 = the contiguous q_dim stride).
+        q_off: The offset of the Q slice within each `q` row.
+
+    Returns:
+        The q_dim-wide (hq*head_dim) attention output buffer.
+
+    Raises:
+        If a RoPE-Q or attention kernel dispatch fails.
     """
     # Rotate Q first (rope_q), then attend; K is already rotated in the cache.
     # `q` may be a strided Q-slice of a fused [q|k|v] buffer (q_stride/q_off);
@@ -1066,6 +1207,24 @@ def qwen_layer(
     """One Qwen decoder layer. Prefill = (Tq=P, q_offset=0); decode = (Tq=1,
     q_offset=pos). Dims come from `w`; behavior flags from `w.cfg`. Serves all
     three Qwen archs (0.5B/3B/Qwen3) via cfg flags + the arch dim-dispatch above.
+
+    Args:
+        ctx: The GPU device context.
+        w: The Qwen `Weights` (dims + behavior flags).
+        l: The decoder-layer index.
+        h: The hidden-state buffer for the layer's input.
+        kc: The layer's key cache.
+        vc: The layer's value cache.
+        Tq: The number of query positions (prefill width, or 1 at decode).
+        q_offset: The absolute position of the first query token.
+        cache_len: The allocated KV-cache length.
+        dummy: A scratch buffer for unused kernel arguments.
+
+    Returns:
+        The updated hidden-state buffer after the layer.
+
+    Raises:
+        If a layer kernel dispatch fails.
     """
     var hd = w.hidden
     var nkv = w.nkv
@@ -1145,6 +1304,17 @@ def sess_embed(
     already carry the appended EOS), apply the final RMSNorm, then L2-normalize.
     Embedding-specific, so it lives in the Qwen module (not the generic engine).
     Runs its own one-shot Session (no KV reuse). Returns the D-element unit vector.
+
+    Args:
+        ctx: The GPU device context.
+        w: The Qwen3-Embedding `Weights`.
+        prompt: The token ids to embed (already carrying the appended EOS).
+
+    Returns:
+        The L2-normalized D-element sentence embedding vector.
+
+    Raises:
+        If running the decoder or the host copy fails.
     """
     var P = len(prompt)
     var s = new_session(ctx, P + 2, w.nlayers, w.nkv)

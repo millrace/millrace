@@ -47,6 +47,12 @@ comptime TIMEOUT_MS = 1_800_000
 
 def slug(model_id: String) -> String:
     """'Qwen/Qwen2.5-3B-Instruct' -> 'Qwen--Qwen2.5-3B-Instruct' (HF cache dir).
+
+    Args:
+        model_id: the HuggingFace repo id to slugify.
+
+    Returns:
+        The repo id with each '/' replaced by '--'.
     """
     var b = model_id.as_bytes()
     var out = List[UInt8]()
@@ -60,7 +66,11 @@ def slug(model_id: String) -> String:
 
 
 def hub_root() -> String:
-    """$HF_HOME/hub, else ~/.cache/huggingface/hub (mirrors huggingface_hub)."""
+    """$HF_HOME/hub, else ~/.cache/huggingface/hub (mirrors huggingface_hub).
+
+    Returns:
+        The absolute path to the HuggingFace hub cache root.
+    """
     var home = String(getenv("HF_HOME"))
     if home.byte_length() > 0:
         return home + "/hub"
@@ -68,14 +78,30 @@ def hub_root() -> String:
 
 
 def resolve_url(repo: String, rev: String, file: String) -> String:
-    """HuggingFace `/resolve/<rev>/<file>` download URL for `repo`."""
+    """HuggingFace `/resolve/<rev>/<file>` download URL for `repo`.
+
+    Args:
+        repo: the HuggingFace repo id.
+        rev: the revision (branch, tag, or commit) to resolve.
+        file: the file path within the repo.
+
+    Returns:
+        The full HuggingFace resolve URL for the file.
+    """
     return "https://huggingface.co/" + repo + "/resolve/" + rev + "/" + file
 
 
 def shard_names(index_text: String) -> List[String]:
     """Distinct '*.safetensors' filenames named anywhere in the index JSON's
     weight_map. Robust substring scan — every shard appears as a quoted value, and
-    no JSON structural token ends in '.safetensors'."""
+    no JSON structural token ends in '.safetensors'.
+
+    Args:
+        index_text: the raw text of the safetensors index JSON.
+
+    Returns:
+        The distinct '*.safetensors' shard filenames found in the index.
+    """
     var names = List[String]()
     var parts = index_text.split('"')
     for i in range(len(parts)):
@@ -93,6 +119,13 @@ def shard_names(index_text: String) -> List[String]:
 
 def write_bytes(path: String, data: List[UInt8]) raises:
     """Write `data` to `path`, chunking to stay under macOS write(2)'s ~2 GiB cap.
+
+    Args:
+        path: the destination file path.
+        data: the bytes to write.
+
+    Raises:
+        Error: if the file cannot be opened or written.
     """
     # macOS write(2) rejects a single call larger than INT_MAX (~2 GiB) with
     # EINVAL, and the 3B shards exceed that — so write in bounded chunks.
@@ -110,14 +143,33 @@ def write_bytes(path: String, data: List[UInt8]) raises:
 
 
 def fetch(mut client: HttpClient, url: String) raises -> Response:
-    """GET `url` over `client` and return the full `Response`."""
+    """GET `url` over `client` and return the full `Response`.
+
+    Args:
+        client: the HTTP client to use.
+        url: the URL to GET.
+
+    Returns:
+        The full HTTP response.
+
+    Raises:
+        Error: on network or HTTP client failure.
+    """
     var resp = client.get(url)
     return resp^
 
 
 def remote_size(mut client: HttpClient, url: String) -> Int:
     """Content-Length of the resolved file (HEAD, following redirects), or -1 if
-    unknown — used to tell a complete download from a truncated/empty one."""
+    unknown — used to tell a complete download from a truncated/empty one.
+
+    Args:
+        client: the HTTP client to use.
+        url: the URL to issue a HEAD request against.
+
+    Returns:
+        The Content-Length in bytes, or -1 if unknown.
+    """
     try:
         var r = client.head(url)
         if r.status != 200:
@@ -140,7 +192,23 @@ def download_one(
 ) raises -> String:
     """Download <repo>/<rev>/<file> into snap_dir. Skips if already present.
     Returns the X-Repo-Commit header (so the caller can pin the snapshot), or ""
-    if an optional file was absent (404)."""
+    if an optional file was absent (404).
+
+    Args:
+        client: the HTTP client to use.
+        repo: the HuggingFace repo id.
+        rev: the revision to resolve.
+        file: the file path within the repo.
+        snap_dir: the snapshot directory to write the file into.
+        optional: if True, a 404 is tolerated and skipped instead of raising.
+
+    Returns:
+        The X-Repo-Commit header value, or "" if the file was skipped or absent.
+
+    Raises:
+        Error: if a required file returns a non-200, non-404 HTTP status, or the
+            write fails.
+    """
     var dest = snap_dir + "/" + file
     var url = resolve_url(repo, rev, file)
     # Resume: skip only if the local file is byte-complete vs the remote. A
@@ -174,7 +242,12 @@ def download_one(
 
 def main() raises:
     """Download a Qwen2.5 checkpoint into the HuggingFace cache layout, pinning the
-    snapshot to the resolved commit and the `main` ref."""
+    snapshot to the resolved commit and the `main` ref.
+
+    Raises:
+        Error: on an unknown flag, a failed config.json fetch, or any download
+            or write failure.
+    """
     # Parse argv: [model-id] [--revision REV]
     var model = String(DEFAULT_MODEL)
     var rev = String("main")

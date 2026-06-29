@@ -32,7 +32,14 @@ def fma_kernel(
     c: TileTensor[dtype, type_of(layout), MutAnyOrigin],
     size: Int,
 ):
-    """Compute `c[i] = a[i] * b[i] + a[i]` elementwise over `size` elements."""
+    """Compute `c[i] = a[i] * b[i] + a[i]` elementwise over `size` elements.
+
+    Args:
+        a: Input buffer read as both multiplicand and addend.
+        b: Input buffer used as the multiplier.
+        c: Output buffer receiving the fused multiply-add result.
+        size: Number of leading elements to process.
+    """
     var tid = global_idx.x
     if tid < size:
         c[tid] = a[tid] * b[tid] + a[tid]
@@ -40,6 +47,10 @@ def fma_kernel(
 
 def main() raises:
     """Run the FMA kernel on the GPU and exit non-zero unless every element is 3.0.
+
+    Raises:
+        Error: if no GPU accelerator is detected, or if any GPU/device
+            operation fails.
     """
     comptime if not has_accelerator():
         raise Error(

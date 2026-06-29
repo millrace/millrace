@@ -42,7 +42,14 @@ def _less(a: String, b: String) -> Bool:
 
 
 def dictsort(v: Value) -> List[Int]:
-    """Indices into v's parallel keys/vals, sorted alphabetically by key."""
+    """Indices into v's parallel keys/vals, sorted alphabetically by key.
+
+    Args:
+        v: The map Value whose keys to sort.
+
+    Returns:
+        Indices into v's keys/vals ordered alphabetically by key.
+    """
     var idx = List[Int]()
     for i in range(len(v.c[].keys)):
         idx.append(i)
@@ -108,7 +115,18 @@ def _str_list(v: Value) -> String:
 
 def format_argument(arg: Value, escape_keys: Bool) raises -> String:
     """Format one argument `Value` as Gemma tool-call text (quoted string,
-    `true`/`false`, or a `{...}` object)."""
+    `true`/`false`, or a `{...}` object).
+
+    Args:
+        arg: The argument Value to format.
+        escape_keys: Whether to quote object keys with the quote token.
+
+    Returns:
+        The formatted Gemma tool-call text for the argument.
+
+    Raises:
+        Error: on failure formatting nested arguments.
+    """
     if arg.tag == VSTR:
         return Q + arg.s + Q
     if arg.tag == VBOOL:
@@ -239,7 +257,18 @@ def _property_body(value: Value) raises -> String:
 
 def format_parameters(properties: Value, filter_keys: Bool) raises -> String:
     """Format a JSON-schema `properties` map into Gemma `key:{...}` parameter
-    text, skipping standard schema keys when `filter_keys`."""
+    text, skipping standard schema keys when `filter_keys`.
+
+    Args:
+        properties: The JSON-schema properties map Value.
+        filter_keys: When True, skip standard schema keys.
+
+    Returns:
+        The Gemma `key:{...}` parameter text for the properties.
+
+    Raises:
+        Error: on failure formatting a property body.
+    """
     var out = String("")
     var found_first = False
     var idx = dictsort(properties)
@@ -256,7 +285,17 @@ def format_parameters(properties: Value, filter_keys: Bool) raises -> String:
 
 def format_function_declaration(tool: Value) raises -> String:
     """Format one tool's `function` (name + description + parameters) as a Gemma
-    function declaration."""
+    function declaration.
+
+    Args:
+        tool: The tool Value containing the `function` definition.
+
+    Returns:
+        The Gemma function declaration text for the tool.
+
+    Raises:
+        Error: on failure formatting the parameters.
+    """
     var f = _get(tool, "function")
     var name = _get(f, "name").s
     var desc = _get(f, "description").s
@@ -278,7 +317,17 @@ def format_function_declaration(tool: Value) raises -> String:
 
 
 def format_gemma_tools(tools: Value) raises -> String:
-    """The full system-block tool segment: each tool wrapped <|tool>…<tool|>."""
+    """The full system-block tool segment: each tool wrapped <|tool>…<tool|>.
+
+    Args:
+        tools: The list Value of tool definitions.
+
+    Returns:
+        The full system-block tool segment with each tool wrapped.
+
+    Raises:
+        Error: on failure formatting a tool declaration.
+    """
     var out = String("")
     for i in range(len(tools.c[].vals)):
         out += (

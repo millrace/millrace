@@ -28,27 +28,62 @@ comptime USCORE = 0x2581  # U+2581 "▁" — Gemma's normalized-space marker
 
 
 def is_letter(b: Int) -> Bool:
-    """True if byte `b` is an ASCII letter (A–Z or a–z)."""
+    """True if byte `b` is an ASCII letter (A–Z or a–z).
+
+    Args:
+        b: the byte value to test.
+
+    Returns:
+        True if `b` is an ASCII letter.
+    """
     return (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
 
 
 def is_digit(b: Int) -> Bool:
-    """True if byte `b` is an ASCII digit (0–9)."""
+    """True if byte `b` is an ASCII digit (0–9).
+
+    Args:
+        b: the byte value to test.
+
+    Returns:
+        True if `b` is an ASCII digit.
+    """
     return b >= 48 and b <= 57
 
 
 def is_space(b: Int) -> Bool:
-    """True if byte `b` is ASCII whitespace (space, tab, LF, CR, VT, or FF)."""
+    """True if byte `b` is ASCII whitespace (space, tab, LF, CR, VT, or FF).
+
+    Args:
+        b: the byte value to test.
+
+    Returns:
+        True if `b` is an ASCII whitespace byte.
+    """
     return b == 32 or b == 9 or b == 10 or b == 13 or b == 11 or b == 12
 
 
 def is_nl(b: Int) -> Bool:
-    """True if byte `b` is a newline character (LF or CR)."""
+    """True if byte `b` is a newline character (LF or CR).
+
+    Args:
+        b: the byte value to test.
+
+    Returns:
+        True if `b` is LF (10) or CR (13).
+    """
     return b == 10 or b == 13
 
 
 def lower(b: Int) -> Int:
-    """ASCII-lowercase byte `b` (A–Z → a–z; other bytes unchanged)."""
+    """ASCII-lowercase byte `b` (A–Z → a–z; other bytes unchanged).
+
+    Args:
+        b: the byte value to lowercase.
+
+    Returns:
+        The lowercased byte (unchanged if not an uppercase ASCII letter).
+    """
     return b + 32 if (b >= 65 and b <= 90) else b
 
 
@@ -85,7 +120,14 @@ struct Tokenizer(Movable):
     """True selects the Gemma SentencePiece-style path (no GPT-2 regex)."""
 
     def bpe(self, mut ids: List[Int]) raises:
-        """Apply rank-greedy BPE merges in place over the token ids `ids`."""
+        """Apply rank-greedy BPE merges in place over the token ids `ids`.
+
+        Args:
+            ids: the token ids to repeatedly merge in place (mutated).
+
+        Raises:
+            If a merge-table dictionary lookup fails.
+        """
         while len(ids) >= 2:
             var best_rank = 1 << 60
             var best_i = -1
@@ -104,6 +146,14 @@ struct Tokenizer(Movable):
 
     def next_chunk(self, buf: List[UInt8], pos: Int, end: Int) -> Int:
         """Return the end of the next GPT-2 pretokenization chunk starting at `pos`.
+
+        Args:
+            buf: the input byte buffer.
+            pos: byte offset where the chunk starts.
+            end: byte offset one past the last byte available.
+
+        Returns:
+            The byte offset one past the end of the next chunk.
         """
         var c = Int(buf[pos])
 
@@ -187,6 +237,15 @@ struct Tokenizer(Movable):
         self, buf: List[UInt8], start: Int, stop: Int, mut out: List[Int]
     ) raises:
         """Encode the `[start, stop)` span (GPT-2 path): pretokenize, map bytes to ids, BPE, append to `out`.
+
+        Args:
+            buf: the input byte buffer.
+            start: byte offset to begin encoding at.
+            stop: byte offset one past the last byte to encode.
+            out: token-id list the results are appended to (mutated).
+
+        Raises:
+            If pretokenization or BPE merging fails.
         """
         var p = start
         while p < stop:
@@ -210,6 +269,15 @@ struct Tokenizer(Movable):
         with U+2581 ("▁"). For each resulting codepoint: if it is a single-codepoint
         vocab symbol, emit its id; else byte-fallback — emit `byte_id[b]` for each
         UTF-8 byte of the original codepoint. Then rank-greedy BPE over the gap.
+
+        Args:
+            buf: the input byte buffer.
+            start: byte offset where the gap begins.
+            stop: byte offset one past the end of the gap.
+            out: token-id list the results are appended to (mutated).
+
+        Raises:
+            If a vocab lookup or BPE merging fails.
         """
         var ids = List[Int]()
         var p = start
@@ -256,6 +324,17 @@ struct Tokenizer(Movable):
 
     def match_special(self, buf: List[UInt8], pos: Int) raises -> SpMatch:
         """Return the longest special token matching at `pos` (id -1, length 0 if none).
+
+        Args:
+            buf: the input byte buffer.
+            pos: byte offset to test for a special-token match.
+
+        Returns:
+            An `SpMatch` with the matched token id and byte length (id -1,
+            length 0 when nothing matches).
+
+        Raises:
+            If indexing the special-token tables fails.
         """
         var best_id = -1
         var best_len = 0
@@ -275,6 +354,15 @@ struct Tokenizer(Movable):
 
     def encode(self, buf: List[UInt8]) raises -> List[Int]:
         """Encode raw input bytes to a list of token ids (special tokens split out first).
+
+        Args:
+            buf: the raw input bytes to encode.
+
+        Returns:
+            The encoded token ids.
+
+        Raises:
+            If special-token matching or BPE encoding fails.
         """
         var out = List[Int]()
         var n = len(buf)
@@ -300,6 +388,15 @@ struct Tokenizer(Movable):
 
     def decode(self, ids: List[Int]) raises -> List[UInt8]:
         """Decode token ids back to raw bytes (vocab tokens, then special tokens).
+
+        Args:
+            ids: the token ids to decode.
+
+        Returns:
+            The decoded raw bytes.
+
+        Raises:
+            If a token-id table lookup fails.
         """
         var out = List[UInt8]()
         for k in range(len(ids)):
@@ -317,14 +414,28 @@ struct Tokenizer(Movable):
 
 
 def hex_val(c: Int) -> Int:
-    """Value (0–15) of a hex-digit character code `c` (0–9 or lowercase a–f)."""
+    """Value (0–15) of a hex-digit character code `c` (0–9 or lowercase a–f).
+
+    Args:
+        c: the character code of a hex digit.
+
+    Returns:
+        The integer value 0–15 of the hex digit.
+    """
     if c >= 48 and c <= 57:
         return c - 48
     return c - 97 + 10  # a-f (Python .hex() is lowercase)
 
 
 def hex_to_bytes(s: String) -> List[UInt8]:
-    """Parse a lowercase hex string into the bytes it encodes."""
+    """Parse a lowercase hex string into the bytes it encodes.
+
+    Args:
+        s: the lowercase hex string.
+
+    Returns:
+        The bytes the hex string encodes.
+    """
     var sb = s.as_bytes()
     var out = List[UInt8]()
     var i = 0
@@ -378,7 +489,17 @@ def load_tokenizer_json(path: String) raises -> Tokenizer:
     """Build a `Tokenizer` straight from a HuggingFace `tokenizer.json` (byte-level
     BPE, `model.type == "BPE"`): decode each vocab token to raw bytes, resolve each
     `"A B"` merge to an (id,id)->merged-id rule, and take `added_tokens` as the
-    special-token table. Produces the same tables as `load_tokenizer`."""
+    special-token table. Produces the same tables as `load_tokenizer`.
+
+    Args:
+        path: filesystem path to the HuggingFace `tokenizer.json`.
+
+    Returns:
+        The constructed `Tokenizer`.
+
+    Raises:
+        If the file cannot be read or its JSON cannot be parsed.
+    """
     var root = parse_json(_read(path))
     var model = root.map_get("model").value()
     var vocab = model.map_get("vocab").value()
@@ -509,7 +630,17 @@ def load_gemma_tokenizer_json(path: String) raises -> Tokenizer:
         is exactly one codepoint, `cp_to_id[codepoint] = id` (keyed on the ORIGINAL
         codepoint incl. U+2581, since symbolization sees ▁).
       - merges are 2-element arrays `[A, B]`; resolve to `(id_A,id_B)->id_AB`.
-      - `added_tokens` -> `sp_text`/`sp_id` (matched before normalization)."""
+      - `added_tokens` -> `sp_text`/`sp_id` (matched before normalization).
+
+    Args:
+        path: filesystem path to Gemma's HuggingFace `tokenizer.json`.
+
+    Returns:
+        The constructed Gemma `Tokenizer`.
+
+    Raises:
+        If the file cannot be read or its JSON cannot be parsed.
+    """
     var root = parse_json(_read(path))
     var model = root.map_get("model").value()
     var vocab = model.map_get("vocab").value()
@@ -595,6 +726,15 @@ def load_gemma_tokenizer_json(path: String) raises -> Tokenizer:
 
 def load_tokenizer(dir: String) raises -> Tokenizer:
     """Build a `Tokenizer` from tok-capture's resolved `.tsv` dumps (vocab/merges/specials) in `dir`.
+
+    Args:
+        dir: directory containing `vocab.tsv`, `merges.tsv`, and `specials.tsv`.
+
+    Returns:
+        The constructed `Tokenizer`.
+
+    Raises:
+        If any of the `.tsv` files cannot be read or parsed.
     """
     var byte_id = List[Int]()
     for _ in range(256):

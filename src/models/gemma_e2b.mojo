@@ -197,14 +197,30 @@ struct GemmaE2bWeights(ModelWeights, Movable):
 
     # ── ModelWeights conformance ─────────────────────────────────────────────
     def config(self) -> ModelConfig:
-        """Return the generic model configuration."""
+        """Return the generic model configuration.
+
+        Returns:
+            The `ModelConfig` describing this model to the engine.
+        """
         return self.cfg
 
     def embed_prompt(
         mut self, ctx: DeviceContext, mut ids: DeviceBuffer[DType.int32], T: Int
     ) raises -> DevBuf:
         """Embed `T` token ids into hidden states and precompute the per-layer
-        (PLE) input signal for this forward pass; returns the scaled hidden."""
+        (PLE) input signal for this forward pass; returns the scaled hidden.
+
+        Args:
+            ctx: the device (GPU) context.
+            ids: the `T` input token ids on device.
+            T: number of tokens in the prompt.
+
+        Returns:
+            The scaled hidden states for the prompt.
+
+        Raises:
+            If a GPU kernel launch or buffer operation fails.
+        """
         var h = embed_tokens(ctx, ids, self.embed, T, self.hidden, self.vocab)
         h = mul_scalar(
             ctx, h, T * self.hidden, E_EMBED_SCALE
@@ -247,7 +263,25 @@ struct GemmaE2bWeights(ModelWeights, Movable):
         cache_len: Int,
         mut dummy: DevBuf,
     ) raises -> DevBuf:
-        """Run decoder layer `l` over hidden `h`, updating the KV caches."""
+        """Run decoder layer `l` over hidden `h`, updating the KV caches.
+
+        Args:
+            ctx: the device (GPU) context.
+            l: index of the decoder layer to run.
+            h: the hidden states (mutated/consumed).
+            kcs: per-layer key caches.
+            vcs: per-layer value caches.
+            Tq: number of query positions in this pass.
+            q_offset: absolute position of the first query token.
+            cache_len: current length of the KV cache.
+            dummy: scratch buffer reused across GEMM calls.
+
+        Returns:
+            The updated hidden states after the layer.
+
+        Raises:
+            If a GPU kernel launch or buffer operation fails.
+        """
         return e2b_layer(
             ctx, self, l, h, kcs, vcs, Tq, q_offset, cache_len, dummy
         )
@@ -255,7 +289,20 @@ struct GemmaE2bWeights(ModelWeights, Movable):
     def lm_logits(
         mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf
     ) raises -> List[Float32]:
-        """Compute soft-capped LM-head logits for the LAST position only."""
+        """Compute soft-capped LM-head logits for the LAST position only.
+
+        Args:
+            ctx: the device (GPU) context.
+            h: the final hidden states.
+            T: number of positions in `h`.
+            dummy: scratch buffer reused across GEMM calls.
+
+        Returns:
+            The soft-capped logits over the vocabulary for the last position.
+
+        Raises:
+            If a GPU kernel launch or buffer operation fails.
+        """
         var hl = last_row(ctx, h, T, self.hidden)
         var logits = mm_norm(
             ctx,
@@ -281,6 +328,18 @@ struct GemmaE2bWeights(ModelWeights, Movable):
         mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf
     ) raises -> List[Float32]:
         """Compute soft-capped LM-head logits for ALL `T` positions (flattened).
+
+        Args:
+            ctx: the device (GPU) context.
+            h: the final hidden states.
+            T: number of positions in `h`.
+            dummy: scratch buffer reused across GEMM calls.
+
+        Returns:
+            The soft-capped logits for all `T` positions, flattened.
+
+        Raises:
+            If a GPU kernel launch or buffer operation fails.
         """
         var n = T * self.vocab
         var logits = mm_norm(
@@ -311,7 +370,21 @@ struct GemmaE2bWeights(ModelWeights, Movable):
         targets: List[Int],
         mut dummy: DevBuf,
     ) raises -> List[Float32]:
-        """Return per-position log-probabilities of the given target tokens."""
+        """Return per-position log-probabilities of the given target tokens.
+
+        Args:
+            ctx: the device (GPU) context.
+            h: the final hidden states.
+            n: number of positions to score.
+            targets: the target token id at each position.
+            dummy: scratch buffer reused across GEMM calls.
+
+        Returns:
+            The log-probability of each target token, per position.
+
+        Raises:
+            If a GPU kernel launch or buffer operation fails.
+        """
         var logits = mm_norm(
             ctx,
             h,
@@ -351,7 +424,19 @@ def load_e2b_weights(
     ctx: DeviceContext, path: String, q4: Bool = True
 ) raises -> GemmaE2bWeights:
     """Load the gemma-4 e2b text decoder (int4 projections by default — the draft
-    is ~5 GB bf16, ~1.4 GB int4, so it co-resides with the 12B target)."""
+    is ~5 GB bf16, ~1.4 GB int4, so it co-resides with the 12B target).
+
+    Args:
+        ctx: the device (GPU) context.
+        path: directory holding the e2b checkpoint safetensors.
+        q4: quantize projections to int4 when True (the default).
+
+    Returns:
+        The loaded `GemmaE2bWeights`.
+
+    Raises:
+        If a tensor is missing or a load/GPU operation fails.
+    """
     var gathered = gather_tensors(path)
     var entries = gathered[0].copy()
     var paths = gathered[1].copy()
@@ -648,7 +733,27 @@ def e2b_attn(
     cache_len: Int,
 ) raises -> DevBuf:
     """Compute one attention block (RoPE Q/K, V-norm, tensor-core attention) for
-    e2b geometry; writes K/V into the caches only when `write` is True."""
+    e2b geometry; writes K/V into the caches only when `write` is True.
+
+    Args:
+        ctx: the device (GPU) context.
+        qkv: the fused [q|k|v] projection output for this layer.
+        kc: the key cache to attend against (and write into when `write`).
+        vc: the value cache to attend against (and write into when `write`).
+        write: True to compute and store K/V into `kc`/`vc` (own-KV layer).
+        qnw: the query-norm weight.
+        knw: the key-norm weight.
+        l_full: True for a full-attention layer, False for sliding.
+        Tq: number of query positions in this pass.
+        q_offset: absolute position of the first query token.
+        cache_len: current length of the KV cache.
+
+    Returns:
+        The attention output for this block.
+
+    Raises:
+        If a GPU kernel launch or buffer operation fails.
+    """
     # `kc`/`vc` are the caches to ATTEND against. write=True (own-KV layer): compute
     # K/V from `qkv` and store them into kc/vc first. write=False (KV-shared layer):
     # kc/vc are an EARLIER layer's caches — only Q is computed; K/V are left as-is.
@@ -812,7 +917,26 @@ def e2b_layer(
     mut dummy: DevBuf,
 ) raises -> DevBuf:
     """Forward one Gemma-4 e2b decoder layer: attention + MLP residual blocks
-    followed by Per-Layer-Embedding integration and the layer_scalar."""
+    followed by Per-Layer-Embedding integration and the layer_scalar.
+
+    Args:
+        ctx: the device (GPU) context.
+        w: the e2b model weights.
+        l: index of the decoder layer to run.
+        h: the input hidden states.
+        kcs: per-layer key caches.
+        vcs: per-layer value caches.
+        Tq: number of query positions in this pass.
+        q_offset: absolute position of the first query token.
+        cache_len: current length of the KV cache.
+        dummy: scratch buffer reused across GEMM calls.
+
+    Returns:
+        The hidden states after the layer.
+
+    Raises:
+        If a GPU kernel launch or buffer operation fails.
+    """
     var full = w.is_full[l]
     var head_dim = EFU_HEAD_DIM if full else ESL_HEAD_DIM
     var hkv = EFU_HKV if full else ESL_HKV

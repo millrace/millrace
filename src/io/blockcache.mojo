@@ -93,7 +93,16 @@ struct BlockCache(Movable):
         model_id: String,
     ):
         """Open (or create) the store at `dir`, sizing the block budget from
-        `budget_bytes` and wiping it if the stamped model dims don't match."""
+        `budget_bytes` and wiping it if the stamped model dims don't match.
+
+        Args:
+            dir: filesystem directory holding the block store.
+            B: tokens per block.
+            nkv: number of K/V heads (key/value channels per token).
+            nlayers: number of transformer layers stored per block.
+            budget_bytes: byte budget used to size the block budget (0 = unlimited).
+            model_id: model identifier stamped into the store's meta file.
+        """
         self.dir = dir
         self.B = B
         self.nkv = nkv
@@ -154,6 +163,12 @@ struct BlockCache(Movable):
 
     def chained_hashes(self, ids: List[Int]) -> List[UInt64]:
         """One chained hash per full B-token block of `ids` (partial tail ignored).
+
+        Args:
+            ids: the token ids to hash in B-token blocks.
+
+        Returns:
+            One chained FNV hash per full B-token block.
         """
         var out = List[UInt64]()
         var nblocks = len(ids) // self.B
@@ -179,6 +194,16 @@ struct BlockCache(Movable):
 
     def longest_run(self, hashes: List[UInt64], ids: List[Int]) raises -> Int:
         """Number of leading blocks present on disk (with matching token ids).
+
+        Args:
+            hashes: the per-block chained hashes to look up.
+            ids: the token ids used to verify each block (collision check).
+
+        Returns:
+            The count of leading blocks found on disk with matching token ids.
+
+        Raises:
+            Error: if reading a block file fails.
         """
         if not self.enabled:
             return 0
@@ -211,7 +236,19 @@ struct BlockCache(Movable):
         a: Int,
         b: Int,
     ) raises:
-        """Write blocks [a, b) from the session's K/V buffers to disk."""
+        """Write blocks [a, b) from the session's K/V buffers to disk.
+
+        Args:
+            kcs: per-layer key cache device buffers.
+            vcs: per-layer value cache device buffers.
+            hashes: the per-block chained hashes naming each block file.
+            ids: the token ids written as each block's header.
+            a: first block index to write (inclusive).
+            b: end block index (exclusive).
+
+        Raises:
+            Error: if opening or writing a block file fails.
+        """
         if not self.enabled:
             return
         var slice_f = self.B * self.nkv  # floats per (block, layer) slice
@@ -246,7 +283,18 @@ struct BlockCache(Movable):
         a: Int,
         b: Int,
     ) raises:
-        """Load blocks [a, b) from disk into the session's K/V buffers."""
+        """Load blocks [a, b) from disk into the session's K/V buffers.
+
+        Args:
+            kcs: per-layer key cache device buffers to fill.
+            vcs: per-layer value cache device buffers to fill.
+            hashes: the per-block chained hashes naming each block file.
+            a: first block index to load (inclusive).
+            b: end block index (exclusive).
+
+        Raises:
+            Error: if opening or reading a block file fails.
+        """
         if not self.enabled:
             return
         var slice_f = self.B * self.nkv
@@ -273,7 +321,15 @@ struct BlockCache(Movable):
 
     def touch_and_evict(mut self, hashes: List[UInt64], nblocks: Int) raises:
         """Move this request's blocks to the LRU tail, then evict from the front
-        until within the block budget. Persist the index."""
+        until within the block budget. Persist the index.
+
+        Args:
+            hashes: the per-block chained hashes touched by this request.
+            nblocks: number of leading blocks from `hashes` that were accessed.
+
+        Raises:
+            Error: if persisting the index fails.
+        """
         if not self.enabled:
             return
         var accessed = List[String]()

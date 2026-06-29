@@ -26,7 +26,14 @@ def json_escape_str(b: List[UInt8]) -> String:
     with `chr(byte)` per byte would mojibake it. All control bytes < 0x20 must be
     escaped for valid JSON: the common ones get short escapes, the rest `\\u00XX`
     (the model can emit e.g. form-feed/vertical-tab, which a raw byte would make
-    the response invalid JSON)."""
+    the response invalid JSON).
+
+    Args:
+        b: the UTF-8 bytes to escape.
+
+    Returns:
+        The JSON-escaped string.
+    """
     var out = List[UInt8]()
     for i in range(len(b)):
         var c = Int(b[i])
@@ -58,7 +65,17 @@ def json_escape_str(b: List[UInt8]) -> String:
 
 
 def load_chat_template(path: String) raises -> Template:
-    """Load and compile the Jinja chat template at `path` into a `Template`."""
+    """Load and compile the Jinja chat template at `path` into a `Template`.
+
+    Args:
+        path: filesystem path to the Jinja chat template.
+
+    Returns:
+        The compiled `Template`.
+
+    Raises:
+        Error: if the file cannot be opened/read or the template fails to compile.
+    """
     with open(path, "r") as f:
         return Template.compile(f.read())
 
@@ -77,6 +94,17 @@ def render_value(
     format (model-turn folding of tool messages, tool-call/result formatting, the
     thinking channel) is beyond jinja2.mojo, so it's rendered in Mojo by
     `render_gemma`; `tmpl` is ignored for Gemma.
+
+    Args:
+        tmpl: the compiled Jinja chat template (ignored for Gemma).
+        req: the parsed OpenAI request value with `messages` and optional `tools`.
+        family: the model family (e.g. `FAMILY_QWEN`, `FAMILY_GEMMA`).
+
+    Returns:
+        The rendered prompt string.
+
+    Raises:
+        Error: if the request has no `messages` array or rendering fails.
     """
     if family == FAMILY_GEMMA:
         return render_gemma(req)
@@ -99,12 +127,34 @@ def render_value(
 
 
 def render_request(tmpl: Template, body: String) raises -> String:
-    """Parse an OpenAI request body and render it (CLI / single-shot use)."""
+    """Parse an OpenAI request body and render it (CLI / single-shot use).
+
+    Args:
+        tmpl: the compiled Jinja chat template.
+        body: the OpenAI request body as a JSON string.
+
+    Returns:
+        The rendered prompt string.
+
+    Raises:
+        Error: if the body fails to parse or rendering fails.
+    """
     return render_value(tmpl, parse_json(body))
 
 
 def render_chat(tmpl: Template, user: String) raises -> String:
-    """Convenience for a single user turn (the CLI), via `render_request`."""
+    """Convenience for a single user turn (the CLI), via `render_request`.
+
+    Args:
+        tmpl: the compiled Jinja chat template.
+        user: the user turn's message content.
+
+    Returns:
+        The rendered prompt string.
+
+    Raises:
+        Error: if rendering the constructed request fails.
+    """
     var body = (
         String('{"messages":[{"role":"user","content":"')
         + json_escape_str(string_to_bytes(user))

@@ -40,7 +40,14 @@ comptime FLASH_PW = 3  # flash query-tile: warps/block = FLASH_PW * GROUP
 def bf16_widen(u: Scalar[DType.uint16]) -> Float32:
     """Widen a bf16 (stored as its raw u16 bits) to f32 — exact, since bf16 is
     the top 16 bits of f32. Weights live on-device as bf16 to halve matmul read
-    traffic; the accumulate stays f32 (§11 #12)."""
+    traffic; the accumulate stays f32 (§11 #12).
+
+    Args:
+        u: A bf16 value as its raw uint16 bit pattern.
+
+    Returns:
+        The exact f32 value (u's 16 bits as the high half of the f32).
+    """
     var bits: UInt32 = UInt32(u) << 16
     return UnsafePointer(to=bits).bitcast[Float32]()[0]
 
@@ -53,6 +60,14 @@ def cvt_kernel[
     n: Int,
 ):
     """Widen `n` bf16 values (raw u16 bits in `src`) to f32 in `dst`, elementwise.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        src: Source buffer of `n` bf16 values (raw u16 bits).
+        dst: Output f32 buffer (length `n`), receives the widened values.
+        n: Element count.
     """
     comptime assert dst.flat_rank == 1
     var i = global_idx.x
@@ -75,6 +90,16 @@ def embed_kernel[
     H: Int,
 ):
     """Embedding gather: dst[t,:] = bf16→f32 of emb row ids[t], for T tokens × H dims.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        ids: [T] int32 token ids, one per token.
+        emb: Bf16 embedding table (raw u16 bits), row-major [vocab, H].
+        dst: Output f32 buffer [T, H], the gathered + widened rows.
+        T: Number of tokens.
+        H: Hidden size (embedding dimension).
     """
     comptime assert dst.flat_rank == 1
     var i = global_idx.x
@@ -96,7 +121,17 @@ def add_kernel[
     dst: TileTensor[DType.float32, LT, MutAnyOrigin],
     n: Int,
 ):
-    """Elementwise residual add: dst[i] = a[i] + b[i] over `n` elements."""
+    """Elementwise residual add: dst[i] = a[i] + b[i] over `n` elements.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        a: Input A buffer (f32, length `n`).
+        b: Input B buffer (f32, length `n`).
+        dst: Output buffer (f32, length `n`), receives a + b.
+        n: Element count.
+    """
     comptime assert dst.flat_rank == 1
     var i = global_idx.x
     if i >= n:
@@ -116,6 +151,16 @@ def rmsnorm_kernel[
     H: Int,
 ):
     """RMSNorm: Y[t,d] = X[t,d] / √(mean_d(X[t,:]²)+EPS) · W[d], one warp per row.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        X: Input rows [T, H] (f32).
+        W: Per-channel RMSNorm weight [H] (f32).
+        Y: Output [T, H] (f32), the normalized · weighted rows.
+        T: Number of rows (tokens).
+        H: Row width (hidden size).
     """
     comptime assert X.flat_rank == 1
     # One warp per row: the old kernel ran the whole H-element reduction on a
@@ -156,6 +201,16 @@ def nll_gather_kernel[
     the GPU — for perplexity / echo logprobs. One warp per row: lanes split the
     vocab to find the row max + Σexp(x−max) (numerically stable), then lane 0 emits
     L[i,tgt] − max − log(Σexp). Avoids ever copying the [n×vocab] logits to host.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        L: [n, vocab] logits (f32), row-major.
+        TGT: [n] target token id per row (int32).
+        OUT: [n] output (f32), log P(target | row) = log_softmax(L[i])[tgt].
+        n: Number of rows.
+        vocab: Vocabulary size (row width of L).
     """
     comptime assert L.flat_rank == 1
     var i = Int(global_idx.x) // WARP_SIZE
@@ -195,6 +250,18 @@ def rmsnorm_add_kernel[
     """Y = (RMSNorm(X)·W + R) · scale — fuses the rmsnorm + residual add (+ an
     optional per-layer scalar) that Gemma applies after every proj into ONE launch
     (3 of these per e2b layer). Same warp-per-row reduction as rmsnorm_kernel.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        X: Input rows [T, H] (f32).
+        W: Per-channel RMSNorm weight [H] (f32).
+        R: Residual [T, H] (f32), added after the norm.
+        Y: Output [T, H] (f32) = (RMSNorm(X)·W + R) · scale.
+        T: Number of rows (tokens).
+        H: Row width (hidden size).
+        scale: Final scalar multiplier (1.0 = none).
     """
     comptime assert X.flat_rank == 1
     var t = Int(global_idx.x) // WARP_SIZE
@@ -236,7 +303,21 @@ def matmul_kernel[
     whole warp cooperates on one output: lane L reads W[n*K + L], W[n*K + L+32],
     … so the 32 lanes touch 32 consecutive words each step (coalesced), then
     `warp_sum` reduces the per-lane partials. Pure f32 accumulate, same as
-    before, so greedy parity is preserved (§11 #8)."""
+    before, so greedy parity is preserved (§11 #8).
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        X: Input activations [M, K] (f32).
+        W: Bf16 weights (raw u16 bits), row-major [N, K] (the dot is W[n,:]·X[m,:]).
+        B: Bias [N] (f32), added when use_bias != 0.
+        Y: Output [M, N] (f32).
+        M: Number of input rows (tokens).
+        K: Contraction (input) dimension.
+        N: Number of output channels.
+        use_bias: Add B when nonzero.
+    """
     comptime assert X.flat_rank == 1
     var out = Int(global_idx.x) // WARP_SIZE  # one warp per output element
     var lane = Int(global_idx.x) % WARP_SIZE
@@ -286,7 +367,23 @@ def matmul_tiled_kernel[
     The TM·CN partials are reduced with `warp_sum` at the end. Pure f32 accumulate
     + bf16 widen and the same lane-strided-K → warp_sum reduction as the GEMV, so
     output is bit-identical and greedy parity is preserved (§11 #8, #12). TM=CN=8
-    measured ~2× the token-only kernel (~210 GFLOP/s) on the M4."""
+    measured ~2× the token-only kernel (~210 GFLOP/s) on the M4.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+        TM: Token rows per warp output tile (token-axis reuse of W).
+        CN: Output columns per warp output tile (column-axis reuse of X).
+
+    Args:
+        X: Input activations [M, K] (f32).
+        W: Bf16 weights (raw u16 bits), row-major [N, K].
+        B: Bias [N] (f32), added when use_bias != 0.
+        Y: Output [M, N] (f32).
+        M: Number of input rows (tokens).
+        K: Contraction (input) dimension.
+        N: Number of output channels.
+        use_bias: Add B when nonzero.
+    """
     comptime assert X.flat_rank == 1
     var ncols = ceildiv(N, CN)
     var tile = (
@@ -429,7 +526,21 @@ def matmul_simd_kernel[
 ):
     """Y[M,N] = X[M,K] · W[N,K]ᵀ (+bias) on the compact 8×8 simdgroup-matrix units.
     Same signature/semantics as matmul_tiled_kernel; launch with grid_dim=
-    (ceildiv(N,SG_BN), ceildiv(M,SG_BM)), block_dim=SG_TPB."""
+    (ceildiv(N,SG_BN), ceildiv(M,SG_BM)), block_dim=SG_TPB.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        X: Input activations [M, K] (f32).
+        W: Bf16 weights (raw u16 bits), row-major [N, K] (transposed operand).
+        B: Bias [N] (f32), added when use_bias != 0.
+        Y: Output [M, N] (f32).
+        M: Number of input rows (tokens).
+        K: Contraction (input) dimension.
+        N: Number of output channels.
+        use_bias: Add B when nonzero.
+    """
     comptime assert X.flat_rank == 1
     var lane = Int(thread_idx.x) % 32
     var fl = _frag8_layout(lane)
@@ -511,7 +622,7 @@ def matmul_simd_kernel[
 comptime Q4_GROUP = 128
 """Int4 quantization group size along K (one scale per 128 weights)."""
 comptime Q4_SHIFT = 7  # log2(Q4_GROUP)
-"""log2(Q4_GROUP): right-shift a K index to its group index."""
+"""`log2(Q4_GROUP)` — right-shift a K index to its group index."""
 comptime _Q4_SHIFTS = SIMD[DType.uint32, 8](0, 4, 8, 12, 16, 20, 24, 28)
 comptime _Q4_BK = 32  # K-chunk dequantized into shared per barrier
 # in matmul_simd_q4_kernel (mult of 8; 64×32 fp32 = 8 KB)
@@ -529,7 +640,22 @@ def q4_deq[
     NG: Int,
 ) -> Float32:
     """Dequant a single weight (n,k). Used by the prefill GEMM W-staging, where
-    the matmul (not the dequant) dominates."""
+    the matmul (not the dequant) dominates.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        P: Packed int4 weights (u32, 8 nibbles/word) for the [N, K] matrix.
+        S: Per-group f32 scales [N, NG] (NG = K/Q4_GROUP).
+        n: Output-channel (row) index.
+        k: Contraction index within the row.
+        K: Row width (contraction dim).
+        NG: Number of groups per row (K / Q4_GROUP).
+
+    Returns:
+        The dequantized weight W[n,k] = (nibble − 8) · scale[n, k/Q4_GROUP].
+    """
     comptime assert P.flat_rank == 1
     var lin = n * K + k
     var w = Int(rebind[Scalar[DType.uint32]](P[lin >> 3]))
@@ -561,7 +687,23 @@ def matmul_q4_kernel[
     The 8 nibbles of each word unpack with vector ops (a scalar unpack is ~2.5×
     slower — ALU-bound). One 256-bit oct = 64 elements = half a 128-group, so a
     single group scale per oct is exact (K, hence words=K/8, is a multiple of 16
-    → words divisible by 8, no tail). ~2× the bf16 GEMV on the M4."""
+    → words divisible by 8, no tail). ~2× the bf16 GEMV on the M4.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        X: Input activations [M, K] (f32).
+        P: Packed int4 weights (u32, 8 nibbles/word) for [N, K].
+        S: Per-group f32 scales [N, NG].
+        B: Bias [N] (f32), added when use_bias != 0.
+        Y: Output [M, N] (f32).
+        M: Number of input rows (tokens).
+        K: Contraction (input) dimension.
+        N: Number of output channels.
+        NG: Groups per row (K / Q4_GROUP).
+        use_bias: Add B when nonzero.
+    """
     comptime assert X.flat_rank == 1
     var out = Int(global_idx.x) // WARP_SIZE
     var lane = Int(global_idx.x) % WARP_SIZE
@@ -623,7 +765,23 @@ def matmul_q4_batch_kernel[
     per m). This keeps small-M verify forwards far below the simdgroup-GEMM's
     flat ~700 ms. Weight unpack (the ALU-heavy nibble→f32) is done once per oct
     and reused across all M rows; same exact-scale invariant (one group scale per
-    64-element oct, since 8|128)."""
+    64-element oct, since 8|128).
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        X: Input activations [M, K] (f32).
+        P: Packed int4 weights (u32, 8 nibbles/word) for [N, K].
+        S: Per-group f32 scales [N, NG].
+        B: Bias [N] (f32), added when use_bias != 0.
+        Y: Output [M, N] (f32).
+        M: Number of input rows (2..SPEC_MAX_M).
+        K: Contraction (input) dimension.
+        N: Number of output channels.
+        NG: Groups per row (K / Q4_GROUP).
+        use_bias: Add B when nonzero.
+    """
     comptime assert X.flat_rank == 1
     var n = Int(global_idx.x) // WARP_SIZE
     var lane = Int(global_idx.x) % WARP_SIZE
@@ -673,6 +831,20 @@ def matmul_norm_kernel[
     streams the full input row x[k] for its dot, so it accumulates Σx[k]² in the
     same K-loop — `out = (Σ x[k]·lnw[k]·W[n,k]) / rms`, rms = √(mean(x²)+EPS) — and
     the separate RMSNorm launch (and its x round-trip) disappears (decode only).
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        X: Input activations [M, K] (f32), un-normalized.
+        LNW: RMSNorm weight [K] (f32), applied to X inside the dot.
+        W: Bf16 weights (raw u16 bits), row-major [N, K].
+        B: Bias [N] (f32), added when use_bias != 0.
+        Y: Output [M, N] (f32).
+        M: Number of input rows (tokens).
+        K: Contraction (input) dimension.
+        N: Number of output channels.
+        use_bias: Add B when nonzero.
     """
     comptime assert X.flat_rank == 1
     var out = Int(global_idx.x) // WARP_SIZE
@@ -714,6 +886,22 @@ def matmul_q4_norm_kernel[
 ):
     """Int4 decode GEMV with RMSNorm fused in (see matmul_norm_kernel). Folds the
     pre-projection RMSNorm into the qkv / gate_up GEMVs — −2 launches per layer.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        X: Input activations [M, K] (f32), un-normalized.
+        LNW: RMSNorm weight [K] (f32), applied to X inside the dot.
+        P: Packed int4 weights (u32, 8 nibbles/word) for [N, K].
+        S: Per-group f32 scales [N, NG].
+        B: Bias [N] (f32), added when use_bias != 0.
+        Y: Output [M, N] (f32).
+        M: Number of input rows (tokens).
+        K: Contraction (input) dimension.
+        N: Number of output channels.
+        NG: Groups per row (K / Q4_GROUP).
+        use_bias: Add B when nonzero.
     """
     comptime assert X.flat_rank == 1
     var out = Int(global_idx.x) // WARP_SIZE
@@ -770,6 +958,22 @@ def matmul_q4_resid_kernel[
 ):
     """Matmul_q4_kernel with a fused residual add (Y = X·Wᵀ(+bias) + R). Folds the
     decode residual into the proj GEMV, saving one launch per layer (×2: o & down).
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        X: Input activations [M, K] (f32).
+        P: Packed int4 weights (u32, 8 nibbles/word) for [N, K].
+        S: Per-group f32 scales [N, NG].
+        B: Bias [N] (f32), added when use_bias != 0.
+        R: Residual [M, N] (f32), added in the epilogue.
+        Y: Output [M, N] (f32) = X·Wᵀ (+bias) + R.
+        M: Number of input rows (tokens).
+        K: Contraction (input) dimension.
+        N: Number of output channels.
+        NG: Groups per row (K / Q4_GROUP).
+        use_bias: Add B when nonzero.
     """
     comptime assert X.flat_rank == 1
     var out = Int(global_idx.x) // WARP_SIZE
@@ -820,7 +1024,22 @@ def matmul_resid_kernel[
     N: Int,
     use_bias: Int,
 ):
-    """Matmul_kernel (bf16 decode GEMV) with a fused residual add."""
+    """Matmul_kernel (bf16 decode GEMV) with a fused residual add.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        X: Input activations [M, K] (f32).
+        W: Bf16 weights (raw u16 bits), row-major [N, K].
+        B: Bias [N] (f32), added when use_bias != 0.
+        R: Residual [M, N] (f32), added in the epilogue.
+        Y: Output [M, N] (f32) = X·Wᵀ (+bias) + R.
+        M: Number of input rows (tokens).
+        K: Contraction (input) dimension.
+        N: Number of output channels.
+        use_bias: Add B when nonzero.
+    """
     comptime assert X.flat_rank == 1
     var out = Int(global_idx.x) // WARP_SIZE
     var lane = Int(global_idx.x) % WARP_SIZE
@@ -859,7 +1078,23 @@ def matmul_q4_silu_resid_kernel[
     """Int4 down-proj decode GEMV with SwiGLU fused on the input: reads the fused
     gate|up GEMV output and forms act[k]=silu(gate[k])·up[k] on load, so the
     separate silu_mul_cat launch (and its `act` buffer) disappears. K = inter, so
-    up[k] is GU[k+K]. Residual fused in the epilogue (down's resid)."""
+    up[k] is GU[k+K]. Residual fused in the epilogue (down's resid).
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        GU: Fused gate|up GEMV output [M, 2*K] (f32); row = gate(K) ++ up(K).
+            act[k] = silu(gate[k]) · up[k] is formed on load.
+        P: Packed int4 down-proj weights (u32, 8 nibbles/word) for [N, K].
+        S: Per-group f32 scales [N, NG].
+        R: Residual [M, N] (f32), added in the epilogue.
+        Y: Output [M, N] (f32).
+        M: Number of input rows (tokens).
+        K: Intermediate size (gate/up width = contraction dim).
+        N: Number of output (hidden) channels.
+        NG: Groups per row (K / Q4_GROUP).
+    """
     comptime assert GU.flat_rank == 1
     var out = Int(global_idx.x) // WARP_SIZE
     var lane = Int(global_idx.x) % WARP_SIZE
@@ -904,6 +1139,19 @@ def matmul_silu_resid_kernel[
     N: Int,
 ):
     """Bf16 down-proj decode GEMV with SwiGLU fused on the input (see q4 variant).
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        GU: Fused gate|up GEMV output [M, 2*K] (f32); row = gate(K) ++ up(K).
+            act[k] = silu(gate[k]) · up[k] is formed on load.
+        W: Bf16 down-proj weights (raw u16 bits), row-major [N, K].
+        R: Residual [M, N] (f32), added in the epilogue.
+        Y: Output [M, N] (f32).
+        M: Number of input rows (tokens).
+        K: Intermediate size (gate/up width = contraction dim).
+        N: Number of output (hidden) channels.
     """
     comptime assert GU.flat_rank == 1
     var out = Int(global_idx.x) // WARP_SIZE
@@ -941,7 +1189,25 @@ def matmul_tiled_q4_kernel[
     use_bias: Int,
 ):
     """Int4 scalar prefill fallback — matmul_tiled_kernel with q4_deq W-reads.
-    Used only if the simdgroup-matrix probe fails."""
+    Used only if the simdgroup-matrix probe fails.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+        TM: Token rows per warp output tile (token-axis reuse of W).
+        CN: Output columns per warp output tile (column-axis reuse of X).
+
+    Args:
+        X: Input activations [M, K] (f32).
+        P: Packed int4 weights (u32, 8 nibbles/word) for [N, K].
+        S: Per-group f32 scales [N, NG].
+        B: Bias [N] (f32), added when use_bias != 0.
+        Y: Output [M, N] (f32).
+        M: Number of input rows (tokens).
+        K: Contraction (input) dimension.
+        N: Number of output channels.
+        NG: Groups per row (K / Q4_GROUP).
+        use_bias: Add B when nonzero.
+    """
     comptime assert X.flat_rank == 1
     var ncols = ceildiv(N, CN)
     var tile = Int(global_idx.x) // WARP_SIZE
@@ -1000,7 +1266,23 @@ def matmul_simd_q4_kernel[
     bf16 (~2.1 TFLOP/s)**, since the packed int4 moved into shared is 4× smaller
     and the dequant is amortized. Only W is staged; X stays on the cache-served
     global path (bf16 X-staging measured negative on M4). Matmul math/output are
-    byte-for-byte the bf16 kernel's."""
+    byte-for-byte the bf16 kernel's.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        X: Input activations [M, K] (f32).
+        P: Packed int4 weights (u32, 8 nibbles/word) for [N, K].
+        S: Per-group f32 scales [N, NG].
+        B: Bias [N] (f32), added when use_bias != 0.
+        Y: Output [M, N] (f32).
+        M: Number of input rows (tokens).
+        K: Contraction (input) dimension.
+        N: Number of output channels.
+        NG: Groups per row (K / Q4_GROUP).
+        use_bias: Add B when nonzero.
+    """
     comptime assert X.flat_rank == 1
     var tid = Int(thread_idx.x)
     var lane = tid % 32
@@ -1138,7 +1420,23 @@ def matmul_q4_small_kernel[
     `_SM_NSG` col-simdgroups; W[blk_col..+64, kc..+_SM_BK] is cooperatively
     dequantized into shared once per K-chunk and each simdgroup MMAs its 2 col-
     fragments from it. X stays on the global cache path. Output/scale invariants
-    match matmul_simd_q4_kernel."""
+    match matmul_simd_q4_kernel.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        X: Input activations [M, K] (f32), M ≤ 8.
+        P: Packed int4 weights (u32, 8 nibbles/word) for [N, K].
+        S: Per-group f32 scales [N, NG].
+        B: Bias [N] (f32), added when use_bias != 0.
+        Y: Output [M, N] (f32).
+        M: Number of input rows (≤ 8).
+        K: Contraction (input) dimension.
+        N: Number of output channels.
+        NG: Groups per row (K / Q4_GROUP).
+        use_bias: Add B when nonzero.
+    """
     comptime assert X.flat_rank == 1
     var tid = Int(thread_idx.x)
     var lane = tid % 32
@@ -1235,6 +1533,15 @@ def silu_mul_kernel[
     n: Int,
 ):
     """SwiGLU on two separate buffers: Y[i] = silu(A[i]) · B[i] over `n` elements.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        A: Gate buffer (f32, length `n`).
+        B: Multiplier buffer (f32, length `n`).
+        Y: Output buffer (f32, length `n`) = silu(A) · B.
+        n: Element count.
     """
     comptime assert A.flat_rank == 1
     var i = global_idx.x
@@ -1257,7 +1564,17 @@ def silu_mul_cat_kernel[
 ):
     """SwiGLU activation reading the *fused* gate+up GEMV output (one buffer, gate
     then up per row): Y = silu(gate)·up. Lets gate+up be one GEMV instead of two —
-    the split happens here for free instead of via separate buffers."""
+    the split happens here for free instead of via separate buffers.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        GU: Fused gate+up GEMV output [T, 2*inter] (f32); row = gate(inter) ++ up(inter).
+        Y: Output [T, inter] (f32) = silu(gate) · up.
+        T: Number of rows (tokens).
+        inter: Intermediate size (gate/up width).
+    """
     comptime assert GU.flat_rank == 1
     var idx = global_idx.x
     if idx >= T * inter:
@@ -1286,7 +1603,17 @@ def gelu_mul_cat_kernel[
 ):
     """GeGLU activation (Gemma): Y = gelu_tanh(gate)·up, reading the fused gate+up
     GEMV output — the GELU sibling of silu_mul_cat_kernel. `gelu_pytorch_tanh`:
-    0.5·g·(1 + tanh(√(2/π)·(g + 0.044715·g³)))."""
+    0.5·g·(1 + tanh(√(2/π)·(g + 0.044715·g³))).
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        GU: Fused gate+up GEMV output [T, 2*inter] (f32); row = gate(inter) ++ up(inter).
+        Y: Output [T, inter] (f32) = gelu_tanh(gate) · up.
+        T: Number of rows (tokens).
+        inter: Intermediate size (gate/up width).
+    """
     comptime assert GU.flat_rank == 1
     var idx = global_idx.x
     if idx >= T * inter:
@@ -1309,7 +1636,17 @@ def gelu_mul_kernel[
 ):
     """Y = gelu_tanh(A)·B over two SEPARATE [n] buffers (Gemma3n per-layer-input
     gate: gelu(gate(h)) ⊙ per_layer_input). Sibling of gelu_mul_cat_kernel, which
-    reads one fused gate++up buffer instead."""
+    reads one fused gate++up buffer instead.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        A: Gate buffer [n] (f32).
+        B: Multiplier buffer [n] (f32).
+        Y: Output [n] (f32) = gelu_tanh(A) · B.
+        n: Element count.
+    """
     comptime assert A.flat_rank == 1
     var i = global_idx.x
     if i >= n:
@@ -1335,6 +1672,18 @@ def gelu_mul_strided_kernel[
 ):
     """Y[t,j] = gelu_tanh(A[t,j]) · P[t, off+j] — the Gemma3n PLE gate fused with the
     strided slice of the per-layer-input table (copy_strided + gelu_mul → 1 launch).
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        A: Gate [T, n] (f32).
+        P: Per-layer-input table [T, stride] (f32).
+        Y: Output [T, n] (f32) = gelu_tanh(A[t,j]) · P[t, off+j].
+        T: Number of rows (tokens).
+        n: Slice width per row.
+        stride: Row stride of P.
+        off: Column offset into P's row.
     """
     comptime assert A.flat_rank == 1
     var i = global_idx.x
@@ -1359,6 +1708,14 @@ def softcap_kernel[
 ):
     """Logit soft-capping (Gemma): X ← cap·tanh(X/cap), in place. Used for the
     final-logit softcap (cap=30) and reusable for the attention-logit softcap.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        X: In/out buffer (f32, length `n`); overwritten with cap·tanh(X/cap).
+        n: Element count.
+        cap: Soft-cap magnitude.
     """
     comptime assert X.flat_rank == 1
     var i = global_idx.x
@@ -1377,7 +1734,16 @@ def add_scalar_kernel[
 ):
     """In-place add a scalar to every element. Gemma bakes (1+w) into every
     RMSNorm weight at load (c=1.0) so the existing `x/rms*w` kernels are exact for
-    Gemma's (1+w) RMSNorm without touching the hot norm kernels."""
+    Gemma's (1+w) RMSNorm without touching the hot norm kernels.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        X: In/out buffer (f32, length `n`); each element becomes X[i] + c.
+        n: Element count.
+        c: Scalar to add.
+    """
     comptime assert X.flat_rank == 1
     var i = global_idx.x
     if i >= n:
@@ -1394,7 +1760,17 @@ def mul_scalar_kernel[
     c: Float32,
 ):
     """Y = X * c (elementwise). Gemma scales embeddings by √hidden (input path) and
-    applies the per-layer learned scalar to the layer output."""
+    applies the per-layer learned scalar to the layer output.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        X: Input buffer (f32, length `n`).
+        Y: Output buffer (f32, length `n`) = X · c.
+        n: Element count.
+        c: Scalar multiplier.
+    """
     comptime assert X.flat_rank == 1
     var i = global_idx.x
     if i >= n:
@@ -1420,6 +1796,19 @@ def vnorm_kernel[
     per (token, kv-head) normalizes that head's HEAD_DIM values by 1/sqrt(mean(x²)+
     eps) and writes them into the V cache at the absolute-position row (like
     rope_k writes K). Used by Gemma's full-attention layers where V = v_norm(k_proj).
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+        HKV: Number of key/value heads.
+        HEAD_DIM: Per-head dimension.
+
+    Args:
+        In: V source (f32); each row has stride in_stride, the V slice at column in_off.
+        Vc: V cache [max, HKV, HEAD_DIM] (f32); normalized V written at row q_offset+t.
+        Tq: Number of tokens this launch.
+        q_offset: Absolute position of the first token (cache row base).
+        in_stride: Source row stride.
+        in_off: Column offset of V within the source row.
     """
     comptime assert In.flat_rank == 1
     var nkv = HKV * HEAD_DIM
@@ -1445,6 +1834,15 @@ def copy_kernel[
     n: Int,
 ):
     """Copy `n` contiguous f32 elements from `src` into `dst` at `dst_offset`.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        src: Source buffer (f32); `n` contiguous elements from index 0.
+        dst: Destination buffer (f32); written starting at `dst_offset`.
+        dst_offset: Start index in `dst`.
+        n: Element count.
     """
     comptime assert dst.flat_rank == 1
     var i = global_idx.x
@@ -1468,6 +1866,18 @@ def copy_strided_kernel[
 ):
     """Copy a [T, n] column-slice out of a strided source (e.g. the V part of a
     fused [q|k|v] buffer) into dst[dst_off:] contiguously — V into its cache rows.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        src: Strided source (f32); each row has stride in_stride, slice at column in_off.
+        dst: Destination buffer (f32); the slice is written contiguously at dst_off.
+        T: Number of rows.
+        in_stride: Source row stride.
+        in_off: Column offset of the slice within the source row.
+        dst_off: Start index in `dst`.
+        n: Slice width per row.
     """
     comptime assert dst.flat_rank == 1
     var idx = global_idx.x
@@ -1490,7 +1900,17 @@ def slice_row_kernel[
 ):
     """Copy n contiguous elements from src starting at src_offset into dst[0:n].
     Used to lift the last token's hidden row out before the LM head, so prefill
-    runs the (VOCAB-wide) head on one row instead of all T (§11 #12)."""
+    runs the (VOCAB-wide) head on one row instead of all T (§11 #12).
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+
+    Args:
+        src: Source buffer (f32); `n` contiguous elements read from `src_offset`.
+        dst: Destination buffer (f32); written at [0:n].
+        src_offset: Start index in `src`.
+        n: Element count.
+    """
     comptime assert dst.flat_rank == 1
     var i = global_idx.x
     if i >= n:
@@ -1542,7 +1962,25 @@ def rope_k_kernel[
     be a strided slice of a fused [q|k|v] buffer (in_stride/in_off).
 
     When QK_NORM (Qwen3), each head is first RMS-normalized over HEAD_DIM and
-    scaled by Kn[d] before the rotation (HF: q_norm/k_norm applied pre-RoPE)."""
+    scaled by Kn[d] before the rotation (HF: q_norm/k_norm applied pre-RoPE).
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+        HKV: Number of key/value heads.
+        HEAD_DIM: Per-head dimension.
+        QK_NORM: Whether to apply per-head QK-RMSNorm before RoPE (Qwen3).
+
+    Args:
+        Kin: K source (f32); each row has stride in_stride, the K slice at column in_off.
+        Kc: K cache [max, HKV, HEAD_DIM] (f32); rotated K written at row q_offset+t.
+        Kn: K_norm weight [HEAD_DIM] (f32); used only when QK_NORM (dummy otherwise).
+        Tq: Number of tokens this launch.
+        q_offset: Absolute position of the first token (cache row base).
+        in_stride: Source row stride (= nkv unfused, = hd+2·nkv reading fused qkv).
+        in_off: Column offset of K within the source row (0 unfused, hd when fused).
+        theta: RoPE base frequency (Qwen passes THETA; Gemma per-layer 1e4/1e6).
+        rot_pairs: Number of d-pairs rotated (<0 = HEAD_DIM/2 = full rotary).
+    """
     comptime assert Kin.flat_rank == 1
     comptime HALF = HEAD_DIM // 2
     var nkv = HKV * HEAD_DIM
@@ -1607,7 +2045,27 @@ def rope_kv_kernel[
     """Rope_k_kernel + the V cache-copy in ONE launch: one thread per token×kv-head
     rotates that head's K into the cache AND copies its V into the cache. Both
     already walked the same (token, kv-head) grid and wrote a per-head cache slice,
-    so merging halves the K/V write dispatches (rope_k + copy_strided → 1)."""
+    so merging halves the K/V write dispatches (rope_k + copy_strided → 1).
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+        HKV: Number of key/value heads.
+        HEAD_DIM: Per-head dimension.
+        QK_NORM: Whether to apply per-head QK-RMSNorm before RoPE (Qwen3).
+
+    Args:
+        In: Fused [q|k|v] source (f32); each row has stride in_stride.
+        Kc: K cache [max, HKV, HEAD_DIM] (f32); rotated K written at row q_offset+t.
+        Vc: V cache [max, HKV, HEAD_DIM] (f32); V copied (unrotated) at the same row.
+        Kn: K_norm weight [HEAD_DIM] (f32); used only when QK_NORM (dummy otherwise).
+        Tq: Number of tokens this launch.
+        q_offset: Absolute position of the first token (cache row base).
+        in_stride: Source row stride (= hd + 2·nkv when reading fused qkv).
+        k_off: Column offset of K within the source row.
+        v_off: Column offset of V within the source row.
+        theta: RoPE base frequency.
+        rot_pairs: Number of d-pairs rotated (<0 = HEAD_DIM/2 = full rotary).
+    """
     comptime assert In.flat_rank == 1
     comptime HALF = HEAD_DIM // 2
     var nkv = HKV * HEAD_DIM
@@ -1673,7 +2131,25 @@ def rope_q_kernel[
     strided slice of a fused [q|k|v] buffer (in_stride/in_off); Qr is contiguous.
 
     When QK_NORM (Qwen3), each head is first RMS-normalized over HEAD_DIM and
-    scaled by Qn[d] before the rotation (HF: q_norm applied pre-RoPE)."""
+    scaled by Qn[d] before the rotation (HF: q_norm applied pre-RoPE).
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+        HQ: Number of query heads.
+        HEAD_DIM: Per-head dimension.
+        QK_NORM: Whether to apply per-head QK-RMSNorm before RoPE (Qwen3).
+
+    Args:
+        Q: Q source (f32); each row has stride in_stride, the Q slice at column in_off.
+        Qr: Rotated output [Tq, HQ, HEAD_DIM] (f32), contiguous.
+        Qn: Q_norm weight [HEAD_DIM] (f32); used only when QK_NORM (dummy otherwise).
+        Tq: Number of tokens this launch.
+        q_offset: Absolute position of the first query (cache row base).
+        in_stride: Source row stride (= hd unfused, = hd+2·nkv reading fused qkv).
+        in_off: Column offset of Q within the source row (0; Q is first in [q|k|v]).
+        theta: RoPE base frequency.
+        rot_pairs: Number of d-pairs rotated (<0 = HEAD_DIM/2 = full rotary).
+    """
     comptime assert Q.flat_rank == 1
     comptime HALF = HEAD_DIM // 2
     var idx = Int(global_idx.x)
@@ -1739,6 +2215,20 @@ def attn_cached_kernel[
     dot sums VEC partials before the horizontal reduce, so the 64-term sum order
     differs from a scalar loop — output drifts by ≤4e-9 (pure f32 rounding), far
     under the forward tolerance, and greedy decode stays token-for-token (§11 #12).
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+        HQ: Number of query heads.
+        HKV: Number of key/value heads.
+        HEAD_DIM: Per-head dimension.
+
+    Args:
+        Q: RoPE-rotated queries [Tq, HQ, HEAD_DIM] (f32).
+        Kc: RoPE-rotated K cache [max, HKV, HEAD_DIM] (f32), row = absolute position.
+        Vc: V cache [max, HKV, HEAD_DIM] (f32).
+        O: Attention output [Tq, HQ, HEAD_DIM] (f32).
+        Tq: Number of query tokens.
+        q_offset: Absolute position of the first query (causal horizon per row).
     """
     comptime assert Q.flat_rank == 1
     comptime VEC = 8
@@ -1814,6 +2304,24 @@ def attn_cached_rope_kernel[
     register chunk c pairs element-wise with chunk c+NVEC/2, so qreg is rotated in
     place with vectorized cos/sin (no extra registers). Qwen3 applies q_norm/RMS per
     head pre-rotation. Bit-parity with rope_q + attn_cached (same split-half θ).
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+        HQ: Number of query heads.
+        HKV: Number of key/value heads.
+        HEAD_DIM: Per-head dimension.
+        QK_NORM: Whether to apply per-head Q-RMSNorm before RoPE (Qwen3).
+
+    Args:
+        Q: RAW (un-rotated) Q slice (f32); each row has stride q_stride, Q at column q_off.
+        Kc: RoPE-rotated K cache [max, HKV, HEAD_DIM] (f32), row = absolute position.
+        Vc: V cache [max, HKV, HEAD_DIM] (f32).
+        Qn: Q_norm weight [HEAD_DIM] (f32); used only when QK_NORM (dummy otherwise).
+        O: Attention output [Tq, HQ, HEAD_DIM] (f32).
+        Tq: Number of query tokens.
+        q_offset: Absolute position of the first query (causal horizon per row).
+        q_stride: Source row stride of Q.
+        q_off: Column offset of Q within the source row.
     """
     comptime assert Q.flat_rank == 1
     comptime VEC = 8
@@ -1921,7 +2429,23 @@ def flash_attn_kernel[
     Lane l still owns keys l, l+FLASH_BK, l+2·FLASH_BK, … in increasing order — the
     exact per-lane sequence and online-softmax update order of attn_cached_kernel —
     and the staged values are bit-identical f32 copies, so the output is bit-for-bit
-    the same (verified max|diff|=0). Only the read path differs."""
+    the same (verified max|diff|=0). Only the read path differs.
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+        HQ: Number of query heads.
+        HKV: Number of key/value heads.
+        HEAD_DIM: Per-head dimension.
+        PW: Query positions per block (warps/block = PW · GROUP).
+
+    Args:
+        Q: RoPE-rotated queries [Tq, HQ, HEAD_DIM] (f32).
+        Kc: RoPE-rotated K cache [max, HKV, HEAD_DIM] (f32), row = absolute position.
+        Vc: V cache [max, HKV, HEAD_DIM] (f32).
+        O: Attention output [Tq, HQ, HEAD_DIM] (f32).
+        Tq: Number of query tokens.
+        q_offset: Absolute position of the first query (causal horizon per row).
+    """
     comptime assert Q.flat_rank == 1
     comptime VEC = 8
     comptime NVEC = HEAD_DIM // VEC
@@ -2045,7 +2569,25 @@ def tc_attn_kernel[
     Causal masking zeros P past the diagonal, so a masked key's V contribution is
     killed in the MMA regardless — V is read with a branchless clamped row index
     (a per-lane divergent guard around the unrolled MMA accumulate miscompiles on
-    this toolchain, silently corrupting the first output d-tile)."""
+    this toolchain, silently corrupting the first output d-tile).
+
+    Parameters:
+        LT: Tensor layout type for the flat 1D buffers.
+        HQ: Number of query heads.
+        HKV: Number of key/value heads.
+        HEAD_DIM: Per-head dimension.
+
+    Args:
+        Q: RoPE-rotated queries [Tq, HQ, HEAD_DIM] (f32).
+        Kc: RoPE-rotated K cache [max, HKV, HEAD_DIM] (f32), row = absolute position.
+        Vc: V cache [max, HKV, HEAD_DIM] (f32).
+        O: Attention output [Tq, HQ, HEAD_DIM] (f32).
+        Tq: Number of query tokens.
+        q_offset: Absolute position of the first query (causal horizon per row).
+        scale_in: Softmax scale; <0 selects 1/sqrt(HEAD_DIM) (Qwen; Gemma passes 1.0).
+        window: Sliding-window width (>0 = attend only the last `window` keys;
+            0 = full causal).
+    """
     comptime assert Q.flat_rank == 1
     comptime ND = HEAD_DIM // _MMA8  # d-tiles
     comptime GROUP = HQ // HKV

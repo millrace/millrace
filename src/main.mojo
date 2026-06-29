@@ -29,13 +29,30 @@ comptime TEMPLATE = "assets/qwen2.5-chat-template.jinja"
 
 
 def read_text(path: String) raises -> String:
-    """Read the whole file at `path` into a String."""
+    """Read the whole file at `path` into a String.
+
+    Args:
+        path: The filesystem path to read.
+
+    Returns:
+        The file's contents as a String.
+
+    Raises:
+        If the file cannot be opened or read.
+    """
     with open(path, "r") as f:
         return f.read()
 
 
 def to_bytes(s: String) -> List[UInt8]:
-    """Copy the UTF-8 bytes of `s` into a `List[UInt8]`."""
+    """Copy the UTF-8 bytes of `s` into a `List[UInt8]`.
+
+    Args:
+        s: The string whose UTF-8 bytes to copy.
+
+    Returns:
+        The UTF-8 bytes of `s` as a `List[UInt8]`.
+    """
     var out = List[UInt8]()
     var sb = s.as_bytes()
     for i in range(len(sb)):
@@ -45,6 +62,9 @@ def to_bytes(s: String) -> List[UInt8]:
 
 def main() raises:
     """Render the prompt, load weights, greedily generate, and print the answer.
+
+    Raises:
+        If weight loading, generation, or tokenization fails.
     """
     var user = String("What is the capital of France?")
     if len(argv()) > 1:

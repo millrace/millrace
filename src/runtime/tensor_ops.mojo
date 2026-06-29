@@ -87,6 +87,12 @@ struct QMat(Movable):
         out self, var bf16: WBuf, var packed: PBuf, var scales: DevBuf, q4: Bool
     ):
         """Construct a QMat taking ownership of its three buffers and `q4` flag.
+
+        Args:
+            bf16: Raw bf16 weight buffer (used when `q4` is False; else a dummy).
+            packed: Packed group-128 int4 weight buffer (used when `q4` is True).
+            scales: Per-group f32 scales for the int4 weights.
+            q4: Representation flag — True = group-128 int4, False = bf16.
         """
         self.bf16 = bf16^
         self.packed = packed^
@@ -95,7 +101,18 @@ struct QMat(Movable):
 
 
 def qmat_bf16(ctx: DeviceContext, var buf: WBuf) raises -> QMat:
-    """Wrap raw bf16 weights in a QMat (q4=False), with dummy int4 buffers."""
+    """Wrap raw bf16 weights in a QMat (q4=False), with dummy int4 buffers.
+
+    Args:
+        ctx: The GPU device context (allocates the size-1 dummy int4 buffers).
+        buf: The raw bf16 weight buffer to take ownership of.
+
+    Returns:
+        A QMat holding `buf` with q4=False and size-1 dummy packed/scales buffers.
+
+    Raises:
+        If allocating the dummy device buffers fails.
+    """
     return QMat(
         buf^,
         ctx.enqueue_create_buffer[DType.uint32](1),
@@ -120,7 +137,25 @@ def mm(
 ) raises -> DevBuf:
     """Matmul x[M,K]·wᵀ[N,K] (+ optional bias) → y[M,N] for bf16 weights. Dispatches
     on M: GEMV at M=1 (decode), simdgroup-matrix GEMM when `simd_ok` (prefill),
-    else the scalar register-tiled GEMM."""
+    else the scalar register-tiled GEMM.
+
+    Args:
+        ctx: The GPU device context.
+        x: Input activations [M, K].
+        w: Bf16 weights [N, K] (transposed in the matmul).
+        b: Bias [N] (read only when `use_bias` is nonzero).
+        M: Number of input rows (tokens).
+        K: Input / contraction dimension.
+        N: Number of output columns.
+        use_bias: Nonzero to add `b`, zero to skip it.
+        simd_ok: True to allow the simdgroup-matrix GEMM at M>1 (prefill).
+
+    Returns:
+        A fresh [M, N] f32 buffer holding x·wᵀ (+ bias).
+
+    Raises:
+        If buffer allocation or kernel launch fails.
+    """
     var y = ctx.enqueue_create_buffer[DType.float32](M * N)
     var lay = row_major(M * N)
     if M == 1:
@@ -195,7 +230,25 @@ def mm_w(
 ) raises -> DevBuf:
     """Mm() for a QMat weight: bf16 path (delegates to mm) or group-128 int4. The
     int4 dispatch mirrors mm — GEMV at M=1 (decode), simdgroup-matrix GEMM at
-    M>1 with the probe on (prefill), scalar-tiled fallback otherwise."""
+    M>1 with the probe on (prefill), scalar-tiled fallback otherwise.
+
+    Args:
+        ctx: The GPU device context.
+        x: Input activations [M, K].
+        w: The projection weight (bf16 or group-128 int4).
+        b: Bias [N] (read only when `use_bias` is nonzero).
+        M: Number of input rows (tokens).
+        K: Input / contraction dimension.
+        N: Number of output columns.
+        use_bias: Nonzero to add `b`, zero to skip it.
+        simd_ok: True to allow the simdgroup-matrix GEMM at M>1 (prefill).
+
+    Returns:
+        A fresh [M, N] f32 buffer holding x·wᵀ (+ bias).
+
+    Raises:
+        If buffer allocation or kernel launch fails.
+    """
     if not w.q4:
         return mm(ctx, x, w.bf16, b, M, K, N, use_bias, simd_ok)
     var y = ctx.enqueue_create_buffer[DType.float32](M * N)
@@ -314,6 +367,24 @@ def mm_w_add(
     """Y = x·Wᵀ(+bias) + resid. At decode (M=1) the residual add is fused into the
     proj GEMV epilogue (one launch instead of GEMV+add); prefill (M>1) falls back
     to mm_w + add (the simd GEMM has no residual variant), so prefill is unchanged.
+
+    Args:
+        ctx: The GPU device context.
+        x: Input activations [M, K].
+        w: The projection weight (bf16 or group-128 int4).
+        b: Bias [N] (read only when `use_bias` is nonzero).
+        resid: Residual [M, N] added to the matmul output.
+        M: Number of input rows (tokens).
+        K: Input / contraction dimension.
+        N: Number of output columns.
+        use_bias: Nonzero to add `b`, zero to skip it.
+        simd_ok: True to allow the simdgroup-matrix GEMM at M>1 (prefill).
+
+    Returns:
+        A fresh [M, N] f32 buffer holding x·wᵀ (+ bias) + resid.
+
+    Raises:
+        If buffer allocation or kernel launch fails.
     """
     if M != 1:
         var y0 = mm_w(ctx, x, w, b, M, K, N, use_bias, simd_ok)
@@ -371,7 +442,26 @@ def mm_norm(
 ) raises -> DevBuf:
     """RMSNorm(x)·Wᵀ for a bf16 weight, with the norm fused into the GEMV at decode
     (M=1) — one launch instead of rmsnorm+matmul. Prefill (M>1) falls back to a
-    separate rmsnorm then mm (the GEMM has no fused-norm variant)."""
+    separate rmsnorm then mm (the GEMM has no fused-norm variant).
+
+    Args:
+        ctx: The GPU device context.
+        x: Input activations [M, K].
+        lnw: RMSNorm weight [K] applied before the projection.
+        w: Bf16 weights [N, K] (transposed in the matmul).
+        b: Bias [N] (read only when `use_bias` is nonzero).
+        M: Number of input rows (tokens).
+        K: Input / contraction dimension.
+        N: Number of output columns.
+        use_bias: Nonzero to add `b`, zero to skip it.
+        simd_ok: True to allow the simdgroup-matrix GEMM at M>1 (prefill).
+
+    Returns:
+        A fresh [M, N] f32 buffer holding RMSNorm(x)·wᵀ (+ bias).
+
+    Raises:
+        If buffer allocation or kernel launch fails.
+    """
     if M != 1:
         var xn = rmsnorm(ctx, x, lnw, M, K)
         return mm(ctx, xn, w, b, M, K, N, use_bias, simd_ok)
@@ -408,6 +498,24 @@ def mm_w_norm(
 ) raises -> DevBuf:
     """Mm_norm() for a QMat weight: fused-norm int4 GEMV at decode (M=1), else
     rmsnorm + mm_w at prefill. Folds the pre-projection RMSNorm into qkv/gate_up.
+
+    Args:
+        ctx: The GPU device context.
+        x: Input activations [M, K].
+        lnw: RMSNorm weight [K] applied before the projection.
+        w: The projection weight (bf16 or group-128 int4).
+        b: Bias [N] (read only when `use_bias` is nonzero).
+        M: Number of input rows (tokens).
+        K: Input / contraction dimension.
+        N: Number of output columns.
+        use_bias: Nonzero to add `b`, zero to skip it.
+        simd_ok: True to allow the simdgroup-matrix GEMM at M>1 (prefill).
+
+    Returns:
+        A fresh [M, N] f32 buffer holding RMSNorm(x)·wᵀ (+ bias).
+
+    Raises:
+        If buffer allocation or kernel launch fails.
     """
     if not w.q4:
         return mm_norm(ctx, x, lnw, w.bf16, b, M, K, N, use_bias, simd_ok)
@@ -449,7 +557,24 @@ def mm_w_silu_add(
     """Down-proj with SwiGLU fused on the input + residual on the output, at decode
     (M=1): Y = silu(gate)·up · Wᵀ + resid, reading the fused gate|up buffer directly
     — drops the silu_mul_cat launch and its `act` buffer. Prefill (M>1) falls back
-    to silu_mul_cat + mm_w_add (unchanged)."""
+    to silu_mul_cat + mm_w_add (unchanged).
+
+    Args:
+        ctx: The GPU device context.
+        gu: The fused gate|up activations [M, 2*inter].
+        w: The down-projection weight (bf16 or group-128 int4) [N, inter].
+        resid: Residual [M, N] added to the down-projection output.
+        M: Number of input rows (tokens).
+        inter: The intermediate (gate/up) dimension.
+        N: Number of output columns (the hidden dimension).
+        simd_ok: True to allow the simdgroup-matrix GEMM at M>1 (prefill).
+
+    Returns:
+        A fresh [M, N] f32 buffer holding silu(gate)·up · wᵀ + resid.
+
+    Raises:
+        If buffer allocation or kernel launch fails.
+    """
     if M != 1:
         var act = silu_mul_cat(ctx, gu, M, inter)
         var dummy = ctx.enqueue_create_buffer[DType.float32](1)
@@ -493,7 +618,18 @@ def probe_simd_gemm(ctx: DeviceContext) raises -> Bool:
     matmul_simd_kernel and checks it against a CPU reference. Returns False — so
     mm() uses the scalar fallback — if this Metal toolchain rejects the AIR
     intrinsics: that surfaces as a catchable pipeline-state error (not a crash),
-    and the DeviceContext stays usable afterward."""
+    and the DeviceContext stays usable afterward.
+
+    Args:
+        ctx: The GPU device context the probe kernel runs on.
+
+    Returns:
+        True if the simdgroup-matrix GEMM ran and matched the CPU reference;
+        False if the toolchain rejected it or the result was wrong.
+
+    Raises:
+        Never — every device error is caught internally and reported as False.
+    """
     try:
         var M = 8
         var K = 16
@@ -557,7 +693,21 @@ def rmsnorm(
     ctx: DeviceContext, mut x: DevBuf, mut w: DevBuf, T: Int, dim: Int
 ) raises -> DevBuf:
     """RMSNorm each of the T rows of x[T,dim] scaled by weight w[dim], one warp per
-    row → fresh [T,dim] buffer."""
+    row → fresh [T,dim] buffer.
+
+    Args:
+        ctx: The GPU device context.
+        x: Input activations [T, dim].
+        w: The RMSNorm scale weight [dim].
+        T: Number of rows (tokens).
+        dim: The row width.
+
+    Returns:
+        A fresh [T, dim] f32 buffer holding the normalized, scaled rows.
+
+    Raises:
+        If buffer allocation or kernel launch fails.
+    """
     var y = ctx.enqueue_create_buffer[DType.float32](T * dim)
     var lay = row_major(T * dim)
     comptime k = rmsnorm_kernel[type_of(lay)]
@@ -583,7 +733,23 @@ def rmsnorm_add(
     scale: Float32 = 1.0,
 ) raises -> DevBuf:
     """(RMSNorm(x)·w + resid)·scale in one launch — fuses Gemma's post-proj norm +
-    residual add (+ optional layer scalar)."""
+    residual add (+ optional layer scalar).
+
+    Args:
+        ctx: The GPU device context.
+        x: Input activations [T, dim].
+        w: The RMSNorm scale weight [dim].
+        resid: Residual [T, dim] added after the norm.
+        T: Number of rows (tokens).
+        dim: The row width.
+        scale: Optional per-layer scalar applied to the summed result.
+
+    Returns:
+        A fresh [T, dim] f32 buffer holding (RMSNorm(x)·w + resid)·scale.
+
+    Raises:
+        If buffer allocation or kernel launch fails.
+    """
     var y = ctx.enqueue_create_buffer[DType.float32](T * dim)
     var lay = row_major(T * dim)
     comptime k = rmsnorm_add_kernel[type_of(lay)]
@@ -611,6 +777,21 @@ def gelu_mul_strided(
     off: Int,
 ) raises -> DevBuf:
     """Gelu(a[t,j])·p[t, off+j] — PLE gate fused with the strided per-layer-input slice.
+
+    Args:
+        ctx: The GPU device context.
+        a: The gate input [T, n] passed through gelu.
+        p: The strided source [T, stride] sliced at column offset `off`.
+        T: Number of rows (tokens).
+        n: The output (gate) width.
+        stride: The row stride of `p`.
+        off: The column offset into each row of `p`.
+
+    Returns:
+        A fresh [T, n] f32 buffer holding gelu(a)·p[:, off:off+n].
+
+    Raises:
+        If buffer allocation or kernel launch fails.
     """
     var y = ctx.enqueue_create_buffer[DType.float32](T * n)
     var lay = row_major(T * n)
@@ -632,7 +813,20 @@ def gelu_mul_strided(
 def add(
     ctx: DeviceContext, mut a: DevBuf, mut b: DevBuf, n: Int
 ) raises -> DevBuf:
-    """Elementwise a + b over n elements → fresh buffer."""
+    """Elementwise a + b over n elements → fresh buffer.
+
+    Args:
+        ctx: The GPU device context.
+        a: The first operand [n].
+        b: The second operand [n].
+        n: Number of elements.
+
+    Returns:
+        A fresh [n] f32 buffer holding a + b.
+
+    Raises:
+        If buffer allocation or kernel launch fails.
+    """
     var y = ctx.enqueue_create_buffer[DType.float32](n)
     var lay = row_major(n)
     comptime k = add_kernel[type_of(lay)]
@@ -650,7 +844,20 @@ def add(
 def silu_mul(
     ctx: DeviceContext, mut a: DevBuf, mut b: DevBuf, n: Int
 ) raises -> DevBuf:
-    """SwiGLU elementwise SiLU(a)·b over n elements → fresh buffer."""
+    """SwiGLU elementwise SiLU(a)·b over n elements → fresh buffer.
+
+    Args:
+        ctx: The GPU device context.
+        a: The gate operand [n] passed through SiLU.
+        b: The up operand [n].
+        n: Number of elements.
+
+    Returns:
+        A fresh [n] f32 buffer holding SiLU(a)·b.
+
+    Raises:
+        If buffer allocation or kernel launch fails.
+    """
     var y = ctx.enqueue_create_buffer[DType.float32](n)
     var lay = row_major(n)
     comptime k = silu_mul_kernel[type_of(lay)]
@@ -668,7 +875,20 @@ def silu_mul(
 def silu_mul_cat(
     ctx: DeviceContext, mut gu: DevBuf, T: Int, inter: Int
 ) raises -> DevBuf:
-    """SwiGLU on the fused gate+up GEMV output [T, 2*inter] → [T, inter]."""
+    """SwiGLU on the fused gate+up GEMV output [T, 2*inter] → [T, inter].
+
+    Args:
+        ctx: The GPU device context.
+        gu: The fused gate|up activations [T, 2*inter].
+        T: Number of rows (tokens).
+        inter: The intermediate (gate/up) dimension.
+
+    Returns:
+        A fresh [T, inter] f32 buffer holding SiLU(gate)·up.
+
+    Raises:
+        If buffer allocation or kernel launch fails.
+    """
     var y = ctx.enqueue_create_buffer[DType.float32](T * inter)
     var lay = row_major(T * inter)
     comptime k = silu_mul_cat_kernel[type_of(lay)]
@@ -687,6 +907,18 @@ def gelu_mul_cat(
     ctx: DeviceContext, mut gu: DevBuf, T: Int, inter: Int
 ) raises -> DevBuf:
     """GeGLU on the fused gate+up GEMV output [T, 2*inter] → [T, inter] (Gemma).
+
+    Args:
+        ctx: The GPU device context.
+        gu: The fused gate|up activations [T, 2*inter].
+        T: Number of rows (tokens).
+        inter: The intermediate (gate/up) dimension.
+
+    Returns:
+        A fresh [T, inter] f32 buffer holding gelu(gate)·up.
+
+    Raises:
+        If buffer allocation or kernel launch fails.
     """
     var y = ctx.enqueue_create_buffer[DType.float32](T * inter)
     var lay = row_major(T * inter)
@@ -705,7 +937,20 @@ def gelu_mul_cat(
 def gelu_mul(
     ctx: DeviceContext, mut a: DevBuf, mut b: DevBuf, n: Int
 ) raises -> DevBuf:
-    """Y = gelu_tanh(a)·b over two separate [n] buffers (Gemma3n PLE gate)."""
+    """Y = gelu_tanh(a)·b over two separate [n] buffers (Gemma3n PLE gate).
+
+    Args:
+        ctx: The GPU device context.
+        a: The gate operand [n] passed through gelu_tanh.
+        b: The up operand [n].
+        n: Number of elements.
+
+    Returns:
+        A fresh [n] f32 buffer holding gelu_tanh(a)·b.
+
+    Raises:
+        If buffer allocation or kernel launch fails.
+    """
     var y = ctx.enqueue_create_buffer[DType.float32](n)
     var lay = row_major(n)
     comptime k = gelu_mul_kernel[type_of(lay)]
@@ -728,7 +973,21 @@ def nll_gather(
     vocab: Int,
 ) raises -> List[Float32]:
     """Per-position log P(target) from [n×vocab] GPU logits — one GPU pass, returns
-    n host floats (no n×vocab host copy). For perplexity / echo logprobs."""
+    n host floats (no n×vocab host copy). For perplexity / echo logprobs.
+
+    Args:
+        ctx: The GPU device context.
+        logits: The [n, vocab] logits buffer.
+        targets: The n target token ids (one per position).
+        n: Number of positions.
+        vocab: The vocabulary size (row width of `logits`).
+
+    Returns:
+        A host List of n floats — log P(target) at each position.
+
+    Raises:
+        If buffer allocation, host mapping, or kernel launch fails.
+    """
     var tgt = ctx.enqueue_create_buffer[DType.int32](n)
     with tgt.map_to_host() as m:
         var mt = TileTensor(m, row_major(n))
@@ -756,7 +1015,17 @@ def nll_gather(
 
 
 def softcap(ctx: DeviceContext, mut x: DevBuf, n: Int, cap: Float32) raises:
-    """In-place logit soft-capping x ← cap·tanh(x/cap) (Gemma)."""
+    """In-place logit soft-capping x ← cap·tanh(x/cap) (Gemma).
+
+    Args:
+        ctx: The GPU device context.
+        x: The [n] buffer soft-capped in place.
+        n: Number of elements.
+        cap: The soft-cap magnitude.
+
+    Raises:
+        If the kernel launch fails.
+    """
     var lay = row_major(n)
     comptime k = softcap_kernel[type_of(lay)]
     ctx.enqueue_function[k](
@@ -766,6 +1035,15 @@ def softcap(ctx: DeviceContext, mut x: DevBuf, n: Int, cap: Float32) raises:
 
 def add_scalar(ctx: DeviceContext, mut x: DevBuf, n: Int, c: Float32) raises:
     """In-place x ← x + c. Gemma bakes (1+w) into RMSNorm weights at load (c=1).
+
+    Args:
+        ctx: The GPU device context.
+        x: The [n] buffer updated in place.
+        n: Number of elements.
+        c: The scalar added to each element.
+
+    Raises:
+        If the kernel launch fails.
     """
     var lay = row_major(n)
     comptime k = add_scalar_kernel[type_of(lay)]
@@ -777,7 +1055,20 @@ def add_scalar(ctx: DeviceContext, mut x: DevBuf, n: Int, c: Float32) raises:
 def mul_scalar(
     ctx: DeviceContext, mut x: DevBuf, n: Int, c: Float32
 ) raises -> DevBuf:
-    """Y = x * c. Gemma embedding ×√hidden and per-layer learned scalar."""
+    """Y = x * c. Gemma embedding ×√hidden and per-layer learned scalar.
+
+    Args:
+        ctx: The GPU device context.
+        x: The input buffer [n].
+        n: Number of elements.
+        c: The scalar each element is multiplied by.
+
+    Returns:
+        A fresh [n] f32 buffer holding x * c.
+
+    Raises:
+        If buffer allocation or kernel launch fails.
+    """
     var y = ctx.enqueue_create_buffer[DType.float32](n)
     var lay = row_major(n)
     comptime k = mul_scalar_kernel[type_of(lay)]
@@ -801,7 +1092,22 @@ def embed_tokens(
     vocab: Int,
 ) raises -> DevBuf:
     """Gather the bf16 embedding rows for T token `ids` from emb[vocab,hidden],
-    widening to a fresh f32 [T,hidden] buffer."""
+    widening to a fresh f32 [T,hidden] buffer.
+
+    Args:
+        ctx: The GPU device context.
+        ids: The T token ids to gather.
+        emb: The bf16 embedding table [vocab, hidden].
+        T: Number of tokens.
+        hidden: The embedding (row) width.
+        vocab: The vocabulary size (number of rows in `emb`).
+
+    Returns:
+        A fresh [T, hidden] f32 buffer of the gathered, widened embedding rows.
+
+    Raises:
+        If buffer allocation or kernel launch fails.
+    """
     var h = ctx.enqueue_create_buffer[DType.float32](T * hidden)
     var lay = row_major(T * hidden)
     comptime k = embed_kernel[
@@ -822,7 +1128,20 @@ def embed_tokens(
 def last_row(
     ctx: DeviceContext, mut src: DevBuf, T: Int, dim: Int
 ) raises -> DevBuf:
-    """Lift row T-1 (dim elements) of src[T,dim] into a fresh 1×dim buffer."""
+    """Lift row T-1 (dim elements) of src[T,dim] into a fresh 1×dim buffer.
+
+    Args:
+        ctx: The GPU device context.
+        src: The source buffer [T, dim].
+        T: Number of rows (the last, T-1, is taken).
+        dim: The row width.
+
+    Returns:
+        A fresh [dim] f32 buffer holding row T-1 of `src`.
+
+    Raises:
+        If buffer allocation or kernel launch fails.
+    """
     var y = ctx.enqueue_create_buffer[DType.float32](dim)
     var lay = row_major(dim)
     comptime k = slice_row_kernel[type_of(lay)]
@@ -846,7 +1165,19 @@ def copy_into(
     dst_len: Int,
 ) raises:
     """Copy n elements from src into dst starting at `dst_offset` (dst has capacity
-    `dst_len`)."""
+    `dst_len`).
+
+    Args:
+        ctx: The GPU device context.
+        src: The source buffer (first n elements copied).
+        dst: The destination buffer (capacity `dst_len`).
+        dst_offset: The start index in `dst` to copy into.
+        n: Number of elements to copy.
+        dst_len: The total capacity of `dst`.
+
+    Raises:
+        If the kernel launch fails.
+    """
     var lay = row_major(n)
     comptime k = copy_kernel[type_of(lay)]
     ctx.enqueue_function[k](
@@ -871,7 +1202,22 @@ def copy_strided(
     dst_len: Int,
 ) raises:
     """Copy a [T, n] slice out of a strided source (V part of a fused [q|k|v]) into
-    dst[dst_off:] — V into its cache rows."""
+    dst[dst_off:] — V into its cache rows.
+
+    Args:
+        ctx: The GPU device context.
+        src: The strided source buffer [T, in_stride].
+        dst: The destination buffer (capacity `dst_len`).
+        T: Number of rows.
+        in_stride: The row stride of `src`.
+        in_off: The column offset of the slice within each `src` row.
+        dst_off: The start index in `dst` to copy into.
+        n: The slice width (columns per row).
+        dst_len: The total capacity of `dst`.
+
+    Raises:
+        If the kernel launch fails.
+    """
     var lay = row_major(T * in_stride)
     comptime k = copy_strided_kernel[type_of(lay)]
     ctx.enqueue_function[k](

@@ -38,6 +38,10 @@ struct ToolCall(Copyable, Movable):
 
     def __init__(out self, var name: String, var arguments: String):
         """Construct a `ToolCall` from a function name and JSON-string arguments.
+
+        Args:
+            name: the function name.
+            arguments: the arguments serialized as a JSON string (OpenAI shape).
         """
         self.name = name^
         self.arguments = arguments^
@@ -60,13 +64,23 @@ struct ParsedReply(Movable):
         var reasoning: String,
         var calls: List[ToolCall],
     ):
-        """Construct a `ParsedReply` from content, reasoning, and tool calls."""
+        """Construct a `ParsedReply` from content, reasoning, and tool calls.
+
+        Args:
+            content: the text outside any tool block (trimmed).
+            reasoning: the thinking-channel content (empty for Qwen / no channel).
+            calls: the tool calls in emission order.
+        """
         self.content = content^
         self.reasoning = reasoning^
         self.calls = calls^
 
     def has_calls(self) -> Bool:
-        """Whether any tool calls were parsed."""
+        """Whether any tool calls were parsed.
+
+        Returns:
+            True if at least one tool call was parsed, False otherwise.
+        """
         return len(self.calls) > 0
 
 
@@ -125,7 +139,14 @@ def repair_json(s: String) -> String:
     closers + trailing commas are dropped. Conservative — callers still
     `parse_json` the result and fall back to verbatim text if it's beyond repair.
     Fixes the common 0.5B failures (`["q"}}` missing the `]`, cut-off generation)
-    but not everything."""
+    but not everything.
+
+    Args:
+        s: the not-quite-JSON string to repair.
+
+    Returns:
+        The repaired JSON string (best effort).
+    """
     var b = string_to_bytes(s)
     var out = List[UInt8]()
     var stack = List[
@@ -228,7 +249,17 @@ def parse_tool_calls(text: String) raises -> ParsedReply:
     via `_extract_call` which parses strictly and then falls back to a repair
     pass for the malformed JSON small models often emit. A block beyond repair
     (or name-less) is preserved verbatim in `content`. A trailing `<tool_call>`
-    with no closing tag (truncated generation) is repaired from what's there."""
+    with no closing tag (truncated generation) is repaired from what's there.
+
+    Args:
+        text: the raw completion text to split.
+
+    Returns:
+        A `ParsedReply` with the surrounding content and parsed tool calls.
+
+    Raises:
+        Error: if the underlying JSON parsing/serialization fails.
+    """
     var b = string_to_bytes(text)
     var OPEN = string_to_bytes(String("<tool_call>"))
     var CLOSE = string_to_bytes(String("</tool_call>"))
@@ -448,7 +479,17 @@ def parse_gemma_tool_calls(text: String) raises -> ParsedReply:
     format), parses NAME + the Gemma-serialized args into OpenAI `arguments`
     (a JSON string). Text outside spans is `content`; an unparseable span is
     kept verbatim. A trailing span with no closing token (truncated) is parsed
-    from what's there."""
+    from what's there.
+
+    Args:
+        text: the raw Gemma completion text to split.
+
+    Returns:
+        A `ParsedReply` with the surrounding content and parsed tool calls.
+
+    Raises:
+        Error: if the underlying JSON parsing/serialization fails.
+    """
     var b = string_to_bytes(text)
     var OPEN = string_to_bytes(String(_G_OPEN))
     var CLOSE = string_to_bytes(String(_G_CLOSE))

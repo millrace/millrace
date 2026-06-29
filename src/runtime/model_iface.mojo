@@ -82,6 +82,9 @@ trait ModelWeights(Movable):
 
     def config(self) -> ModelConfig:
         """Return this model's `ModelConfig` (behavior flags + engine-relevant dims).
+
+        Returns:
+            This model's `ModelConfig` (behavior flags + engine-relevant dims).
         """
         ...
 
@@ -89,6 +92,18 @@ trait ModelWeights(Movable):
         mut self, ctx: DeviceContext, mut ids: DeviceBuffer[DType.int32], T: Int
     ) raises -> DevBuf:
         """Embed `T` prompt token ids into the hidden-state buffer (+ any scaling).
+
+        Args:
+            ctx: The GPU device context.
+            ids: The prompt token ids (length `T`).
+            T: The number of prompt tokens to embed.
+
+        Returns:
+            The hidden-state buffer for the `T` positions (with any embedding
+            scaling applied).
+
+        Raises:
+            On device/compute errors.
         """
         ...
 
@@ -105,6 +120,23 @@ trait ModelWeights(Movable):
         mut dummy: DevBuf,
     ) raises -> DevBuf:
         """Run decoder layer `l` over hidden state `h`, updating the KV caches; return the new state.
+
+        Args:
+            ctx: The GPU device context.
+            l: The decoder-layer index to run.
+            h: The input hidden state for this layer.
+            kcs: All layers' key caches (updated in place for layer `l`).
+            vcs: All layers' value caches (updated in place for layer `l`).
+            Tq: The number of query positions in this call.
+            q_offset: The position offset of the query block within the sequence.
+            cache_len: The current KV-cache length (keys/values already stored).
+            dummy: A scratch buffer reused across calls.
+
+        Returns:
+            The new hidden state after layer `l`.
+
+        Raises:
+            On device/compute errors.
         """
         # Receives ALL per-layer K/V caches (not just layer l's) so a family can
         # implement cross-layer KV sharing (Gemma-4 e2b). Dense families index [l].
@@ -113,13 +145,39 @@ trait ModelWeights(Movable):
     def lm_logits(
         mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf
     ) raises -> List[Float32]:
-        """Produce the last position's vocab logits (+ any final softcap)."""
+        """Produce the last position's vocab logits (+ any final softcap).
+
+        Args:
+            ctx: The GPU device context.
+            h: The final hidden state.
+            T: The number of positions in `h`.
+            dummy: A scratch buffer reused across calls.
+
+        Returns:
+            The last position's vocab logits (with any final softcap applied).
+
+        Raises:
+            On device/compute errors.
+        """
         ...
 
     def lm_logits_all(
         mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf
     ) raises -> List[Float32]:
         """Produce logits for all `T` positions (row-major T×vocab) for spec-decode verification.
+
+        Args:
+            ctx: The GPU device context.
+            h: The final hidden state for all `T` positions.
+            T: The number of positions in `h`.
+            dummy: A scratch buffer reused across calls.
+
+        Returns:
+            A flat host list of logits for all `T` positions (row-major
+            T×vocab), length `T*vocab`.
+
+        Raises:
+            On device/compute errors.
         """
         # Logits for ALL T positions (row-major T×vocab), for speculative-decode
         # batch verification. Same head as `lm_logits` but over every row, not just
@@ -135,6 +193,19 @@ trait ModelWeights(Movable):
         mut dummy: DevBuf,
     ) raises -> List[Float32]:
         """Return log P(targets[i] | h[i]) for the first `n` rows (LM head + on-GPU per-row log-softmax).
+
+        Args:
+            ctx: The GPU device context.
+            h: The hidden states (one row per scored position).
+            n: The number of rows to score.
+            targets: The target token id for each row.
+            dummy: A scratch buffer reused across calls.
+
+        Returns:
+            Log P(targets[i] | h[i]) for the first `n` rows.
+
+        Raises:
+            On device/compute errors.
         """
         # log P(targets[i] | h[i]) for the first n rows — the LM head (+ any softcap)
         # followed by an on-GPU per-row log-softmax-of-target (nll_gather), so the

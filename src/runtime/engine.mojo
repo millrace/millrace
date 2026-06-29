@@ -17,7 +17,18 @@ from runtime.model_iface import ModelWeights
 def upload_ids(
     ctx: DeviceContext, vals: List[Int]
 ) raises -> DeviceBuffer[DType.int32]:
-    """Upload a list of token ids to a fresh int32 device buffer."""
+    """Upload a list of token ids to a fresh int32 device buffer.
+
+    Args:
+        ctx: The GPU device context.
+        vals: The token ids to upload.
+
+    Returns:
+        A fresh int32 device buffer holding `vals`.
+
+    Raises:
+        On device/compute errors.
+    """
     var n = len(vals)
     var d = ctx.enqueue_create_buffer[DType.int32](n)
     with d.map_to_host() as m:
@@ -32,7 +43,24 @@ def argmax_last[
 ](
     ctx: DeviceContext, mut w: W, mut h: DevBuf, T: Int, mut dummy: DevBuf
 ) raises -> Int:
-    """Greedy: last-position logits (via the family's LM head) → argmax."""
+    """Greedy: last-position logits (via the family's LM head) → argmax.
+
+    Parameters:
+        W: The model-weights family type (supplies the LM head).
+
+    Args:
+        ctx: The GPU device context.
+        w: The model weights (supplies the family's LM head).
+        h: The final hidden state.
+        T: The number of positions in `h`.
+        dummy: A size-1 scratch output buffer.
+
+    Returns:
+        The argmax token id over the last position's logits.
+
+    Raises:
+        On device/compute errors.
+    """
     return argmax_f(w.lm_logits(ctx, h, T, dummy))
 
 
@@ -42,6 +70,22 @@ def logits_last[
     ctx: DeviceContext, mut w: W, mut h: DevBuf, T: Int, mut dummy: DevBuf
 ) raises -> List[Float32]:
     """Last-position logits on the host (the family's tied LM head + any softcap).
+
+    Parameters:
+        W: The model-weights family type (supplies the LM head).
+
+    Args:
+        ctx: The GPU device context.
+        w: The model weights (supplies the family's LM head).
+        h: The final hidden state.
+        T: The number of positions in `h`.
+        dummy: A size-1 scratch output buffer.
+
+    Returns:
+        The last position's vocab logits on the host (with any final softcap).
+
+    Raises:
+        On device/compute errors.
     """
     return w.lm_logits(ctx, h, T, dummy)
 
@@ -71,7 +115,20 @@ def new_session(
     ctx: DeviceContext, max_seq: Int, nlayers: Int, nkv: Int
 ) raises -> Session:
     """Allocate a fresh `Session`: empty per-layer K/V caches sized for `max_seq`
-    tokens × `nkv` (heads·head_dim), with position 0."""
+    tokens × `nkv` (heads·head_dim), with position 0.
+
+    Args:
+        ctx: The GPU device context.
+        max_seq: The maximum sequence length to size the caches for.
+        nlayers: The number of decoder layers (one K/V cache pair each).
+        nkv: The K/V row width (heads·head_dim).
+
+    Returns:
+        A fresh `Session` with empty caches and position 0.
+
+    Raises:
+        On device/compute errors.
+    """
     var cache_len = max_seq * nkv
     var kcs = List[DevBuf]()
     var vcs = List[DevBuf]()
@@ -90,7 +147,23 @@ def sess_prefill[
 ) raises -> List[Float32]:
     """Prefill the whole `prompt` from position 0 (the offset==0 case of
     `sess_prefill_suffix`): embed, run every layer, set `s.pos`, and return the
-    last-position logits."""
+    last-position logits.
+
+    Parameters:
+        W: The model-weights family type (embed / run_layer / LM head).
+
+    Args:
+        ctx: The GPU device context.
+        w: The model weights (embed / run_layer / LM head).
+        s: The decode session (KV caches + position; updated in place).
+        prompt: The prompt token ids to prefill.
+
+    Returns:
+        The last-position vocab logits after the prompt.
+
+    Raises:
+        On device/compute errors.
+    """
     var P = len(prompt)
     var ids_dev = upload_ids(ctx, prompt)
     var h = w.embed_prompt(ctx, ids_dev, P)
@@ -141,7 +214,25 @@ def sess_prefill_suffix[
 
     With `progress` (and a large enough suffix), prints a throttled stdout line
     with percent done + ETA; gated off below PROGRESS_MIN_TOK so frequent tiny
-    prefills are untouched."""
+    prefills are untouched.
+
+    Parameters:
+        W: The model-weights family type (embed / run_layer / LM head).
+
+    Args:
+        ctx: The GPU device context.
+        w: The model weights (embed / run_layer / LM head).
+        s: The decode session (KV caches + position; updated in place).
+        suffix: The new suffix token ids to prefill.
+        offset: The cache position to prefill at (rows [0, offset) reused).
+        progress: Whether to print throttled prefill progress (large suffixes only).
+
+    Returns:
+        The last-row vocab logits after the suffix.
+
+    Raises:
+        On device/compute errors.
+    """
     var Q = len(suffix)
     var nlayers = w.config().nlayers
     var ids_dev = upload_ids(ctx, suffix)
@@ -187,7 +278,23 @@ def sess_token_logprobs[
     """Teacher-forced log-probs for a token window: a fresh forward (offset 0) over
     `tokens`, then log P(tokens[i+1] | tokens[0..i]) for i in [0, T-2] — T-1 floats,
     each conditioned on ≥1 in-window token. Drives perplexity / echo logprobs; the
-    n×vocab logits stay on-GPU (token_logprobs)."""
+    n×vocab logits stay on-GPU (token_logprobs).
+
+    Parameters:
+        W: The model-weights family type (embed / run_layer / LM head).
+
+    Args:
+        ctx: The GPU device context.
+        w: The model weights (embed / run_layer / LM head).
+        s: The decode session (KV caches + position; updated in place).
+        tokens: The token window to score.
+
+    Returns:
+        T-1 teacher-forced log-probs: log P(tokens[i+1] | tokens[0..i]).
+
+    Raises:
+        On device/compute errors.
+    """
     var T = len(tokens)
     var ids_dev = upload_ids(ctx, tokens)
     var h = w.embed_prompt(ctx, ids_dev, T)
@@ -206,7 +313,23 @@ def sess_step[
     Float32
 ]:
     """Decode one step: embed `token` at `s.pos`, run every layer, advance
-    `s.pos`, and return the next-position logits."""
+    `s.pos`, and return the next-position logits.
+
+    Parameters:
+        W: The model-weights family type (embed / run_layer / LM head).
+
+    Args:
+        ctx: The GPU device context.
+        w: The model weights (embed / run_layer / LM head).
+        s: The decode session (KV caches + position; updated in place).
+        token: The token id to decode at `s.pos`.
+
+    Returns:
+        The next-position vocab logits.
+
+    Raises:
+        On device/compute errors.
+    """
     var one = upload_ids(ctx, [token])
     var h = w.embed_prompt(ctx, one, 1)
     for l in range(w.config().nlayers):
@@ -221,6 +344,21 @@ def generate[
     Int
 ]:
     """Greedy decode: prefill the prompt then emit tokens until EOS or max_new.
+
+    Parameters:
+        W: The model-weights family type (embed / run_layer / LM head).
+
+    Args:
+        ctx: The GPU device context.
+        w: The model weights (embed / run_layer / LM head).
+        prompt: The prompt token ids.
+        max_new: The maximum number of tokens to generate.
+
+    Returns:
+        The generated token ids (greedy argmax each step).
+
+    Raises:
+        On device/compute errors.
     """
     var cfg = w.config()
     var s = new_session(ctx, len(prompt) + max_new + 2, cfg.nlayers, cfg.nkv)
@@ -247,6 +385,26 @@ def generate_sample[
     seed: UInt64,
 ) raises -> List[Int]:
     """Greedy-structure decode but draw each token from the processed distribution.
+
+    Parameters:
+        W: The model-weights family type (embed / run_layer / LM head).
+
+    Args:
+        ctx: The GPU device context.
+        w: The model weights (embed / run_layer / LM head).
+        prompt: The prompt token ids.
+        max_new: The maximum number of tokens to generate.
+        temp: The sampling temperature.
+        top_k: The top-k truncation (0 = off).
+        top_p: The nucleus (top-p) threshold.
+        rep_pen: The repetition penalty applied over the context.
+        seed: The RNG seed (0 = use a fixed default).
+
+    Returns:
+        The sampled token ids.
+
+    Raises:
+        On device/compute errors.
     """
     var cfg = w.config()
     var s = new_session(ctx, len(prompt) + max_new + 2, cfg.nlayers, cfg.nkv)
@@ -336,7 +494,23 @@ def sess_verify[
     returning logits for ALL Q positions (row-major Q×vocab). Does NOT advance
     s.pos — the caller commits the accepted prefix length. KV rows written here for
     accepted tokens are valid; any rejected tail is harmlessly overwritten next
-    round (linear KV: the next forward writes from the committed s.pos)."""
+    round (linear KV: the next forward writes from the committed s.pos).
+
+    Parameters:
+        W: The model-weights family type (embed / run_layer / LM head).
+
+    Args:
+        ctx: The GPU device context.
+        w: The model weights (embed / run_layer / all-position LM head).
+        s: The decode session (KV caches + position; `s.pos` NOT advanced).
+        batch: The [c0]+drafts token batch to verify.
+
+    Returns:
+        Logits for all Q positions (row-major Q×vocab, flat host list).
+
+    Raises:
+        On device/compute errors.
+    """
     var Q = len(batch)
     var ids_dev = upload_ids(ctx, batch)
     var h = w.embed_prompt(ctx, ids_dev, Q)
@@ -377,7 +551,26 @@ def generate_spec[
     forward, accepts the longest prefix matching the target's argmaxes, and takes
     the target's correction (or its next prediction if all K accepted) as the next
     committed token. Returns the same tokens `generate` would, just fewer
-    forwards."""
+    forwards.
+
+    Parameters:
+        W: The model-weights family type (embed / run_layer / LM head).
+
+    Args:
+        ctx: The GPU device context.
+        w: The model weights (embed / run_layer / LM head).
+        prompt: The prompt token ids.
+        max_new: The maximum number of tokens to generate.
+        K: The number of draft tokens proposed per round.
+        ngram: The n-gram length used for prompt-lookup drafting.
+        verbose: Whether to print acceptance statistics at the end.
+
+    Returns:
+        The generated token ids (bit-identical to greedy `generate`).
+
+    Raises:
+        On device/compute errors.
+    """
     var cfg = w.config()
     var s = new_session(
         ctx, len(prompt) + max_new + K + 4, cfg.nlayers, cfg.nkv
@@ -480,7 +673,27 @@ def generate_spec_draft[
     advanced in lockstep at the committed length: the draft writes c0+drafts as it
     proposes; after the accept the draft's `pos` is rolled back to drop the rejected
     tail (linear KV, overwritten next round). Unlike prompt-lookup, the draft can
-    predict free text, so acceptance holds up on non-echoing prose."""
+    predict free text, so acceptance holds up on non-echoing prose.
+
+    Parameters:
+        TW: The target model-weights family type (verifies + defines the output).
+        DW: The draft model-weights family type (proposes the K tokens).
+
+    Args:
+        ctx: The GPU device context.
+        target: The target model weights (verifies + defines the output).
+        draft: The small draft model weights (proposes the K tokens).
+        prompt: The prompt token ids.
+        max_new: The maximum number of tokens to generate.
+        K: The number of draft tokens proposed per round.
+        verbose: Whether to print acceptance statistics at the end.
+
+    Returns:
+        The generated token ids (bit-identical to greedy `generate` on the target).
+
+    Raises:
+        On device/compute errors.
+    """
     var tcfg = target.config()
     var dcfg = draft.config()
     var cap = len(prompt) + max_new + K + 4

@@ -167,6 +167,9 @@ struct GemmaWeights(ModelWeights, Movable):
     # ── ModelWeights conformance ─────────────────────────────────────────────
     def config(self) -> ModelConfig:
         """Return the model-agnostic `ModelConfig` the engine drives this model with.
+
+        Returns:
+            The model-agnostic `ModelConfig` the engine drives this model with.
         """
         return self.cfg
 
@@ -174,6 +177,17 @@ struct GemmaWeights(ModelWeights, Movable):
         mut self, ctx: DeviceContext, mut ids: DeviceBuffer[DType.int32], T: Int
     ) raises -> DevBuf:
         """Embed `T` prompt token ids and apply Gemma's input √hidden embedding scale.
+
+        Args:
+            ctx: The GPU device context.
+            ids: The prompt token ids on device.
+            T: The number of prompt tokens.
+
+        Returns:
+            The hidden-state buffer for the `T` embedded tokens, scaled by √hidden.
+
+        Raises:
+            If the embedding or scaling kernel dispatch fails.
         """
         var h = embed_tokens(ctx, ids, self.embed, T, self.hidden, self.vocab)
         # Gemma scales the embeddings by √hidden on the INPUT path only.
@@ -192,6 +206,23 @@ struct GemmaWeights(ModelWeights, Movable):
         mut dummy: DevBuf,
     ) raises -> DevBuf:
         """Run decoder layer `l` over hidden state `h`, reading/writing its KV cache.
+
+        Args:
+            ctx: The GPU device context.
+            l: The decoder-layer index.
+            h: The hidden-state buffer for the layer's input.
+            kcs: The per-layer key caches.
+            vcs: The per-layer value caches.
+            Tq: The number of query positions (prefill width, or 1 at decode).
+            q_offset: The absolute position of the first query token.
+            cache_len: The allocated KV-cache length.
+            dummy: A scratch buffer for unused kernel arguments.
+
+        Returns:
+            The updated hidden-state buffer after the layer.
+
+        Raises:
+            If a layer kernel dispatch fails.
         """
         return gemma_layer(
             ctx, self, l, h, kcs[l], vcs[l], Tq, q_offset, cache_len, dummy
@@ -201,6 +232,18 @@ struct GemmaWeights(ModelWeights, Movable):
         mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf
     ) raises -> List[Float32]:
         """Final norm + tied LM head over the LAST row, softcapped; the next-token logits.
+
+        Args:
+            ctx: The GPU device context.
+            h: The hidden-state buffer.
+            T: The number of rows in `h`.
+            dummy: A scratch buffer for unused kernel arguments.
+
+        Returns:
+            The vocab-sized softcapped last-token logits, on the host.
+
+        Raises:
+            If the LM-head GEMV dispatch or host copy fails.
         """
         # Final (1+w) RMSNorm + tied LM head over the last row, then softcap=30.
         var hl = last_row(ctx, h, T, self.hidden)
@@ -228,6 +271,18 @@ struct GemmaWeights(ModelWeights, Movable):
         mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf
     ) raises -> List[Float32]:
         """Final norm + tied LM head over ALL `T` rows, softcapped (spec-decode verify).
+
+        Args:
+            ctx: The GPU device context.
+            h: The hidden-state buffer.
+            T: The number of rows in `h`.
+            dummy: A scratch buffer for unused kernel arguments.
+
+        Returns:
+            The `T`×vocab softcapped logits for every row, flattened, on the host.
+
+        Raises:
+            If the LM-head GEMV dispatch or host copy fails.
         """
         # All-row logits for spec-decode verification, with the final softcap=30
         # applied across every position.
@@ -261,6 +316,19 @@ struct GemmaWeights(ModelWeights, Movable):
         mut dummy: DevBuf,
     ) raises -> List[Float32]:
         """Per-position log-probabilities of the `targets` token ids (softcapped).
+
+        Args:
+            ctx: The GPU device context.
+            h: The hidden-state buffer.
+            n: The number of rows to score.
+            targets: The target token ids whose log-probs to gather.
+            dummy: A scratch buffer for unused kernel arguments.
+
+        Returns:
+            The per-row log-probabilities of the `targets` tokens.
+
+        Raises:
+            If the LM-head GEMV or gather dispatch fails.
         """
         var logits = mm_norm(
             ctx,
@@ -285,7 +353,20 @@ def load_gemma_weights(
     stays tiny in memory; pass range(48) for the full model. embed/final_norm are
     always loaded (embed stays bf16). With q4=True the projection weights are
     group-128 int4 (the full bf16 model is ~24 GB and won't fit a 24 GB GPU; int4
-    is ~7 GB). Skips vision/audio embedder tensors."""
+    is ~7 GB). Skips vision/audio embedder tensors.
+
+    Args:
+        ctx: The GPU device context.
+        path: The checkpoint directory/safetensors path.
+        layers: Which decoder layers to actually load (the rest get size-1 placeholders); pass range(48) for the full model.
+        q4: Load the projection weights as group-128 int4 (embed/final_norm stay bf16).
+
+    Returns:
+        The loaded `GemmaWeights`.
+
+    Raises:
+        If the checkpoint is missing tensors or cannot be read.
+    """
     var gathered = gather_tensors(path)
     var entries = gathered[0].copy()
     var paths = gathered[1].copy()
@@ -569,6 +650,24 @@ def gemma_attn(
     """Project→norm→RoPE→attend for one Gemma layer. `qkv` is the fused projection
     output ([q|k|v] for sliding, [q|k] for full). Writes rotated K + normalized V
     into the caches, rotates Q, runs tensor-core causal attention (scale=1.0).
+
+    Args:
+        ctx: The GPU device context.
+        qkv: The fused projection output ([q|k|v] for sliding, [q|k] for full).
+        kc: The K cache to write the rotated K into.
+        vc: The V cache to write the normalized V into.
+        qnw: The per-head q_norm weights.
+        knw: The per-head k_norm weights.
+        l_full: True for a full_attention layer, False for sliding.
+        Tq: The number of query positions (prefill width, or 1 at decode).
+        q_offset: The absolute position of the first query token.
+        cache_len: The allocated KV-cache length.
+
+    Returns:
+        The q_dim-wide (hq*head_dim) attention output buffer.
+
+    Raises:
+        If a RoPE, v_norm, or attention kernel dispatch fails.
     """
     var head_dim = FU_HEAD_DIM if l_full else SL_HEAD_DIM
     var hkv = FU_HKV if l_full else SL_HKV
@@ -736,7 +835,26 @@ def gemma_layer(
       r=h; h=in_ln(h); h=attn(h); h=post_attn_ln(h); h=r+h
       r=h; h=pre_ff_ln(h); h=geglu(h); h=post_ff_ln(h); h=r+h
       h=h*layer_scalar
-    All RMSNorms are the plain `x/rms*weight` variant (no (1+w) offset)."""
+    All RMSNorms are the plain `x/rms*weight` variant (no (1+w) offset).
+
+    Args:
+        ctx: The GPU device context.
+        w: The `GemmaWeights` (dims + per-layer weights).
+        l: The decoder-layer index.
+        h: The hidden-state buffer for the layer's input.
+        kc: The layer's key cache.
+        vc: The layer's value cache.
+        Tq: The number of query positions (prefill width, or 1 at decode).
+        q_offset: The absolute position of the first query token.
+        cache_len: The allocated KV-cache length.
+        dummy: A scratch buffer for unused kernel arguments.
+
+    Returns:
+        The updated hidden-state buffer after the layer.
+
+    Raises:
+        If a layer kernel dispatch fails.
+    """
     var full = w.is_full[l]
     var head_dim = FU_HEAD_DIM if full else SL_HEAD_DIM
     var hkv = FU_HKV if full else SL_HKV

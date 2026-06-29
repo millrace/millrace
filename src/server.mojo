@@ -241,6 +241,21 @@ struct ServerState(Movable):
         var embed_id: String,
     ):
         """Take ownership of the loaded models, tokenizers, caches, and ids; start with an empty `cached` list.
+
+        Args:
+            ctx: the GPU device context.
+            model: the primary chat model weights (Qwen or Gemma).
+            cfg: the primary model's config (behavior flags + eos).
+            primary_arch: Qwen arch (0/1/2) for the embed gate; -1 for Gemma.
+            max_seq: the primary model's KV-cache context cap, in tokens.
+            tok: tokenizer for the primary (chat) model.
+            tmpl: the primary model's chat template.
+            sess: the long-lived KV-cache session.
+            model_id: model id reported by /v1/models and every response.
+            bcache: the disk-backed prefix cache.
+            embed_w: secondary embedding model weights, or None when none is loaded.
+            embed_tok: tokenizer for the secondary embedding model, or None.
+            embed_id: id reported for the embedding model ("" when unset).
         """
         self.ctx = ctx^
         self.model = model^
@@ -262,7 +277,14 @@ struct ServerState(Movable):
 
 
 def to_bytes(s: String) -> List[UInt8]:
-    """Copy a String's UTF-8 bytes into a `List[UInt8]`."""
+    """Copy a String's UTF-8 bytes into a `List[UInt8]`.
+
+    Args:
+        s: the source String.
+
+    Returns:
+        A new list holding `s`'s UTF-8 bytes.
+    """
     var out = List[UInt8]()
     var sb = s.as_bytes()
     for i in range(len(sb)):
@@ -272,6 +294,14 @@ def to_bytes(s: String) -> List[UInt8]:
 
 def get_int(req: Value, key: String, default: Int) -> Int:
     """Read `key` from a JSON object as an Int (truncating a float), or `default` if absent/wrong type.
+
+    Args:
+        req: the JSON object Value to read from.
+        key: the key to look up.
+        default: value returned when the key is absent or not a number.
+
+    Returns:
+        The key's value as an Int, or `default`.
     """
     var o = req.map_get(key)
     if o:
@@ -285,6 +315,14 @@ def get_int(req: Value, key: String, default: Int) -> Int:
 
 def get_float(req: Value, key: String, default: Float64) -> Float64:
     """Read `key` from a JSON object as a Float64 (promoting an int), or `default` if absent/wrong type.
+
+    Args:
+        req: the JSON object Value to read from.
+        key: the key to look up.
+        default: value returned when the key is absent or not a number.
+
+    Returns:
+        The key's value as a Float64, or `default`.
     """
     var o = req.map_get(key)
     if o:
@@ -298,6 +336,14 @@ def get_float(req: Value, key: String, default: Float64) -> Float64:
 
 def get_bool(req: Value, key: String, default: Bool) -> Bool:
     """Read `key` from a JSON object as a Bool, or `default` if absent/not a bool.
+
+    Args:
+        req: the JSON object Value to read from.
+        key: the key to look up.
+        default: value returned when the key is absent or not a bool.
+
+    Returns:
+        The key's boolean value, or `default`.
     """
     var o = req.map_get(key)
     if o and o.value().tag == VBOOL:
@@ -307,6 +353,13 @@ def get_bool(req: Value, key: String, default: Bool) -> Bool:
 
 def get_str(req: Value, key: String) -> String:
     """Read `key` from a JSON object as a String, or "" if absent/not a string.
+
+    Args:
+        req: the JSON object Value to read from.
+        key: the key to look up.
+
+    Returns:
+        The key's string value, or "" when absent or not a string.
     """
     var o = req.map_get(key)
     if o and o.value().tag == VSTR:
@@ -315,14 +368,28 @@ def get_str(req: Value, key: String) -> String:
 
 
 def esc(s: String) -> String:
-    """JSON-escape a String for embedding in a response body."""
+    """JSON-escape a String for embedding in a response body.
+
+    Args:
+        s: the String to escape.
+
+    Returns:
+        The JSON-escaped String.
+    """
     return json_escape_str(to_bytes(s))
 
 
 def req_has_tools(req: Value) -> Bool:
     """True iff the request carries a non-empty `tools` array — only then do we
     lift the model's <tool_call> blocks into structured calls (a tools-less
-    request that happens to emit the literal text is left as plain content)."""
+    request that happens to emit the literal text is left as plain content).
+
+    Args:
+        req: the parsed request object Value.
+
+    Returns:
+        True iff the request carries a non-empty `tools` array.
+    """
     var t = req.map_get("tools")
     return Bool(t) and not t.value().is_none() and t.value().truthy()
 
@@ -335,7 +402,18 @@ def responses_to_chat(bv: Value) raises -> Optional[Value]:
     We support the common `input`-as-string form (+ optional top-level
     `instructions` → system message); array `input` returns None (→ 400). Built
     by re-emitting JSON and reparsing so we reuse parse_json + render_value
-    rather than constructing jinja2.mojo Values by hand."""
+    rather than constructing jinja2.mojo Values by hand.
+
+    Args:
+        bv: the parsed Responses-API request body.
+
+    Returns:
+        A chat-shaped Value with a `messages` array (tools forwarded when
+        present), or None for an unsupported array `input` (caller → 400).
+
+    Raises:
+        Error: if re-emitting and reparsing the synthesized JSON fails.
+    """
     if bv.map_get("messages"):
         return bv  # already chat-shaped (tools, if any, ride along)
     var inp = bv.map_get("input")
@@ -364,7 +442,14 @@ def responses_to_chat(bv: Value) raises -> Optional[Value]:
 
 def complete_utf8_len(b: List[UInt8]) -> Int:
     """Length of the longest prefix of `b` that ends on a UTF-8 char boundary —
-    so a multibyte char split across tokens isn't emitted half-formed."""
+    so a multibyte char split across tokens isn't emitted half-formed.
+
+    Args:
+        b: the byte buffer to measure.
+
+    Returns:
+        The length of the longest prefix of `b` ending on a UTF-8 boundary.
+    """
     var n = len(b)
     if n == 0:
         return 0
@@ -387,7 +472,16 @@ def complete_utf8_len(b: List[UInt8]) -> Int:
 
 
 def slice_bytes(b: List[UInt8], start: Int, stop: Int) -> List[UInt8]:
-    """Copy the half-open byte range [start, stop) of `b` into a new list."""
+    """Copy the half-open byte range [start, stop) of `b` into a new list.
+
+    Args:
+        b: the source byte buffer.
+        start: inclusive start index.
+        stop: exclusive stop index.
+
+    Returns:
+        A new list holding the bytes in [start, stop).
+    """
     var out = List[UInt8]()
     for i in range(start, stop):
         out.append(b[i])
@@ -431,6 +525,16 @@ struct Reply(Movable):
         tps: Float64 = 0.0,
     ):
         """Build a Reply from the generated ids and stop flag; stats default to zero.
+
+        Args:
+            ids: generated token ids, with the EOS token dropped.
+            stopped: True if generation ended on EOS, False if it hit the cap.
+            n_prompt: number of prompt tokens.
+            reused: prompt tokens served from the KV cache.
+            prefilled: prompt tokens actually prefilled this request.
+            pf_ms: prefill wall-clock time, in milliseconds.
+            dec_ms: decode wall-clock time, in milliseconds.
+            tps: decode throughput, in tokens per second.
         """
         self.ids = ids^
         self.stopped = stopped
@@ -502,7 +606,23 @@ def gen_full(
     common case in an agent loop, where each turn appends to the same growing
     conversation) and only prefills the diverging suffix. Times prefill vs decode
     separately — each `sess_*` call ends in a device→host logits copy, so the GPU
-    is synced at the boundary — and logs a terse per-request line."""
+    is synced at the boundary — and logs a terse per-request line.
+
+    Args:
+        s: the mutable server state (model, session, and caches).
+        ids: the full prompt token ids.
+        max_new: the maximum number of tokens to generate.
+        temp: sampling temperature (0 selects the greedy spec-decode path).
+        top_k: top-k sampling cutoff.
+        top_p: nucleus (top-p) sampling cutoff.
+
+    Returns:
+        A Reply holding the generated ids, stop flag, and per-request stats.
+
+    Raises:
+        Error: if the prompt length exceeds the model's context, or a GPU
+            forward step fails.
+    """
     # Clamp generation so prefill + decode never overrun the cache.
     var room = s.max_seq - len(ids) - 1
     if room < 1:
@@ -735,7 +855,14 @@ def gen_full(
 
 
 def service_unavailable(msg: String) -> Response:
-    """503 with a JSON error body (flare has no built-in 503 helper)."""
+    """503 with a JSON error body (flare has no built-in 503 helper).
+
+    Args:
+        msg: the JSON error body.
+
+    Returns:
+        A 503 Service Unavailable Response with a JSON content type.
+    """
     var resp = Response(
         status=Status.SERVICE_UNAVAILABLE,
         reason="Service Unavailable",
@@ -758,7 +885,15 @@ def _model_obj(id: String) -> String:
 
 def models_json(model: String, embed_model: String) -> String:
     """List the chat model, plus the embedding model when one is loaded
-    (embed_model == "" means none)."""
+    (embed_model == "" means none).
+
+    Args:
+        model: the chat model id.
+        embed_model: the embedding model id, or "" when none is loaded.
+
+    Returns:
+        The /v1/models list body as a JSON string.
+    """
     var data = _model_obj(model)
     if embed_model.byte_length() > 0 and embed_model != model:
         data += "," + _model_obj(embed_model)
@@ -766,7 +901,14 @@ def models_json(model: String, embed_model: String) -> String:
 
 
 def version_json(model: String) -> String:
-    """Build the GET /v1/version body (engine name, version, served model)."""
+    """Build the GET /v1/version body (engine name, version, served model).
+
+    Args:
+        model: the served model id.
+
+    Returns:
+        The /v1/version body as a JSON string.
+    """
     return (
         '{"engine":"millfolio","version":"'
         + MILLFOLIO_VERSION
@@ -778,7 +920,15 @@ def version_json(model: String) -> String:
 
 def embedding_item_json(index: Int, vec: List[Float32]) -> String:
     """One OpenAI embedding object: the float vector as a JSON array. f32 stringifies
-    at full precision (~8 sig figs), enough to reconstruct the unit vector."""
+    at full precision (~8 sig figs), enough to reconstruct the unit vector.
+
+    Args:
+        index: the item's position in the embeddings list.
+        vec: the embedding vector.
+
+    Returns:
+        One OpenAI embedding object as a JSON string.
+    """
     var arr = String("[")
     for i in range(len(vec)):
         if i > 0:
@@ -796,6 +946,14 @@ def embedding_item_json(index: Int, vec: List[Float32]) -> String:
 
 def embeddings_json(model: String, data: String, n_tok: Int) -> String:
     """OpenAI /v1/embeddings response envelope around the pre-built `data` array.
+
+    Args:
+        model: the embedding model id.
+        data: the pre-built JSON array of embedding objects.
+        n_tok: the prompt/total token count for the usage field.
+
+    Returns:
+        The /v1/embeddings response body as a JSON string.
     """
     return (
         '{"object":"list","data":'
@@ -813,7 +971,14 @@ def embeddings_json(model: String, data: String, n_tok: Int) -> String:
 def millfolio_stats(r: Reply) -> String:
     """The non-standard `millfolio` stats object (prefill cost + decode throughput).
     Additive top-level field — OpenAI clients ignore unknown fields, a millfolio
-    UI reads it. Mirrors the `gen:` line the server logs to stdout."""
+    UI reads it. Mirrors the `gen:` line the server logs to stdout.
+
+    Args:
+        r: the buffered Reply carrying the per-request stats.
+
+    Returns:
+        The `millfolio` stats object as a JSON string.
+    """
     return (
         '{"prefill_ms":'
         + String(Int(r.pf_ms + 0.5))
@@ -851,6 +1016,18 @@ def completion_json(
     reasoning: String = String(""),
 ) -> String:
     """Build a non-streaming OpenAI chat.completion body (content + usage, plus optional millfolio stats and reasoning).
+
+    Args:
+        model: the served model id.
+        content: the assistant message content (pre-escaped).
+        n_prompt: the prompt token count.
+        n_gen: the generated token count.
+        finish: the finish_reason ("stop" / "length").
+        millfolio: the millfolio stats object, or "" to omit it.
+        reasoning: the pre-escaped reasoning content, or "" to omit it.
+
+    Returns:
+        The chat.completion body as a JSON string.
     """
     var extra = (
         ',"millfolio":' + millfolio
@@ -879,7 +1056,15 @@ def completion_json(
 
 def chunk_reasoning_json(model: String, reasoning: String) -> String:
     """A streaming chunk carrying reasoning as a `reasoning_content` delta
-    (`reasoning` must already be JSON-escaped)."""
+    (`reasoning` must already be JSON-escaped).
+
+    Args:
+        model: the served model id.
+        reasoning: the pre-escaped reasoning content delta.
+
+    Returns:
+        The chat.completion.chunk body as a JSON string.
+    """
     return (
         '{"id":"chatcmpl-millfolio","object":"chat.completion.chunk","created":0,"model":"'
         + model
@@ -897,6 +1082,16 @@ def chunk_json(
     millfolio: String = String(""),
 ) -> String:
     """Build a streaming chat.completion.chunk body carrying a content `delta` (or final finish_reason).
+
+    Args:
+        model: the served model id.
+        delta: the content delta (used when `finish` is False).
+        finish: True for the final chunk (emits finish_reason, empty delta).
+        fin: the finish_reason for the final chunk.
+        millfolio: the millfolio stats object, or "" to omit it.
+
+    Returns:
+        The chat.completion.chunk body as a JSON string.
     """
     var delta_obj = String("{}")
     var finish_reason = String("null")
@@ -928,7 +1123,14 @@ def chunk_json(
 
 def tool_calls_array_json(calls: List[ToolCall]) -> String:
     """OpenAI chat `message.tool_calls` array. `arguments` is itself a JSON
-    *string*, so it's escaped a second time on the way in."""
+    *string*, so it's escaped a second time on the way in.
+
+    Args:
+        calls: the tool calls to serialize.
+
+    Returns:
+        The `message.tool_calls` array as a JSON string.
+    """
     var s = String("[")
     for i in range(len(calls)):
         if i > 0:
@@ -954,6 +1156,17 @@ def completion_tools_json(
     reasoning: String = String(""),
 ) -> String:
     """Build a non-streaming chat.completion body whose message carries `tool_calls` (finish_reason "tool_calls").
+
+    Args:
+        model: the served model id.
+        content: the assistant message content (escaped here; "" → null).
+        calls: the lifted tool calls.
+        n_prompt: the prompt token count.
+        n_gen: the generated token count.
+        reasoning: the reasoning content (escaped here), or "" to omit it.
+
+    Returns:
+        The chat.completion body as a JSON string.
     """
     var content_field = String("null")
     if content.byte_length() > 0:
@@ -977,7 +1190,14 @@ def completion_tools_json(
 
 
 def chunk_role_json(model: String) -> String:
-    """Opening streaming chunk announcing the assistant role (content null)."""
+    """Opening streaming chunk announcing the assistant role (content null).
+
+    Args:
+        model: the served model id.
+
+    Returns:
+        The opening chat.completion.chunk body as a JSON string.
+    """
     return (
         '{"id":"chatcmpl-millfolio","object":"chat.completion.chunk","created":0,"model":"'
         + model
@@ -989,7 +1209,16 @@ def chunk_role_json(model: String) -> String:
 def chunk_toolcall_json(model: String, i: Int, call: ToolCall) -> String:
     """One streaming chunk carrying a whole tool call at `index` i (name +
     full arguments). Clients accumulate per index; emitting it in one delta is
-    valid since generation is already buffered."""
+    valid since generation is already buffered.
+
+    Args:
+        model: the served model id.
+        i: the tool call's index.
+        call: the tool call (name + arguments).
+
+    Returns:
+        The chat.completion.chunk body as a JSON string.
+    """
     var delta = (
         '{"tool_calls":[{"index":'
         + String(i)
@@ -1013,7 +1242,17 @@ def chunk_toolcall_json(model: String, i: Int, call: ToolCall) -> String:
 def function_call_item_json(
     i: Int, name: String, args: String, status: String
 ) -> String:
-    """A Responses-API `function_call` output item."""
+    """A Responses-API `function_call` output item.
+
+    Args:
+        i: the call's index (drives the deterministic fc_/call_ ids).
+        name: the function name.
+        args: the function arguments (a JSON string).
+        status: the item status.
+
+    Returns:
+        The `function_call` output item as a JSON string.
+    """
     return (
         '{"type":"function_call","id":"fc_'
         + String(i)
@@ -1031,6 +1270,12 @@ def function_call_item_json(
 
 def function_calls_output_json(calls: List[ToolCall]) -> String:
     """Build a Responses-API output array of `function_call` items, one per call.
+
+    Args:
+        calls: the tool calls to serialize.
+
+    Returns:
+        The output array of `function_call` items as a JSON string.
     """
     var s = String("[")
     for i in range(len(calls)):
@@ -1044,6 +1289,13 @@ def function_calls_output_json(calls: List[ToolCall]) -> String:
 
 def output_message_json(content: String, status: String) -> String:
     """Build a Responses-API assistant `message` output item wrapping `content` (pre-escaped output_text).
+
+    Args:
+        content: the pre-escaped output_text content.
+        status: the item status.
+
+    Returns:
+        The assistant `message` output item as a JSON string.
     """
     return (
         '{"type":"message","id":"'
@@ -1057,7 +1309,15 @@ def output_message_json(content: String, status: String) -> String:
 
 
 def output_reasoning_json(reasoning: String, status: String) -> String:
-    """A Responses-API `reasoning` output item (`reasoning` pre-escaped)."""
+    """A Responses-API `reasoning` output item (`reasoning` pre-escaped).
+
+    Args:
+        reasoning: the pre-escaped reasoning summary text.
+        status: the item status.
+
+    Returns:
+        The `reasoning` output item as a JSON string.
+    """
     return (
         '{"type":"reasoning","id":"rs_millfolio","status":"'
         + status
@@ -1071,7 +1331,18 @@ def response_object_raw(
     model: String, output: String, status: String, n_prompt: Int, n_gen: Int
 ) -> String:
     """Responses-API `response` object with a pre-built `output` array (a list
-    of message and/or function_call items)."""
+    of message and/or function_call items).
+
+    Args:
+        model: the served model id.
+        output: the pre-built `output` array.
+        status: the response status.
+        n_prompt: the input (prompt) token count.
+        n_gen: the output (generated) token count.
+
+    Returns:
+        The `response` object as a JSON string.
+    """
     return (
         '{"id":"'
         + RESP_ID
@@ -1093,6 +1364,13 @@ def response_object_raw(
 
 def resp_event(type: String, payload: String) -> SseEvent:
     """Build a named Responses-API SSE frame: an `event:` line plus a JSON body whose `type` matches and is followed by `payload`.
+
+    Args:
+        type: the event name (also the JSON body's `type`).
+        payload: the JSON fields following `type` in the body.
+
+    Returns:
+        The named SseEvent frame.
     """
     # Named SSE frame: an `event:` line plus a matching `"type"` in the JSON
     # (the Vercel AI SDK switches on the latter). `payload` = fields after type.
@@ -1107,7 +1385,18 @@ def stream_deltas(mut s: ServerState, ids: List[Int]) raises -> List[String]:
     UTF-8 char boundary.
 
     A multibyte char split across tokens is never emitted half-formed.
-    (Buffered: all ids are already generated.)"""
+    (Buffered: all ids are already generated.)
+
+    Args:
+        s: the mutable server state (used for its tokenizer).
+        ids: the generated token ids to decode.
+
+    Returns:
+        A list of JSON-escaped content deltas, each ending on a UTF-8 boundary.
+
+    Raises:
+        Error: if token decoding fails.
+    """
     var out = List[String]()
     var prefix = List[Int]()
     var sent = 0
@@ -1134,6 +1423,15 @@ struct Api(Copyable, Handler, Movable):
 
     def serve(self, req: Request) raises -> Response:
         """Route a request by method and path to the matching endpoint, or 404.
+
+        Args:
+            req: the incoming HTTP request.
+
+        Returns:
+            The endpoint's Response, or a 404 when no route matches.
+
+        Raises:
+            Error: if the dispatched endpoint fails.
         """
         var path = req.url
         var is_post = req.method == Method.POST
@@ -1165,7 +1463,18 @@ struct Api(Copyable, Handler, Movable):
         or a raw string (tokenized with the model's tokenizer, NO chat template).
         Runs a teacher-forced forward and returns `logprobs.token_logprobs` =
         [null, log P(t1|t0), log P(t2|t0:1), …]; the client computes
-        PPL = exp(-mean token_logprobs). No text is generated (echo-only)."""
+        PPL = exp(-mean token_logprobs). No text is generated (echo-only).
+
+        Args:
+            req: the /v1/completions HTTP request.
+
+        Returns:
+            A text_completion Response with `logprobs.token_logprobs`, or a
+            400/bad-request Response on invalid input.
+
+        Raises:
+            Error: if JSON parsing or the teacher-forced forward fails.
+        """
         ref s = self.st[]
         var bv = parse_json(req.text())
         var pr = bv.map_get("prompt")
@@ -1249,7 +1558,18 @@ struct Api(Copyable, Handler, Movable):
         model is available → 503. `input` is a string or an array of strings. Each
         is tokenized with the embedding model's own tokenizer (NO EOS append —
         last-token pooling uses the raw final token) and run through sess_embed
-        (last-token-pooled + L2-normalized vector)."""
+        (last-token-pooled + L2-normalized vector).
+
+        Args:
+            req: the /v1/embeddings HTTP request.
+
+        Returns:
+            An embeddings Response, a 400 on missing/invalid input, or a 503
+            when no embedding model is available.
+
+        Raises:
+            Error: if JSON parsing or the embedding forward fails.
+        """
         ref s = self.st[]
         # Which weights+tokenizer serve embeddings: the secondary embed model if
         # loaded, else the primary iff it is itself arch==2, else none → 503.
@@ -1339,6 +1659,16 @@ struct Api(Copyable, Handler, Movable):
 
     def handle_chat(self, req: Request) raises -> Response:
         """Handle POST /v1/chat/completions: render the chat template, generate, and frame the result (streaming or buffered, with tool-call lifting).
+
+        Args:
+            req: the /v1/chat/completions HTTP request.
+
+        Returns:
+            A chat.completion Response, or an SSE stream Response when
+            `stream` is requested.
+
+        Raises:
+            Error: if JSON parsing, generation, or framing fails.
         """
         ref s = self.st[]
         var body = req.text()
@@ -1491,6 +1821,16 @@ struct Api(Copyable, Handler, Movable):
 
     def handle_responses(self, req: Request) raises -> Response:
         """Handle POST /v1/responses: map the Responses-API body onto the chat shape, generate, and frame it as Responses output items.
+
+        Args:
+            req: the /v1/responses HTTP request.
+
+        Returns:
+            A Responses-API `response` Response, an SSE stream when `stream`
+            is requested, or a 400 on invalid input.
+
+        Raises:
+            Error: if JSON parsing, generation, or framing fails.
         """
         ref s = self.st[]
         var body = req.text()
@@ -1763,7 +2103,17 @@ struct Api(Copyable, Handler, Movable):
 
 
 def read_text(path: String) raises -> String:
-    """Read and return the entire contents of the file at `path` as a String."""
+    """Read and return the entire contents of the file at `path` as a String.
+
+    Args:
+        path: the file path to read.
+
+    Returns:
+        The file's full contents as a String.
+
+    Raises:
+        Error: if the file cannot be opened or read.
+    """
     with open(path, "r") as f:
         return f.read()
 
@@ -1816,7 +2166,17 @@ def _slug(model_id: String) -> String:
 def hf_cache_path(model_id: String) raises -> String:
     """Local snapshot dir of an already-downloaded HF model, mirroring
     huggingface_hub's layout: <hub>/models--<slug>/snapshots/<refs/main>. Raises if
-    not cached (no refs/main) — caller then treats the arg as a literal path."""
+    not cached (no refs/main) — caller then treats the arg as a literal path.
+
+    Args:
+        model_id: the Hugging Face repo id.
+
+    Returns:
+        The local snapshot directory of the cached model.
+
+    Raises:
+        Error: if the model is not cached (no refs/main to read).
+    """
     var home = String(getenv("HF_HOME"))
     var hub = (home + "/hub") if home.byte_length() > 0 else (
         String(getenv("HOME")) + "/.cache/huggingface/hub"
@@ -1850,6 +2210,13 @@ struct Config(Copyable, Movable):
         kv_budget_mb: Int,
     ):
         """Construct a Config from explicit port, model ids, q4 flag, and KV-cache budget.
+
+        Args:
+            port: TCP port to listen on.
+            model: the default chat model/checkpoint.
+            embed_model: the default embedding model/checkpoint.
+            q4: whether to use group-128 int4 projection weights.
+            kv_budget_mb: disk KV-cache LRU cap, in MiB.
         """
         self.port = port
         self.model = model^
@@ -1876,6 +2243,9 @@ def load_config() -> Config:
     kv_budget_mb (int, MiB). `model` is the chat model; `embed_model` is the
     secondary embedding model (HF id or checkpoint path, same treatment as
     `model`). Parsed with the same jinja2.mojo json the server uses for requests.
+
+    Returns:
+        The resolved Config (env overrides applied over file values).
     """
     var port = Int(PORT)
     var model = String("")
@@ -1913,6 +2283,9 @@ def load_config() -> Config:
 
 def main() raises:
     """Entry point: load config, bind/listen, load the model(s), then serve requests until shutdown.
+
+    Raises:
+        Error: if binding, model loading, or serving fails.
     """
     # Config: ~/.config/millfolio/config.json (+ env). Path override: $MILLFOLIO_CONFIG.
     var cfg = load_config()

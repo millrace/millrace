@@ -129,7 +129,18 @@ def _prev_non_tool_role(M: Value, before: Int) -> String:
 
 def render_gemma(req: Value) raises -> String:
     """Render an OpenAI request (`messages` + optional `tools`/`enable_thinking`)
-    into the Gemma prompt, always adding the generation prompt (serving)."""
+    into the Gemma prompt, always adding the generation prompt (serving).
+
+    Args:
+        req: The OpenAI request value containing the `messages` array and
+            optional `tools`/`enable_thinking` fields.
+
+    Returns:
+        The rendered Gemma prompt string.
+
+    Raises:
+        Error: If the request has no `messages` array.
+    """
     var msgs_o = req.map_get("messages")
     if not msgs_o:
         raise Error("request has no 'messages' array")

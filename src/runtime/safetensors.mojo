@@ -44,18 +44,39 @@ struct TensorEntry(Copyable, Movable):
 
 
 def is_ws(c: Int) -> Bool:
-    """True if byte `c` is JSON whitespace (space, tab, LF, or CR)."""
+    """True if byte `c` is JSON whitespace (space, tab, LF, or CR).
+
+    Args:
+        c: A byte value.
+
+    Returns:
+        True if `c` is a JSON whitespace byte.
+    """
     return c == 32 or c == 9 or c == 10 or c == 13
 
 
 def skip_ws(buf: List[UInt8], mut pos: Int):
-    """Advance `pos` past any run of whitespace in `buf`."""
+    """Advance `pos` past any run of whitespace in `buf`.
+
+    Args:
+        buf: The header bytes being scanned.
+        pos: The scan offset, advanced in place past any whitespace.
+    """
     while pos < len(buf) and is_ws(Int(buf[pos])):
         pos += 1
 
 
 def expect(buf: List[UInt8], mut pos: Int, ch: Int) raises:
-    """Consume byte `ch` at `pos`, raising a parse error if it isn't there."""
+    """Consume byte `ch` at `pos`, raising a parse error if it isn't there.
+
+    Args:
+        buf: The header bytes being scanned.
+        pos: The scan offset; advanced one byte past `ch` on success.
+        ch: The byte value that must appear at `pos`.
+
+    Raises:
+        Error: if `pos` is past the end of `buf` or the byte there isn't `ch`.
+    """
     if pos >= len(buf) or Int(buf[pos]) != ch:
         raise Error("parse error at byte " + String(pos))
     pos += 1
@@ -63,6 +84,16 @@ def expect(buf: List[UInt8], mut pos: Int, ch: Int) raises:
 
 def parse_string(buf: List[UInt8], mut pos: Int) raises -> String:
     """Parse a quoted JSON string at `pos` (no escape handling) and return it.
+
+    Args:
+        buf: The header bytes being scanned.
+        pos: The scan offset; advanced past the closing quote on success.
+
+    Returns:
+        The string contents between the quotes.
+
+    Raises:
+        Error: if the opening or closing quote is missing.
     """
     expect(buf, pos, QUOTE)
     var s = String("")
@@ -74,7 +105,18 @@ def parse_string(buf: List[UInt8], mut pos: Int) raises -> String:
 
 
 def parse_uint(buf: List[UInt8], mut pos: Int) raises -> Int:
-    """Parse a run of decimal digits at `pos` into an int (raises if none)."""
+    """Parse a run of decimal digits at `pos` into an int (raises if none).
+
+    Args:
+        buf: The header bytes being scanned.
+        pos: The scan offset; advanced past the digits consumed.
+
+    Returns:
+        The parsed unsigned integer value.
+
+    Raises:
+        Error: if no decimal digit is present at `pos`.
+    """
     var v = 0
     var start = pos
     while pos < len(buf) and Int(buf[pos]) >= 48 and Int(buf[pos]) <= 57:
@@ -86,7 +128,18 @@ def parse_uint(buf: List[UInt8], mut pos: Int) raises -> Int:
 
 
 def parse_int_array(buf: List[UInt8], mut pos: Int) raises -> List[Int]:
-    """Parse a JSON array of unsigned ints (e.g. data_offsets) at `pos`."""
+    """Parse a JSON array of unsigned ints (e.g. data_offsets) at `pos`.
+
+    Args:
+        buf: The header bytes being scanned.
+        pos: The scan offset; advanced past the closing `]`.
+
+    Returns:
+        The parsed ints in order (empty for `[]`).
+
+    Raises:
+        Error: on a malformed array (missing `[`, `]`, or an element).
+    """
     var out = List[Int]()
     expect(buf, pos, LBRACK)
     skip_ws(buf, pos)
@@ -106,7 +159,15 @@ def parse_int_array(buf: List[UInt8], mut pos: Int) raises -> List[Int]:
 
 
 def skip_value(buf: List[UInt8], mut pos: Int) raises:
-    """Advance `pos` past one JSON value (string, object, array, or scalar)."""
+    """Advance `pos` past one JSON value (string, object, array, or scalar).
+
+    Args:
+        buf: The header bytes being scanned.
+        pos: The scan offset; advanced past the whole value.
+
+    Raises:
+        Error: on a malformed string/object/array nested in the value.
+    """
     skip_ws(buf, pos)
     var c = Int(buf[pos])
     if c == QUOTE:
@@ -136,7 +197,15 @@ def skip_value(buf: List[UInt8], mut pos: Int) raises:
 
 
 def skip_object(buf: List[UInt8], mut pos: Int) raises:
-    """Advance `pos` past a whole JSON object, including nested values."""
+    """Advance `pos` past a whole JSON object, including nested values.
+
+    Args:
+        buf: The header bytes being scanned.
+        pos: The scan offset; advanced past the closing `}`.
+
+    Raises:
+        Error: on a malformed object (missing `{`, key, `:`, or `}`).
+    """
     expect(buf, pos, LBRACE)
     skip_ws(buf, pos)
     if Int(buf[pos]) == RBRACE:
@@ -158,7 +227,17 @@ def skip_object(buf: List[UInt8], mut pos: Int) raises:
 
 def parse_header(buf: List[UInt8]) raises -> List[TensorEntry]:
     """Parse a safetensors header object into per-tensor entries, skipping the
-    `__metadata__` key. begin/end are offsets relative to the data blob."""
+    `__metadata__` key. begin/end are offsets relative to the data blob.
+
+    Args:
+        buf: The safetensors header JSON bytes.
+
+    Returns:
+        One `TensorEntry` per tensor, with begin/end relative to the data blob.
+
+    Raises:
+        Error: on a malformed header.
+    """
     var entries = List[TensorEntry]()
     var pos = 0
     skip_ws(buf, pos)
@@ -208,7 +287,18 @@ def parse_header(buf: List[UInt8]) raises -> List[TensorEntry]:
 
 
 def read_header(path: String) raises -> List[TensorEntry]:
-    """Parse the header; entries' begin/end are ABSOLUTE file offsets."""
+    """Parse the header; entries' begin/end are ABSOLUTE file offsets.
+
+    Args:
+        path: Filesystem path to a `.safetensors` file.
+
+    Returns:
+        The tensor entries with begin/end shifted by the 8-byte length prefix
+        plus header length, so they are absolute file offsets.
+
+    Raises:
+        Error: on I/O failure or a malformed header.
+    """
     with open(path, "r") as f:
         var lenb = f.read_bytes(8)
         var hlen: UInt64 = 0
@@ -230,7 +320,20 @@ def load_one(
     ctx: DeviceContext, path: String, begin: Int, end: Int
 ) raises -> DevBuf:
     """Load the bf16 tensor in byte range [begin, end) and widen it to a fresh f32
-    device buffer (via the cvt kernel)."""
+    device buffer (via the cvt kernel).
+
+    Args:
+        ctx: The device context to allocate and enqueue on.
+        path: Filesystem path holding the tensor bytes.
+        begin: Start byte offset of the bf16 tensor.
+        end: End byte offset (exclusive) of the bf16 tensor.
+
+    Returns:
+        A fresh f32 device buffer holding the widened tensor.
+
+    Raises:
+        Error: on I/O failure or a device allocation/enqueue failure.
+    """
     var nbytes = end - begin
     var count = nbytes // 2
     var dev_f32 = ctx.enqueue_create_buffer[DType.float32](count)
@@ -266,7 +369,21 @@ def load_named(
     name2idx: Dict[String, Int],
     name: String,
 ) raises -> DevBuf:
-    """Look up tensor `name` and load it as a widened f32 device buffer."""
+    """Look up tensor `name` and load it as a widened f32 device buffer.
+
+    Args:
+        ctx: The device context to allocate and enqueue on.
+        paths: Per-entry file paths (aligned with `entries`).
+        entries: The parsed tensor entries.
+        name2idx: Map from tensor name to its index in `entries`/`paths`.
+        name: The tensor name to load.
+
+    Returns:
+        The named tensor as a widened f32 device buffer.
+
+    Raises:
+        Error: if `name` is absent, or on I/O / device failure.
+    """
     var idx = name2idx[name]
     return load_one(ctx, paths[idx], entries[idx].begin, entries[idx].end)
 
@@ -276,7 +393,20 @@ def load_one_bf16(
 ) raises -> WBuf:
     """Load a bf16 tensor to device *without* widening to f32 — the matmul/embed
     kernels widen per element (bf16_widen), halving weight read traffic (§11 #12).
-    The raw safetensors bytes are already bf16, so this is a plain upload."""
+    The raw safetensors bytes are already bf16, so this is a plain upload.
+
+    Args:
+        ctx: The device context to allocate and enqueue on.
+        path: Filesystem path holding the tensor bytes.
+        begin: Start byte offset of the bf16 tensor.
+        end: End byte offset (exclusive) of the bf16 tensor.
+
+    Returns:
+        The raw bf16 tensor as a u16 device buffer (not widened).
+
+    Raises:
+        Error: on I/O failure or a device allocation/enqueue failure.
+    """
     var nbytes = end - begin
     var count = nbytes // 2
     var dev_u16 = ctx.enqueue_create_buffer[DType.uint16](count)
@@ -311,7 +441,21 @@ def load_named_bf16(
     name2idx: Dict[String, Int],
     name: String,
 ) raises -> WBuf:
-    """Look up tensor `name` and load it as a raw bf16 (u16) device buffer."""
+    """Look up tensor `name` and load it as a raw bf16 (u16) device buffer.
+
+    Args:
+        ctx: The device context to allocate and enqueue on.
+        paths: Per-entry file paths (aligned with `entries`).
+        entries: The parsed tensor entries.
+        name2idx: Map from tensor name to its index in `entries`/`paths`.
+        name: The tensor name to load.
+
+    Returns:
+        The named tensor as a raw bf16 (u16) device buffer.
+
+    Raises:
+        Error: if `name` is absent, or on I/O / device failure.
+    """
     var idx = name2idx[name]
     return load_one_bf16(ctx, paths[idx], entries[idx].begin, entries[idx].end)
 
@@ -323,7 +467,22 @@ def load_one_q4(
     and quantize it to group-128 int4 on the host — symmetric RTN, scale per
     128-wide group along K. Reads the raw bf16 bytes (no full-precision copy ever
     reaches the device), packs 8 nibbles/u32, uploads packed+scales. One-time at
-    load (host-side, so it is not fast — a few minutes for the 3B)."""
+    load (host-side, so it is not fast — a few minutes for the 3B).
+
+    Args:
+        ctx: The device context to allocate and enqueue on.
+        path: Filesystem path holding the tensor bytes.
+        begin: Start byte offset of the bf16 weight.
+        end: End byte offset (exclusive) of the bf16 weight.
+        K: The reduction dim (a multiple of 128); the weight is [N, K] with
+            N inferred from the byte count.
+
+    Returns:
+        A `QMat` holding the packed group-128 int4 weights and per-group scales.
+
+    Raises:
+        Error: on I/O failure or a device allocation/enqueue failure.
+    """
     var nbytes = end - begin
     var count = nbytes // 2  # u16 weights = N*K
     var N = count // K
@@ -385,7 +544,23 @@ def load_proj(
     K: Int,
     q4: Bool,
 ) raises -> QMat:
-    """A projection weight as QMat: int4 (group-128) if `q4` else bf16."""
+    """A projection weight as QMat: int4 (group-128) if `q4` else bf16.
+
+    Args:
+        ctx: The device context to allocate and enqueue on.
+        paths: Per-entry file paths (aligned with `entries`).
+        entries: The parsed tensor entries.
+        name2idx: Map from tensor name to its index in `entries`/`paths`.
+        name: The tensor name to load.
+        K: The reduction dim (a multiple of 128); the weight is [N, K].
+        q4: If True quantize to group-128 int4, else keep bf16.
+
+    Returns:
+        The projection weight as a `QMat` (int4 group-128 if `q4`, else bf16).
+
+    Raises:
+        Error: if `name` is absent, or on I/O / device failure.
+    """
     var idx = name2idx[name]
     if q4:
         return load_one_q4(
@@ -408,7 +583,23 @@ def fuse_pair(
 ) raises -> QMat:
     """Concatenate two same-K projection weights along the output dim N (a's rows
     then b's) into one QMat, so a single GEMV computes both (e.g. gate|up, q|k|v).
-    Host-side copy at load — a/b are already the right representation."""
+    Host-side copy at load — a/b are already the right representation.
+
+    Args:
+        ctx: The device context to allocate and enqueue on.
+        a: The first weight (consumed), contributing the leading rows.
+        b: The second weight (consumed), contributing the trailing rows.
+        Na: The number of output rows in `a`.
+        Nb: The number of output rows in `b`.
+        K: The shared reduction dim of both weights.
+        q4: True if `a`/`b` are int4 group-128, False if bf16.
+
+    Returns:
+        A single `QMat` with `a`'s rows followed by `b`'s along N.
+
+    Raises:
+        Error: on a device allocation or buffer-mapping failure.
+    """
     if q4:
         var wa = Na * K // 8
         var wb = Nb * K // 8
@@ -470,7 +661,21 @@ def fuse_pair(
 def concat_bias(
     ctx: DeviceContext, var a: DevBuf, var b: DevBuf, na: Int, nb: Int
 ) raises -> DevBuf:
-    """Concatenate two f32 bias vectors (for the fused QKV bias)."""
+    """Concatenate two f32 bias vectors (for the fused QKV bias).
+
+    Args:
+        ctx: The device context to allocate and enqueue on.
+        a: The first f32 bias vector (consumed).
+        b: The second f32 bias vector (consumed).
+        na: The length of `a`.
+        nb: The length of `b`.
+
+    Returns:
+        A fresh f32 device buffer holding `a` followed by `b`.
+
+    Raises:
+        Error: on a device allocation or buffer-mapping failure.
+    """
     var c = ctx.enqueue_create_buffer[DType.float32](na + nb)
     with c.map_to_host() as d:
         with a.map_to_host() as ah:
@@ -554,6 +759,17 @@ def gather_tensors(
     single .safetensors file (0.5B in the HF cache is one blob) or a directory
     holding sharded shards + model.safetensors.index.json (3B). Detection: try to
     open the index inside `path`-as-dir; absent → treat `path` as a single file.
+
+    Args:
+        path: A single `.safetensors` file, or a directory holding shards plus a
+            `model.safetensors.index.json`.
+
+    Returns:
+        A tuple of (tensor entries with absolute file offsets, the file path each
+        entry lives in).
+
+    Raises:
+        Error: on I/O failure or a malformed header / index.
     """
     var entries = List[TensorEntry]()
     var paths = List[String]()
